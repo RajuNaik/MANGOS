@@ -1,0 +1,287 @@
+DATABRICKS CHEAT SHEET -- DAY-BEFORE QUICK REVIEW (2026)
+Condensed companion to Databricks_COMPLETE_HANDBOOK_2026.txt (Parts A-K). One line per concept
+where possible. If a bullet doesn't fully jog your memory, the Part letter tells you where to
+look it up in the full handbook. Read top to bottom once, then just re-scan the GOTCHAS section
+right before you walk in.
+======================================================================================================================================================
+======================================================================================================================================================
+TOP GOTCHAS -- COMMONLY CONFUSED PAIRS (read this section twice)
+======================================================================================================================================================
+- cache() vs checkpoint(): cache = memory, does NOT cut lineage. checkpoint = disk, DOES cut lineage.
+- repartition(n) vs coalesce(n): repartition = shuffle, up OR down, even. coalesce = no shuffle, DOWN only, can be uneven.
+- partitionBy vs bucketBy vs Liquid Clustering: partitionBy = folder-per-value (bad at high cardinality).
+  bucketBy = fixed hash buckets, avoids join shuffle+sort if pre-bucketed both sides. Liquid Clustering
+  (CLUSTER BY) = 2026 default for NEW tables, no fixed scheme, changeable later without a rewrite.
+- CACHE TABLE vs Delta Cache: CACHE TABLE = plain Spark, session-only, in-memory (= df.cache()).
+  Delta Cache = Databricks-specific, local DISK, cross-session, transparent file cache. Different things.
+- Tungsten vs Photon: Tungsten = stock Spark, JVM, off-heap binary rows + whole-stage CODEGEN (compiles
+  query to bytecode). Photon = Databricks' native C++, true COLUMNAR/vectorized, replaces Tungsten
+  execution for supported ops. Photon fallback (UDFs etc.) still gets Tungsten's codegen, just not
+  Photon's vectorization.
+- PRIMARY KEY/FOREIGN KEY vs NOT NULL/CHECK: PK/FK are INFORMATIONAL ONLY (not enforced). NOT NULL and
+  CHECK are the ones you can actually rely on to REJECT bad data.
+- Delta CDF vs Lakebase CDF: Delta's Change Data Feed = row-level changes on a Delta TABLE
+  (delta.enableChangeDataFeed). Lakebase's Change Data Feed = Postgres -> Delta sync. Same name,
+  different layer.
+- %run vs dbutils.notebook.run(): %run = include-style, shares session/variables, no args. 
+  dbutils.notebook.run() = isolated call, takes args, returns a value, can be conditional.
+- Managed vs External table: Managed = Databricks owns data + metadata, DROP deletes files.
+  External = Databricks owns metadata only, DROP keeps files.
+- Shallow vs Deep clone: Shallow = metadata only, points at source's files (fast, dependent on source).
+  Deep = physical copy, fully independent (slower, safe for real backups).
+- Time travel vs RESTORE: time travel = just READS an old version. RESTORE = actually rolls the table
+  back to that version.
+- Stage vs Task vs Job: Job = one per ACTION. Job splits into Stages (split by shuffle boundary).
+  Stage splits into Tasks (one per partition per core).
+- DBSQL materialized view vs Lakeflow pipeline materialized view: DBSQL MV = standalone catalog
+  object, created via plain SQL, no pipeline needed. Lakeflow MV = only exists inside a
+  Declarative Pipeline's dependency graph. Two different implementations, same name.
+- AQE vs Catalyst: Catalyst builds the ORIGINAL plan from stats-based ESTIMATES (before anything runs).
+  AQE RE-PLANS mid-query using ACTUAL sizes after each stage completes. Catalyst = static, AQE = adaptive.
+- reduceByKey vs groupByKey (RDD-era): reduceByKey combines LOCALLY first (map-side combine), then
+  shuffles small partial results. groupByKey shuffles ALL raw data first, then groups. Always prefer
+  reduceByKey for aggregates. (On DataFrame API, Catalyst already does this for you automatically.)
+- Broadcast variable vs Accumulator: broadcast = read-only copy sent OUT to every executor.
+  accumulator = write-only from executors, driver reads the final total. Opposite directions.
+  Accumulator gotcha: only guaranteed exactly-once inside ACTIONS, not transformations.
+======================================================================================================================================================
+======================================================================================================================================================
+PART A -- FOUNDATIONS
+======================================================================================================================================================
+- Spark keeps intermediate results IN MEMORY across steps (vs MapReduce disk-to-disk) = 10-100x faster.
+- Databricks =/= Spark. Databricks (the company) also built Delta Lake, MLflow, Unity Catalog,
+  Spark Declarative Pipelines -- all now open source.
+- DWH: structured, ACID, easy DML | can't scale storage/compute independently, no semi/unstructured data.
+- Data Lake: cheap, any data type, scales independently | no ACID, no DML, no schema enforcement.
+- Lakehouse = Delta/Iceberg metadata layer on cheap object storage = ACID+DML+schema+time-travel,
+  still cheap and holds any data type.
+- Driver builds DAG -> splits into STAGES (shuffle boundary) -> splits into TASKS (1 per partition/core).
+- ~5 cores/executor is the empirical sweet spot (more hurts I/O throughput + GC blast radius).
+- RDD = no schema, no Catalyst optimization. DataFrame = has schema, Catalyst optimizes. Dataset =
+  type-safe DataFrame (Scala/Java only). You basically never touch raw RDDs in real work today.
+- Transformation = LAZY, returns new DF. Action = triggers execution.
+- Narrow = no shuffle (filter/map). Wide = shuffle (groupBy/join/distinct/repartition).
+- On-heap = JVM/GC managed, faster. Off-heap = no GC pauses, slightly slower, disabled by default.
+- Serverless compute = 2026 default answer, scales to zero. Classic all-purpose/job/pools still exist
+  for special cases (custom instance types, init scripts, long interactive dev).
+- Spark 4.0 / DBR 17.x LTS: ANSI mode ON BY DEFAULT -- overflow/divide-by-zero/bad casts now THROW
+  instead of returning null. Biggest 3.1.2 -> 4.0 breaking change.
+- VARIANT type = pre-parsed JSON, ~8x faster than string + get_json_object for nested field access.
+- Spark Connect = thin client/server architecture; serverless compute runs on this.
+======================================================================================================================================================
+PART B -- CORE PYSPARK
+======================================================================================================================================================
+- Never inferSchema in prod (2 passes = double I/O). Explicit StructType = 0 extra jobs to read shape.
+- Read mode: PERMISSIVE (default, _corrupt_record col) / DROPMALFORMED / FAILFAST.
+- mounts (dbutils.fs.mount) = LEGACY -> External Locations + Storage Credentials (governed, auditable).
+- Secrets: dbutils.secrets.get(scope, key) -- works identically for Key-Vault-backed or Databricks-backed scopes.
+- dropna(how="any"/"all", subset=[...]) / fillna(value, subset=[...]).
+- UDF = black box to Catalyst AND forces a Photon fallback -- prefer built-ins whenever one exists.
+- concat() (no delimiter) vs concat_ws() (with delimiter). arrays_zip / explode / array_intersect /
+  array_union / array_except / array_distinct / array_min/max / array_sort / array_repeat.
+- greatest()/least() = ROW-level max/min across columns. agg({"col":"max"}) = COLUMN-level (aggregate).
+- StructType = rigid, every field required. MapType = flexible, missing keys OK. ArrayType = list column.
+- Snappy: low CPU, splittable -> hot layer. Gzip: high compression, NOT splittable -> cold/archive.
+- distinct() = dedup on ALL cols. dropDuplicates([cols]) = dedup on a SUBSET of cols.
+- select() (one projection) beats chained withColumn() in a loop for planning performance.
+- PySpark: distributed, lazy, immutable. Pandas: single-node, eager, mutable. Polars: single-node but
+  Rust-fast/multi-threaded, NOT distributed -- a fast Pandas replacement, not a Spark replacement.
+- subtract() = de-duplicated diff. exceptAll() = keeps duplicates (multiset semantics).
+- lead()/lag()/first()/last() over a Window; max(col).over(Window.partitionBy(k)) = classic
+  "max value among duplicate keys" pattern.
+- spark.sql("... {df} ...", df=df) -- direct DataFrame reference inside SQL, Spark 3.4+.
+- from_json + StructType for a KNOWN JSON shape; VARIANT type for messy/schema-drifting JSON.
+- dbutils.notebook.exit(value) -> ADF reads it via @activity('<name>').output.runOutput.
+- spark_partition_id() = which partition a row landed in. input_file_name() = which source file a row came from.
+======================================================================================================================================================
+PART C -- PERFORMANCE
+======================================================================================================================================================
+- Default partition read size = 128MB (spark.sql.files.maxPartitionBytes).
+- shuffle.partitions default = 200 -- now an UPPER BOUND, AQE coalesces down automatically post-shuffle.
+- cache()/persist(LEVEL): MEMORY_ONLY (default), MEMORY_ONLY_SER, MEMORY_AND_DISK(_SER), DISK_ONLY,
+  and _2 suffix = replicated on 2 nodes.
+- Catalyst plan flow: unresolved logical -> logical -> optimized logical -> physical plan(s) ->
+  SELECTED physical (cost model, using pre-run ESTIMATES).
+- AQE (default ON) fixes 3 things AFTER each stage using ACTUAL sizes: (1) shuffle->broadcast
+  promotion (2) coalesces small shuffle partitions (3) auto skew detection/handling.
+- broadcast(df) ships a full copy to every executor, no shuffle -- auto-triggers under
+  spark.sql.autoBroadcastJoinThreshold (~10MB default) even without calling it explicitly.
+- Skew fix order: AQE auto (default) -> broadcast join -> manual salting (extreme cases only) -> skew hints.
+- Sort-Merge Join = default strategy for two large tables: shuffle -> sort -> merge. bucketBy avoids
+  the shuffle+sort if both sides are pre-bucketed identically on the join key.
+- explain() = physical plan. explain("extended") = all plans. explain("formatted") = readable format.
+- Photon = native C++ vectorized engine, default ON for serverless/SQL warehouses/serverless pipelines.
+  FALLS BACK to plain JVM Spark on: Python/Scala UDFs (biggest cause), complex regex, some map/struct ops.
+======================================================================================================================================================
+PART D -- DELTA LAKE
+======================================================================================================================================================
+- Delta = transaction-log/metadata LAYER on top of Parquet files -- not a competing file format.
+- _delta_log: 1 JSON per commit + checkpoint Parquet every 10 commits + .crc files (corruption
+  detection + speed). Default retention = 7 days. DELETE = soft delete (file marked invalid, kept).
+- 3 ways to create a table: PySpark DeltaTable API / SQL CREATE TABLE USING DELTA / df.write.saveAsTable.
+- DeltaTable.forPath()/forName() = handle/instance for PySpark DML, reflects the base table.
+- SCD1 = MERGE overwrite, no history. SCD2 = MERGE + is_current flag + start/end dates, full history.
+- deltaTable.history(N) for audit trail; explode operationMetrics for custom audit tables.
+- Time travel: TIMESTAMP/VERSION AS OF (SQL) or .option("timestampAsOf"/"versionAsOf") (PySpark).
+- RESTORE TABLE = actually rolls back (vs. time travel which just reads).
+- OPTIMIZE = compacts small files (~1GB target), marks old ones invalid (doesn't delete them).
+- VACUUM = physically deletes invalid files past retention. ALWAYS dry-run first. RETAIN 0 HOURS
+  needs retentionDurationCheck disabled first. Kills time travel for removed versions.
+- ZORDER = co-locates related data while optimizing -- superseded by Liquid Clustering for new tables.
+- mergeSchema=True = ADDS columns (old rows get null). overwriteSchema=True = REPLACES schema (destructive).
+- Column stats only captured for first 32 columns by default -- reorder hot filter columns if past col 32.
+- LIQUID CLUSTERING (CLUSTER BY) = 2026 default: no fixed scheme, changeable later without a rewrite
+  (partitionBy could NOT do this).
+- PREDICTIVE OPTIMIZATION = auto OPTIMIZE/VACUUM/ANALYZE on UC managed tables -- manual = fallback now.
+- DELETION VECTORS = soft-delete markers instead of rewriting whole files -- default-on now, breaks
+  the old "every DELETE rewrites files" assumption.
+- Delta 4.x: VARIANT columns, coordinated commits (multi-engine writes), type widening (no rewrite).
+- UniForm = Delta auto-writes Iceberg+Hudi metadata alongside -- zero-copy multi-engine reads.
+  "Delta vs Iceberg" is often a false choice now.
+- Iceberg v3 GA + Managed Iceberg in UC -- Unity Catalog now governs both formats.
+======================================================================================================================================================
+PART E -- UNITY CATALOG
+======================================================================================================================================================
+- 1 metastore per region; a workspace attaches to ONE metastore; one metastore can serve MANY workspaces.
+- catalog.schema.table = 3-level namespace (was just database.table under Hive Metastore).
+- Volumes = UC object for non-tabular files (PDFs/images/weights), same grant model as tables.
+- Lineage = automatic, column-level. External Lineage (GA) extends beyond Databricks to sources/BI tools.
+- External Locations + Storage Credentials = modern replacement for dbutils.fs.mount().
+- Catalog Federation = query Snowflake/BigQuery/OneLake LIVE, no copy. Azure<->OneLake bidirectional GA.
+- OpenSharing (was Delta Sharing) = zero-copy sharing, now covers models/skills/unstructured data too.
+- UC Metrics = governed, reusable KPI definitions (joins/filters/grain baked in) -- SQL/BI/agents all
+  reference the SAME definition.
+- Business Glossary + Domains = authoritative term defs + business-aligned groupings -- feeds Genie Ontology.
+======================================================================================================================================================
+PART F -- LAKEFLOW
+======================================================================================================================================================
+- Checkpointing + trigger(processingTime=/once=True/availableNow=True) + outputMode(append/complete) =
+  exactly-once streaming guarantees. Can't sort a streaming DF; can't dedupe unbounded (only within watermark).
+- COPY INTO = simple/idempotent, up to low-thousands of files. Auto Loader = millions of files, streaming-native.
+- Auto Loader modes: directory listing (default) vs file notification (faster, needs cloud event config).
+- Lakeflow = Connect (ingest) + Declarative Pipelines (was DLT) + Jobs (was Workflows).
+- OLD: import dlt / @dlt.table.  NEW: from pyspark import pipelines as dp / @dp.table (streaming) /
+  @dp.materialized_view (NEW explicit decorator). Old @dlt code still runs unchanged.
+- AUTO CDC (was APPLY CHANGES INTO) = declarative SCD1/SCD2, no hand-written MERGE needed.
+- Streaming Table = append-only, exactly-once, Bronze. Materialized View = current-state of a query,
+  handles CDC, Silver/Gold. View = not persisted, pipeline-internal only.
+- Declarative pipelines resolve dependency order from data references, NOT code order in the file.
+- Lakeflow Connect = 100+ connectors + Zerobus (event streaming write API, ~100MB/s, single-digit-sec latency).
+======================================================================================================================================================
+PART G -- ARCHITECTURE
+======================================================================================================================================================
+- Bronze: unvalidated, schema-on-read, append-only, cheap.
+- Silver: structured+enriched, quality-checked, versioned/governed -- enrichment/agg/feature-eng beyond simple cleanup.
+- Gold: highly refined, query-optimized, business-oriented, single source of truth -- dimensional
+  models/data marts/analytical DBs.
+- Data Mesh = ORGANIZATIONAL layer, not a technical layering scheme (that's medallion) -- domain
+  ownership + data-as-product + self-serve platform + federated governance. UC Domains/Metrics/
+  OpenSharing map directly onto these principles.
+======================================================================================================================================================
+PART H -- MODERN OPERATIONAL DATA
+======================================================================================================================================================
+- Lakebase = serverless Postgres, built on Neon tech, stateless compute (WAL+data externalized) ->
+  instant branching, scale-to-zero, ~5x faster writes.
+- LTAP = unify OLTP(Lakebase)+OLAP(Lakehouse) on one copy, one UC model. "Zero copies" really means
+  zero MANUAL/ETL copies (2 physical reps kept in sync under the hood -- know this nuance).
+- Lakehouse//RT = new real-time SQL warehouse (Beta), Reyden engine, ~10x faster on some benchmarks.
+- Databricks Apps = small web apps inside the workspace, backed by Lakebase, governed by UC.
+======================================================================================================================================================
+PART I -- SUMMIT 2026
+======================================================================================================================================================
+- Keynote theme: "AI doesn't have an intelligence problem, it has a context problem" -- 4 pillars:
+  context / cost / control / choice.
+- Key GA/Beta: LTAP (coming soon), Lakehouse//RT (Beta), Lakebase DR+branching+5x writes, Lakeflow
+  100+ connectors GA, Iceberg v3 GA, UC Metrics, Catalog Federation, External Lineage GA, OpenSharing.
+======================================================================================================================================================
+PART J -- SPARK/SQL INTERVIEW CLASSICS
+======================================================================================================================================================
+- SparkSession = unified entry point (wraps old SparkContext + SQLContext + HiveContext).
+- spark-submit deploy modes: client (driver on submitting machine) vs cluster (driver on the cluster).
+- Unified Memory Management: execution memory (shuffle/join/sort) + storage memory (cache) DYNAMICALLY
+  borrow from each other. spark.memory.fraction / spark.memory.storageFraction.
+- Cluster sizing worked answer: reserve 1 core+1GB/node for OS, ~5 cores/executor, memory = usable
+  RAM / executors-per-node minus ~7% overhead. Know the TRADE-OFFS, not a single "right" number.
+- Join TYPES: inner / left / right / full / LEFT SEMI (left cols only, filter-style) / LEFT ANTI
+  (no-match rows) / CROSS (Cartesian, usually accidental -- classic perf anti-pattern).
+- Join STRATEGIES: Broadcast Hash (small side) / Shuffle Hash (hash table, riskier) / Sort-Merge
+  (safe default for 2 large sides) / Broadcast Nested Loop (non-equi join fallback, expensive).
+- File formats: CSV/JSON row+splittable+no schema. Avro row+good schema evolution+streaming.
+  Parquet/ORC columnar+high compression+analytics. Delta = transactional LAYER on Parquet.
+- "Job is slow" checklist: collect() abuse, repeated .count() w/o cache, accidental cross join,
+  chained withColumn loop, UDF-where-builtin-exists, small file problem, late filtering,
+  over-partitioned small shuffles.
+- ROWS BETWEEN (physical row count) vs RANGE BETWEEN (value-based range on ORDER BY column).
+- row_number() (no ties) vs rank() (ties, skips next) vs dense_rank() (ties, no skip) vs
+  percent_rank() vs ntile(n).
+- PIVOT (rows->cols) / UNPIVOT (cols->rows) / CTE (WITH clause).
+- CDF: delta.enableChangeDataFeed=true; readChangeFeed+startingVersion; _change_type/
+  _commit_version/_commit_timestamp columns. (Different from Lakebase's CDF -- see GOTCHAS.)
+- NOT NULL + CHECK = enforced. PRIMARY KEY/FOREIGN KEY = informational only, NOT enforced (gotcha).
+- GENERATED ALWAYS AS (expr) = computed column. GENERATED ALWAYS AS IDENTITY = auto-increment surrogate key.
+- Watermarking: withWatermark(col, threshold) bounds streaming state growth, enables
+  dropDuplicatesWithinWatermark(). Stream-static join = no watermark needed. Stream-stream join =
+  watermark REQUIRED on both sides.
+- Cluster access modes: Single User (everything incl. UC) / Shared (UC isolation between sessions) /
+  No Isolation Shared (legacy, NOT UC-compatible).
+- DABs (Databricks Asset Bundles) = YAML-as-code, git-based, `databricks bundle deploy -t <env>`.
+- Row-level security/masking: LEGACY = hand-written dynamic view w/ is_member(). MODERN = native UC
+  ROW FILTER / COLUMN MASK objects attached directly to the table.
+- System tables: system.access.audit / system.billing.usage / system.access.table_lineage -- queryable via SQL.
+- Testing PySpark: pure function in/out + pytest + local SparkSession fixture + chispa for
+  DataFrame-equality assertions.
+- SQL patterns: Nth highest = DENSE_RANK() OVER (...) = N. Running total = SUM() OVER (... ROWS
+  BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW). Gaps-and-islands = date/sequence MINUS
+  ROW_NUMBER() -> group by the difference.
+======================================================================================================================================================
+PART K -- DEEPER INTERNALS & PLATFORM SURFACE
+======================================================================================================================================================
+- Tungsten (stock Spark) = off-heap binary rows + whole-stage codegen (compiles query to bytecode).
+  Photon (Databricks) = native C++, true columnar/vectorized, replaces Tungsten execution for
+  supported ops. Photon fallback still keeps Tungsten's codegen benefit.
+- Kryo >> Java serialization (faster, smaller) -- spark.serializer config. Matters less for
+  DataFrame API (Tungsten's already binary); mostly an RDD-era/custom-object question now.
+- Speculative execution = duplicates a SLOW STRAGGLER task, uses whichever finishes first
+  (infra/node issue, NOT data skew). spark.speculation.
+- Dynamic Resource Allocation = the underlying Spark mechanism autoscaling/serverless build on.
+  spark.dynamicAllocation.enabled.
+- Delta uses OPTIMISTIC concurrency control: read version -> compute changes -> commit if no
+  conflict, else FAIL + caller retries. Exceptions to know by name: ConcurrentAppendException,
+  ConcurrentDeleteReadException, MetadataChangedException. Isolation: WriteSerializable (default,
+  more throughput) vs Serializable (strictest).
+- ANALYZE TABLE ... COMPUTE STATISTICS [FOR COLUMNS ...] -- feeds Catalyst's cost-based INITIAL
+  plan (AQE only fixes things AFTER a stage runs).
+- Auto Loader schemaEvolutionMode: addNewColumns (default, restarts stream) / rescue (doesn't fail,
+  puts new/mismatched data in _rescued_data) / failOnNewColumns / none.
+  _rescued_data column = safety net, unrecognized data preserved as JSON, never silently dropped.
+- Spark UI debug flow: JOBS (which action is slow) -> STAGES (check shuffle volume) -> TASKS
+  sorted by duration (skew/straggler check) -> EXECUTORS (high GC time = memory pressure) ->
+  SQL tab (live per-operator metrics).
+- Jobs/Workflows: ephemeral job cluster (cheap) vs all-purpose. Task types: notebook/python/JAR/
+  SQL/pipeline/dbt/nested job. FOR-EACH task (loop over a list). Conditional/if-else tasks.
+  taskValues.set/get (inter-task data passing). Job PARAMETERS (vs. per-notebook widgets).
+- Service principals = non-human identity for automation; OAuth (short-lived) preferred over PATs
+  (long-lived); jobs can "RUN AS" a service principal.
+- DBSQL native materialized views (standalone SQL object) vs Lakeflow pipeline MVs (pipeline-only)
+  -- two different implementations, same name (see GOTCHAS).
+- Clean Rooms = cross-ORG collaboration, built on Delta Sharing, RESTRICTED to pre-approved
+  queries, only aggregate results leave. Different problem than UC governance (within org) or
+  plain sharing (no compute restriction).
+- Marketplace = Delta-Sharing-powered discovery for datasets/models/apps.
+- UC admin hierarchy: Account Admin (billing/workspaces/SSO) > Metastore Admin (catalogs) >
+  Catalog Owner (domain-level -- ties to Data Mesh) > Workspace Admin (compute/settings only --
+  does NOT auto-grant data access, deliberately separated from governance).
+- Bloom filter indexes = legacy, point-lookup file-skipping on high-cardinality cols, superseded
+  by Liquid Clustering.
+- GDPR right-to-be-forgotten: DELETE alone is NOT enough (soft-delete + time travel still expose
+  it) -> VACUUM with short retention to physically remove, OR crypto-shredding (destroy a
+  per-user encryption key = data unreadable forever, no file rewrite needed).
+- Metadata-driven pipelines: config Delta table (source/target/keys/watermark per row) + one
+  generic parameterized pipeline looping over it. FOR-EACH task = the managed version of this pattern.
+- DBU = normalized compute unit; rate varies by compute type/instance/tier. Tiers: Standard /
+  Premium (adds UC RBAC/ABAC) / Enterprise (advanced compliance).
+======================================================================================================================================================
+*** END OF DATABRICKS CHEAT SHEET ***
+Full depth + code examples + "why" behind every bullet: Databricks_COMPLETE_HANDBOOK_2026.txt
+AI/GenAI cheat sheet: AI_on_Databricks_CHEAT_SHEET_2026.txt
+======================================================================================================================================================

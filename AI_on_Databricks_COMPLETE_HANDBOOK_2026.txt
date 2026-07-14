@@ -1,0 +1,1175 @@
+AI ON DATABRICKS -- COMPLETE HANDBOOK (BEGINNER TO ADVANCED) -- 2026 EDITION
+Self-contained reference. This entire topic area did not exist in your original 2023 notes at all
+-- built from scratch here, beginner concepts included, through to the full 2026 GenAI/Agent stack
+and Databricks Data + AI Summit 2026 (June 15-18, San Francisco) announcements.
+Companion file "Databricks_COMPLETE_HANDBOOK_2026.txt" covers the core data-engineering platform.
+======================================================================================================================================================
+======================================================================================================================================================
+PART A -- FOUNDATIONS OF AI / ML (start here if you're new to this side of Databricks)
+======================================================================================================================================================
+======================================================================================================================================================
+A1. AI vs ML vs Deep Learning vs GenAI -- the nesting-doll picture
+
+	ARTIFICIAL INTELLIGENCE (AI) -- the broadest umbrella term: any technique that makes a
+	computer perform a task that would normally require human intelligence (reasoning,
+	perception, language, decision-making). Includes hand-written rule-based systems too, not
+	just "learning" ones.
+
+	MACHINE LEARNING (ML) -- a SUBSET of AI where the system LEARNS patterns from data instead of
+	being explicitly hand-coded with rules. Classic examples: a model predicting house prices
+	from features (size, location, bedrooms), a model classifying an email as spam/not-spam.
+
+	DEEP LEARNING -- a SUBSET of ML using neural networks with many layers ("deep" networks).
+	Powers image recognition, speech recognition, and -- critically for this notepad -- modern
+	language models.
+
+	GENERATIVE AI (GenAI) -- a SUBSET of deep learning where the model GENERATES new content
+	(text, code, images, audio) rather than just predicting a label or a number. Large Language
+	Models (LLMs) like the ones powering Genie, Agent Bricks, and every "AI Function" in this
+	notepad are the language-focused branch of GenAI.
+
+	So: AI > ML > Deep Learning > GenAI/LLMs, each one nested inside the one before it.
+	This whole notepad is mostly about the GenAI/LLM layer, PLUS how Databricks' older, classic-ML
+	tooling (MLflow Tracking, Model Registry, Feature Store) still underpins it.
+======================================================================================================================================================
+A2. Why do AI work ON a data platform like Databricks at all?
+
+	The core Databricks pitch: your AI is only as good as the DATA it's grounded in and governed
+	by, and that data already lives in your lakehouse (Delta Lake + Unity Catalog -- see the
+	companion notepad). Historically, "doing AI" meant standing up a SEPARATE stack: a vector
+	database, a separate model-serving platform, a separate access-control system for who can
+	call which model, and a separate pipeline to keep that stack in sync with your real data.
+
+	Databricks' argument (repeated heavily at Summit 2026, framed as "AI doesn't have an
+	intelligence problem, it has a CONTEXT problem") is that keeping AI INSIDE the same governed
+	platform as your data means:
+		- an AI agent's access to data can be governed with the SAME Unity Catalog permissions
+		  model as a human analyst's access (Part E3)
+		- retrieval indexes (Vector Search, B5) stay automatically in sync with the SOURCE Delta
+		  table, instead of a separate ETL job keeping a vector DB up to date
+		- every model/agent/prompt call can be traced, evaluated, and audited the same way a SQL
+		  query can be (MLflow 3, Part E2)
+		- cost and quality can be governed centrally (Unity AI Gateway, Part E3) instead of every
+		  team wiring up its own OpenAI API key with no spend visibility
+======================================================================================================================================================
+A3. The classic ML lifecycle (still the backbone underneath GenAI work too)
+
+	Even before GenAI, "doing ML" on Databricks followed a repeatable lifecycle:
+		1. FEATURE ENGINEERING -- derive useful input columns from raw data (e.g. "days since
+		   last purchase" from a raw transactions table)
+		2. TRAINING -- fit a model (scikit-learn, XGBoost, PyTorch, etc.) against those features
+		3. TRACKING -- log every experiment's parameters, metrics, and resulting model artifact
+		   so you can compare runs and reproduce results later
+		4. REGISTRY -- once you pick a winning model, register it as an official, versioned asset
+		5. SERVING -- deploy the registered model behind an endpoint for real-time or batch
+		   predictions
+		6. MONITORING -- watch for the model's real-world performance drifting from what you
+		   measured at training time
+
+	GenAI/agent work (Parts B-F) follows almost the SAME lifecycle shape -- you still track
+	experiments, register versions, serve behind an endpoint, and monitor production behavior --
+	just with GenAI-specific concepts layered on top of steps 3 and 6 (tracing instead of plain
+	metric-logging, LLM judges instead of plain accuracy/RMSE, Part E2).
+======================================================================================================================================================
+A4. MLflow (classic) -- Tracking, Registry, and Serving basics
+
+	MLflow is Databricks' open-source (and Databricks-managed) tool for the lifecycle in A3. It
+	predates the GenAI wave by years, and MLflow 3 (Part E2) extends it for GenAI rather than
+	replacing it.
+
+	TRACKING -- log parameters/metrics/artifacts for every training run:
+		import mlflow
+		with mlflow.start_run():
+		    mlflow.log_param("n_estimators", 100)
+		    model = train_model(...)
+		    mlflow.log_metric("accuracy", 0.91)
+		    mlflow.sklearn.log_model(model, "model")
+	Every run is browsable/comparable in the MLflow Experiments UI -- who ran it, what
+	hyperparameters, what score, and the resulting model artifact, all in one place.
+
+	MODEL REGISTRY -- once you have a winning run, register the model as a named, VERSIONED asset:
+		mlflow.register_model("runs:/<run_id>/model", "catalog.schema.my_model_name")
+	This gives you version numbers (v1, v2, v3...) so downstream consumers always know exactly
+	which version they're pointed at, and you can promote/rollback without re-deploying code.
+	2026 CORRECTION/UPDATE worth knowing precisely: registered models now live INSIDE UNITY
+	CATALOG (catalog.schema.model_name, the same 3-level namespace as tables -- companion notepad
+	Part E3), which means a model gets the SAME governance/lineage/audit treatment as any other
+	data asset. As PART of that move, the OLD workspace-level Model Registry's fixed lifecycle
+	STAGES (Staging / Production / Archived) are DEPRECATED -- Unity Catalog's model registry uses
+	ALIASES instead (mutable, custom-named pointers you can attach to any version, e.g. "champion"/
+	"challenger", not a fixed enum):
+		client.set_registered_model_alias("catalog.schema.my_model", "champion", version=3)
+		model = mlflow.pyfunc.load_model("models:/catalog.schema.my_model@champion")
+	Aliases are more flexible than the old fixed stages (you can define whatever alias names make
+	sense for your workflow, and move an alias between versions instantly) -- this is a genuine,
+	concrete "the docs changed since older tutorials were written" trap worth knowing about if an
+	interviewer asks about model promotion, since a lot of pre-2024 material (and a fair amount of
+	still-circulating tutorial content) references the old Staging/Production stage names directly.
+
+	SERVING -- deploy a registered model behind a REST endpoint (Model Serving, Part C2) so
+	applications can call it for real-time predictions, or run it as a batch job against a whole
+	table of new records.
+======================================================================================================================================================
+A5. Feature Store / Feature Engineering
+
+	A FEATURE is a derived input column a model actually trains/predicts on (e.g. "average order
+	value over the last 30 days" derived from a raw orders table).
+	The problem a Feature Store solves: the SAME feature logic needs to be computed consistently
+	in two very different contexts --
+		- TRAINING time -- computed in bulk, over historical data, often looking back at what the
+		  feature's value WAS at each historical point in time (not its value TODAY) -- this is
+		  called POINT-IN-TIME CORRECTNESS, and getting it wrong (accidentally using "today's"
+		  value of a feature to train on "yesterday's" label) causes a subtle but serious bug
+		  called "training-serving skew" or "label leakage."
+		- SERVING/INFERENCE time -- computed (or looked up) for a SINGLE new record, in real time,
+		  with low latency.
+	A Feature Store centralizes feature DEFINITIONS so both training and serving pull the exact
+	same logic/values, instead of two teams re-implementing (and subtly mis-implementing) the
+	same feature twice. On Databricks this is built on Delta tables (for the offline/training
+	side) with a low-latency online store (increasingly Lakebase, see companion notepad Part H1)
+	for the real-time serving side.
+======================================================================================================================================================
+A6. What is a Foundation Model / LLM?
+
+	A Foundation Model is a very large model (usually a neural network with billions of
+	parameters) pre-trained on a massive, broad dataset (e.g. a large fraction of the public
+	internet), making it "foundational" -- a general-purpose starting point that can be adapted
+	(via prompting, fine-tuning, or RAG -- see A7) to many different downstream tasks, instead of
+	training a brand-new model from scratch for every task.
+	A Large Language Model (LLM) is the text-focused kind of foundation model -- trained to
+	predict the next piece of text given everything before it, which turns out to be enough to
+	make it useful for conversation, summarization, classification, code generation, and more.
+	Examples you'll encounter on Databricks: Databricks' own DBRX model, Meta's Llama family,
+	and (via Model Serving's "external model" support, Part C3) OpenAI's, Anthropic's, and
+	Google's frontier models.
+======================================================================================================================================================
+A7. What is RAG (Retrieval-Augmented Generation)?
+
+	An LLM's knowledge is frozen at whatever data it was trained on -- it doesn't automatically
+	know your company's private data, or anything that happened after its training cutoff.
+	RAG is the standard pattern for fixing that WITHOUT retraining the model:
+		1. take the user's question
+		2. SEARCH a knowledge base (your own governed documents/tables) for the most relevant
+		   pieces of information (this is what Vector Search, Part B5, does)
+		3. STUFF those relevant pieces into the prompt alongside the user's question
+		4. ask the LLM to answer USING that retrieved context
+	Result: the LLM's answer is "grounded" in your actual, current, private data, and can cite
+	where the answer came from -- instead of the model guessing from its frozen training data
+	(which, for company-specific questions, it usually can't answer correctly at all, or worse,
+	"hallucinates" -- confidently states something false).
+======================================================================================================================================================
+A8. Embeddings & vector similarity (the mechanism underneath RAG/Vector Search)
+
+	An EMBEDDING is a numeric vector (e.g. a list of ~1000 floating point numbers) that represents
+	the MEANING of a piece of text, produced by a specialized embedding model. Texts with SIMILAR
+	meaning end up with embedding vectors that are mathematically CLOSE together (measured via
+	cosine similarity or a similar distance metric), even if they don't share any of the same
+	words.
+	This is what makes SEMANTIC search possible: searching for "cancel my subscription" can
+	correctly retrieve a document titled "how to end your membership" even though the two share
+	almost no literal words -- something old-fashioned keyword search couldn't reliably do.
+	A "vector index" (Part B5) is just a specialized data structure that stores embeddings and can
+	very quickly find the nearest ones to a given query embedding, even across millions of documents.
+======================================================================================================================================================
+A9. AI Agent vs a plain chatbot
+
+	A plain CHATBOT/LLM call takes an input and produces an output -- one shot, no ability to
+	take real ACTIONS in the world beyond generating text back to the user.
+	An AGENT is an LLM given: (a) a defined set of TOOLS it's allowed to call (e.g. "run this SQL
+	query," "look something up in Salesforce," "send a Slack message"), and (b) the ability to
+	reason in a LOOP -- decide it needs a tool, call it, look at the result, decide what to do
+	next (possibly call another tool), and only produce a final answer once it's actually gathered
+	what it needs. This "reason, act, observe, repeat" loop is often called the ReAct pattern in
+	the ML literature.
+	Practically: a chatbot can TELL you today's exchange rate if you paste it in; an agent can
+	go LOOK UP today's exchange rate itself via a tool call, then answer.
+======================================================================================================================================================
+A10. Why AI governance matters (motivates Parts E3/F onward)
+
+	Once an LLM stops being a one-shot text generator and becomes an AGENT that can call tools,
+	read data, and take actions, the SAME questions you already ask about human employee access
+	apply to it: What is this agent allowed to READ? What is it allowed to DO (read-only vs
+	write)? How much can it SPEND calling paid model APIs before someone notices? Can we PROVE,
+	after the fact, exactly what it did and why (for audit/compliance)? Is it leaking PII, or
+	vulnerable to being tricked ("prompt injection") into ignoring its instructions?
+	Part E3 (Unity AI Gateway) is Databricks' answer to all of the above -- the same governance
+	instinct that produced Unity Catalog for DATA now extends to models/agents/tools.
+======================================================================================================================================================
+======================================================================================================================================================
+PART B -- PREPARING DATA FOR AI
+======================================================================================================================================================
+======================================================================================================================================================
+B1. Governing unstructured data (documents, images, PDFs) for AI use
+
+	AI work is often the FIRST time a data team has to seriously govern UNSTRUCTURED data (PDFs,
+	scanned contracts, product images, call-center audio) with the same rigor as structured
+	tables. Two 2026 Databricks mechanisms handle this (both detailed fully in the companion
+	Databricks notepad, summarized here):
+		- VOLUMES -- a Unity Catalog object type governing raw files (PDFs/images/audio/model
+		  weights) with the same grant/audit model as tables; typical landing spot for raw
+		  documents before you chunk/embed them for RAG.
+		- FILE type (Beta) -- lets a managed Delta/Iceberg table hold unstructured data as a
+		  proper COLUMN type, alongside structured columns, rather than only storing a path
+		  reference to a file living elsewhere.
+	Either way, the goal is: your RAG/agent pipeline reads from a GOVERNED Unity Catalog object
+	(Volume or table), not an ungoverned pile of files somewhere -- so the same access controls
+	that protect a sensitive table also protect the sensitive PDF the agent might retrieve from.
+======================================================================================================================================================
+B2. Delta tables as the source of truth for AI data
+
+	Both TRAINING data (for fine-tuning, Part C4) and RAG's knowledge base (Part A7) should live
+	as governed Delta tables/Volumes, for the same reasons any other analytics workload benefits
+	from Delta: ACID guarantees your training set isn't corrupted mid-read, time travel lets you
+	reproduce exactly what a model was trained/evaluated on, and Unity Catalog governance means
+	you can prove who could access what data a given model or agent was exposed to.
+======================================================================================================================================================
+B3. Preparing documents for RAG -- chunking (a beginner concept worth knowing)
+
+	Documents (a 50-page PDF, a long wiki article) are almost always too long to stuff entirely
+	into an LLM's prompt, and embedding a whole long document as ONE vector loses too much
+	specific detail to retrieve well. So documents are split into smaller CHUNKS (e.g. a few
+	paragraphs each) BEFORE embedding -- each chunk gets its own embedding vector, so a search can
+	retrieve just the specific, relevant paragraph(s) instead of an entire irrelevant document.
+	Chunk size/overlap is a real, common tuning knob in RAG system quality -- too small loses
+	context around the answer, too large dilutes the embedding's specificity and wastes prompt
+	space. Databricks' Agent Bricks Knowledge Assistant template (Part D4) handles this chunking
+	step automatically as part of its auto-optimization loop.
+======================================================================================================================================================
+B4. AI Functions in SQL -- calling an LLM directly from a SQL query
+
+	These functions let you invoke a foundation model as a plain SQL function call -- no separate
+	Python serving app, no external API wiring.
+
+	ai_query(endpoint, prompt)          -- generic: send any prompt to any Model Serving endpoint
+		SELECT ai_query('my-endpoint', 'Summarize this: ' || review_text) FROM reviews;
+
+	ai_classify(text, labels)           -- zero-shot classification into a fixed label set
+		SELECT ai_classify(ticket_text, ARRAY('billing','technical','shipping')) AS category
+		FROM support_tickets;
+
+	ai_extract(text, schema)            -- pull structured fields out of unstructured text
+		SELECT ai_extract(contract_text, ARRAY('vendor_name','contract_value','end_date'))
+		FROM contracts;
+
+	ai_summarize(text)                  -- condense long text
+	ai_translate(text, target_lang)     -- translate a column of text
+	ai_fix_grammar(text)                -- clean up free-text input
+	ai_similarity(text1, text2)         -- semantic similarity score between two strings
+	ai_mask(text, entities)             -- redact PII entity types from free text
+
+	WHY THIS MATTERS FOR A DATA ENGINEER: Gold-layer enrichment that would previously have needed
+	a bespoke external Python microservice call ("classify this support ticket," "extract entities
+	from this PDF's raw text," "redact PII before this table is shared downstream") can now live
+	as ONE LINE inside a normal SQL query or a Lakeflow Declarative Pipeline -- fitting naturally
+	into the medallion architecture you already know (companion notepad Part G) instead of
+	requiring a separate service to call out to.
+======================================================================================================================================================
+B5. Mosaic AI Vector Search
+
+	Implements the retrieval half of RAG (A7/A8) as a managed Databricks service.
+		1. create an EMBEDDING MODEL endpoint (or use a Databricks-provided one) that turns text
+		   into vectors
+		2. create a VECTOR SEARCH INDEX, pointed at a source Delta table -- Databricks handles
+		   embedding every row and building the searchable index automatically
+		3. as the SOURCE table changes (new rows inserted/updated), the index AUTO-SYNCS -- there
+		   is no separate ETL job you maintain to keep embeddings fresh, unlike a standalone
+		   vector database bolted onto your stack
+		4. query the index for the K most similar rows to a given query text/vector:
+
+	from databricks.vector_search.client import VectorSearchClient
+	vsc = VectorSearchClient()
+	index = vsc.get_index(endpoint_name="my_endpoint", index_name="catalog.schema.my_index")
+	results = index.similarity_search(
+	    query_text="how do I reset my password?",
+	    columns=["chunk_text", "source_doc"],
+	    num_results=5
+	)
+	This is the standard building block behind almost every RAG chatbot/Knowledge Assistant on
+	Databricks (see Agent Bricks' Knowledge Assistant template, Part D4).
+======================================================================================================================================================
+======================================================================================================================================================
+PART C -- SERVING & FOUNDATION MODELS
+======================================================================================================================================================
+======================================================================================================================================================
+C1. Foundation Model APIs
+
+	Databricks hosts a curated set of popular open foundation models (e.g. Llama family models,
+	Databricks' own DBRX) ready to call via a simple API, with two pricing/capacity modes:
+		- PAY-PER-TOKEN -- simplest option, no capacity to manage, billed per token processed --
+		  good for getting started or for variable/bursty traffic.
+		- PROVISIONED THROUGHPUT -- reserve guaranteed capacity (a certain tokens/second rate) for
+		  predictable, high-volume, latency-sensitive production traffic -- more like reserving a
+		  cluster than paying per-call.
+======================================================================================================================================================
+C2. Model Serving -- one endpoint abstraction for everything
+
+	A single, unified way to deploy and call a model, REGARDLESS of where the model actually comes
+	from:
+		- a Databricks-hosted FOUNDATION model (C1)
+		- an EXTERNAL model (OpenAI, Anthropic, Google Gemini, etc.) -- Model Serving proxies the
+		  call, so your application code talks to ONE consistent Databricks endpoint URL/API shape
+		  no matter which underlying provider is actually answering, and Unity Catalog/Unity AI
+		  Gateway governance (Part E3) applies uniformly regardless of provider.
+		- YOUR OWN custom or fine-tuned model (registered via MLflow, A4/C4)
+	Every endpoint gets automatic scaling, request/response logging (feeding into MLflow tracing,
+	Part E2), and governed access via Unity Catalog just like any other catalog object.
+======================================================================================================================================================
+C3. Calling an external model (OpenAI/Anthropic/Gemini) through Model Serving
+
+	Rather than your application code holding a raw OpenAI/Anthropic API key directly, you
+	register the external model AS a Model Serving endpoint (with the actual provider API key
+	stored securely once, centrally), and your application calls the DATABRICKS endpoint instead.
+	Benefit: you get Unity Catalog governance, Unity AI Gateway spend caps/routing (Part E3), and
+	MLflow tracing (Part E2) on EVERY call to that external provider too -- not just calls to
+	Databricks-hosted models -- and you can swap the underlying provider later without changing
+	any application code, just the endpoint's backing configuration.
+======================================================================================================================================================
+C4. Fine-tuning
+
+	FINE-TUNING means further training an existing foundation model on YOUR OWN, narrower dataset
+	so it performs better on a specific task/style/domain than the general-purpose base model
+	would out of the box.
+	WHEN to reach for fine-tuning vs. simpler options:
+		- PROMPTING (just writing a good prompt) -- try this FIRST, it's free and instant
+		- RAG (A7) -- use this when the model needs access to FACTS/DATA it doesn't already know
+		  (your company's current documents/data) -- most "the bot doesn't know our stuff" problems
+		  are RAG problems, not fine-tuning problems
+		- FINE-TUNING -- use this when the model needs to learn a specific STYLE, FORMAT, or
+		  narrow SKILL that prompting/RAG can't reliably teach it (e.g. always output a very
+		  specific JSON schema, adopt a very specific tone, get very good at one narrow, repetitive
+		  task type) -- generally the LAST resort, since it's more expensive and slower to iterate
+		  on than prompting or RAG.
+	Databricks supports fine-tuning via SERVERLESS GPUs (companion notepad references this too) --
+	you don't provision/manage a GPU cluster yourself; you request the fine-tuning job and
+	Databricks handles the underlying compute. Agent Bricks (Part D4) can also automatically train
+	smaller, cheaper CUSTOM models competitive with frontier models on a narrow task, as part of
+	its auto-optimization loop, without you manually managing a fine-tuning job at all.
+======================================================================================================================================================
+C5. Batch inference vs real-time serving
+
+	BATCH inference -- run a model (or an AI Function, B4) across an entire TABLE of records at
+	once (e.g. classify every support ticket from the last 24 hours in one Lakeflow pipeline run)
+	-- fits naturally into the medallion/Lakeflow patterns from the companion notepad, often just
+	an ai_query()/ai_classify() call inside a normal batch/streaming transformation.
+	REAL-TIME serving -- a live endpoint (Model Serving, C2) responding to individual requests as
+	they arrive (e.g. a chatbot answering a user's question right now) -- lower latency
+	requirements, typically the mode agents (Part D) operate in.
+======================================================================================================================================================
+======================================================================================================================================================
+PART D -- BUILDING AGENTS
+======================================================================================================================================================
+======================================================================================================================================================
+D1. Agent fundamentals recap + tool calling
+
+	Recall from A9: an agent is an LLM equipped with TOOLS and a reasoning LOOP. "TOOL CALLING"
+	(sometimes "function calling") is the actual mechanism -- you describe each available tool to
+	the model (its name, what it does, what parameters it takes), and the model, instead of
+	always just replying with text, can reply with "please call tool X with these arguments,"
+	your application code actually executes that tool, feeds the result back to the model, and the
+	model continues reasoning with that new information.
+	Well-designed tools for a Databricks agent are often UNITY CATALOG FUNCTIONS -- ordinary SQL
+	or Python functions registered in Unity Catalog -- so the SAME governance/audit/discovery
+	model that applies to tables also applies to "things an agent is allowed to do."
+======================================================================================================================================================
+D2. MCP -- Model Context Protocol
+
+	MCP is an OPEN STANDARD (not Databricks-specific -- originally introduced by Anthropic, now
+	widely adopted industry-wide) for how an AI agent connects to EXTERNAL tools/systems (Slack,
+	Jira, GitHub, Google Drive, a company's internal ticketing system, etc.) in a consistent way.
+	Before MCP, every agent framework/vendor tended to build its OWN bespoke integration code for
+	"connect to Slack," "connect to Jira," etc. -- MCP defines one common protocol so a tool
+	built to be "MCP-compatible" can be plugged into ANY MCP-compatible agent, instead of a new
+	bespoke integration per agent framework.
+	On Databricks, agents built with the Mosaic AI Agent Framework (D3) natively support connecting
+	to MCP servers, and credentials/access for those MCP connections are managed through Unity
+	Catalog (so "which external systems can this agent touch, and as whom" is governed the same
+	way table access is). Unity AI Gateway (Part E3) also treats registered MCP servers as
+	first-class governed objects, and Agent Bricks (D4) added an MCP tool-discovery CATALOG in
+	2026 so teams can find/share approved MCP tools org-wide instead of everyone wiring up their
+	own connection to the same external system.
+======================================================================================================================================================
+D3. Mosaic AI Agent Framework -- code-first agent building
+
+	The "full control, bring your own framework" option for building agents on Databricks.
+		- write agent logic using whatever orchestration approach you prefer (LangChain,
+		  LangGraph, a fully custom Python loop) -- Databricks doesn't lock you into one framework
+		- define TOOLS (D1) including Unity Catalog Functions and MCP servers (D2)
+		- LOG the agent with MLflow (so every version is tracked, A4/E2), REGISTER it in Unity
+		  Catalog (so it's a governed, versioned asset like a model), and DEPLOY it to Model
+		  Serving (C2) -- the exact SAME lifecycle you'd use for a plain ML model, which is the
+		  core pitch versus standing up a bare LangChain app with no governance/observability
+		  wrapper around it.
+	This is the option to reach for when Agent Bricks' pre-built templates (D4) don't fit your
+	exact use case and you need full custom control over the agent's reasoning loop.
+======================================================================================================================================================
+D4. Agent Bricks -- auto-optimized, higher-level agent building
+
+	Launched 2025, significantly expanded at Summit 2026 into what Databricks now calls a full
+	"developer agent platform." The pitch: instead of you manually writing prompts, picking chunk
+	sizes, and eyeballing whether outputs look good, you DESCRIBE THE TASK, and Agent Bricks:
+		1. auto-generates DOMAIN-SPECIFIC SYNTHETIC DATA relevant to your task
+		2. auto-builds TASK-AWARE BENCHMARKS/evaluation sets from that synthetic data
+		3. auto-creates LLM JUDGES (Part E2) calibrated to what "good" looks like for your task
+		4. searches over optimization techniques (prompt variants, model choice, RAG settings,
+		   even fine-tuning a smaller model) to hit a QUALITY/COST TARGET you specify
+	-- effectively automating the tedious trial-and-error loop of building a good GenAI
+	application by hand.
+
+	READY-MADE TEMPLATES:
+		- INFORMATION EXTRACTION AGENT -- turn documents (PDFs, emails, scanned reports) into
+		  structured fields (an automated version of the ai_extract pattern in B4, but with
+		  Agent Bricks' auto-optimization applied on top)
+		- KNOWLEDGE ASSISTANT AGENT -- grounded Q&A over your enterprise documents, with cited
+		  sources -- effectively a fully auto-optimized RAG pipeline (handles the chunking from
+		  B3, the Vector Search index from B5, and the retrieval prompt, all auto-tuned)
+		- CUSTOM LLM / CUSTOM AGENT -- general-purpose, bring your own evaluation criteria
+		- SUPERVISOR AGENT -- multi-agent ORCHESTRATION: a top-level agent that routes a request
+		  to the right specialist sub-agent (could be a Genie space, another Agent Bricks agent,
+		  or a custom Mosaic AI Agent Framework agent) and stitches the results together
+
+	2026 ADDITIONS:
+		- SECURE SANDBOXES -- isolated virtual machines for running code-interpreter-style tools
+		  or subagents safely, with down-scoped (restricted) Unity Catalog credentials rather than
+		  the agent's full permission set
+		- AGENT MEMORY -- persistent state across sessions (an agent can "remember" earlier
+		  conversations, often backed by Lakebase -- companion notepad Part H1)
+		- MCP TOOL DISCOVERY -- a built-in catalog of approved MCP tools (D2), discoverable and
+		  shareable across the organization
+		- option to train smaller CUSTOM models (via reinforcement learning techniques) that are
+		  competitive with frontier models on your NARROW task specifically, at meaningfully
+		  lower cost-per-query than always calling a large frontier model
+
+	Databricks-reported adoption stats (as of Summit 2026): 100,000+ agents built on Agent Bricks,
+	processing 1+ QUADRILLION tokens per year in aggregate across customers. Named customers
+	include AstraZeneca, 7-Eleven, Fox Corporation, Block, and Hawaiian Electric.
+======================================================================================================================================================
+D5. Multi-agent systems -- the Supervisor pattern in more depth
+
+	As tasks get more complex, a SINGLE agent trying to do everything (search documents, run SQL,
+	call external APIs, format a final report) tends to get unreliable -- too many responsibilities
+	crammed into one prompt/reasoning loop.
+	The SUPERVISOR pattern splits this up: one top-level "supervisor" agent's ONLY job is to
+	understand the user's request and DELEGATE pieces of it to the right specialist sub-agent
+	(e.g. delegate "what were Q3 sales?" to a Genie space that's an expert at querying the sales
+	tables, delegate "draft a follow-up email" to a different agent tuned for writing), then
+	combine their outputs into one coherent final answer. This mirrors how a human manager
+	delegates to specialists rather than trying to be an expert at every sub-task personally.
+	Both Agent Bricks (D4, via its Supervisor template) and the Mosaic AI Agent Framework (D3,
+	via custom orchestration code) support building this pattern; Omnigent (Part F4) is
+	Databricks' framing for governing the resulting web of agents as one coherent, unified runtime.
+======================================================================================================================================================
+======================================================================================================================================================
+PART E -- EVALUATING & GOVERNING AI IN PRODUCTION (LLMOps)
+======================================================================================================================================================
+======================================================================================================================================================
+E1. Why evaluating a GenAI app is a genuinely different problem than evaluating classic ML
+
+	A classic ML model (A3) usually has one clean, objective metric to optimize -- accuracy, RMSE,
+	precision/recall -- computed automatically by comparing a prediction to a known correct label.
+	A GenAI app's output is FREE-FORM TEXT (or a whole agent trajectory of tool calls) -- there's
+	rarely one single "correct" answer to compare against character-for-character, and quality
+	dimensions like "was this answer actually helpful," "did it hallucinate a fact," "was it safe/
+	on-brand" don't reduce to a simple numeric formula the way RMSE does.
+	This is WHY the GenAI world invented "LLM judges" (E2) -- using another LLM, carefully
+	prompted and calibrated against human-labeled examples, to SCORE outputs on these fuzzier
+	dimensions at scale, since a human can't manually review every single production interaction.
+======================================================================================================================================================
+E2. MLflow 3 for GenAI
+
+	Extends the classic MLflow you already know (A4 -- Tracking, Registry are unchanged and still
+	used) with a GenAI-native layer:
+
+	TRACING -- automatically logs EVERY input, intermediate step (including every tool call an
+	agent makes), and output of an LLM/agent call -- this is the debugging foundation everything
+	else in this section builds on top of, since you can't evaluate or fix what you can't see.
+		import mlflow
+		mlflow.openai.autolog()          # autolog also available for LangGraph, Anthropic, and
+		                                    20+ other SDKs -- no manual instrumentation needed
+
+		@mlflow.trace
+		def my_app(user_input: str):
+		    response = client.chat.completions.create(
+		        model="...", messages=[{"role": "user", "content": user_input}]
+		    )
+		    return response.choices[0].message.content
+	Every call to my_app() now produces a full trace (viewable in the MLflow UI) showing exactly
+	what was sent to the model, what came back, and how long each step took.
+
+	LLM JUDGES / SCORERS -- automated quality metrics (correctness, safety, relevance, groundedness
+	-- i.e. "is the answer actually supported by the retrieved documents") computed by prompting
+	another LLM to grade a trace. Critically, the SAME scorers run in DEVELOPMENT (comparing
+	prompt/model versions before shipping) AND in PRODUCTION MONITORING (continuously grading
+	live traffic) -- so a regression caught in production is measured with the exact same yardstick
+	you used during development, not a completely separate, hand-rolled monitoring script.
+
+	REVIEW APP -- a structured UI where a DOMAIN EXPERT (not necessarily an engineer) reviews real
+	production traces and gives feedback -- thumbs up/down, or a correction to what the ideal
+	answer should have been. This human feedback (a) directly becomes a high-quality EVALUATION
+	DATASET for testing future versions, and (b) is used to calibrate/align the automated LLM
+	judges above, so the automated scores actually track what a real human considers "good."
+
+	PROMPT / APP VERSION TRACKING -- every meaningful change (a new prompt wording, a different
+	underlying model, a different retrieval setting) is versioned, so you can compare version
+	N vs version N-1 side by side on the same evaluation set, and trace a bad production output
+	back to the EXACT code/prompt/data version that produced it -- rather than "something changed
+	somewhere and we're not sure what."
+
+	GOVERNANCE -- prompts, registered agent "apps," and traces are all Unity Catalog objects, just
+	like tables and models -- same permissions, same audit trail, same discoverability.
+======================================================================================================================================================
+E3. Unity AI Gateway -- runtime governance for AI
+
+	Extends Unity Catalog's governance philosophy (companion notepad Part E) from DATA objects to
+	AI RUNTIME BEHAVIOR:
+		- registers MODELS (Databricks-hosted and external), MCP TOOL SERVERS (D2), AGENTS, and
+		  "SKILLS" as first-class governed objects -- discoverable, permission-able, auditable,
+		  the same as a table.
+		- HARD SPEND CAPS + smart cost/quality ROUTING across model providers -- e.g. route
+		  cheap/high-volume steps to a small, inexpensive model and escalate only genuinely hard
+		  reasoning steps to an expensive frontier model; switching providers/models is a
+		  CONFIGURATION change at the Gateway level, not a code rewrite in every application that
+		  calls it.
+		- CONTEXTUAL SERVICE POLICIES (Beta) -- allow/deny/require-human-approval rules for
+		  SPECIFIC agent actions, evaluated AT RUNTIME (e.g. "this agent may read files in this
+		  folder, but must never be allowed to write/delete anything," or "any action estimated to
+		  cost more than $X requires a human to approve it first").
+		- UNIFIED TRACING/AUDIT across every model call AND every tool call any agent makes,
+		  organization-wide -- one place to answer "what did our AI systems actually do this week,
+		  and how much did it cost."
+		- BUILT-IN GUARDRAILS -- PII exposure detection, prompt-injection detection, and content
+		  filtering, with an ecosystem of security partners (CrowdStrike, Palo Alto Networks,
+		  Okta, Zscaler, Netskope, and others) plugging into this layer.
+
+	The mental-model shift this represents: governance used to mean "who can access this table."
+	It now ALSO means "what is this agent allowed to actually DO, in a given interaction, right
+	now" -- a genuinely new kind of policy question that didn't exist before agents could take
+	real actions rather than just generate text.
+======================================================================================================================================================
+E4. Omnigent
+
+	Databricks' framing for a SINGLE, unified, governed agent RUNTIME spanning Genie (Part F),
+	Agent Bricks (D4), and any fully custom agent built via the Mosaic AI Agent Framework (D3) --
+	regardless of WHICH layer actually built a given agent, it's governed through the SAME Unity
+	AI Gateway policies (spend caps, routing, tracing, contextual approval rules from E3). The
+	goal is to prevent a fragmented situation where "the Genie agents are governed one way, the
+	Agent Bricks agents another way, and the custom agents nobody's tracking at all."
+======================================================================================================================================================
+E5. Monitoring AI in production
+
+	Beyond one-off evaluation before shipping (E2), production AI systems need ONGOING monitoring
+	for two distinct failure modes:
+		- QUALITY DRIFT -- the same LLM judges/scorers used during development keep running
+		  continuously against live traffic, catching a real-world regression (e.g. users
+		  starting to ask about a new product the RAG knowledge base hasn't been updated with yet,
+		  causing a spike in "ungrounded answer" scores) before it becomes a widespread complaint.
+		- COST DRIFT -- Unity AI Gateway's spend tracking (E3) surfaces when usage patterns shift
+		  in a way that's quietly getting expensive (e.g. an agent looping and re-calling an
+		  expensive tool far more than expected), which a purely quality-focused monitoring setup
+		  would miss entirely.
+	Genie ZeroOps (Part F3) applies this same "autonomous background monitoring" philosophy to
+	data/ML pipelines more broadly, not just to GenAI-specific quality/cost metrics.
+======================================================================================================================================================
+======================================================================================================================================================
+PART F -- GENIE: THE BUSINESS-FACING AI LAYER
+======================================================================================================================================================
+======================================================================================================================================================
+F1. Evolution: "AI/BI Genie" -> "Genie One"
+
+	PRE-2026 -- "AI/BI Genie" was primarily a NATURAL-LANGUAGE-TO-SQL assistant: a business user
+	types a question in plain English against a defined dataset (a "Genie Space" -- a curated,
+	scoped set of tables the business user is allowed to ask questions against), and Genie
+	generates + runs the SQL, returning a chart/table answer. Useful, but fundamentally a
+	Q&A tool.
+
+	GENIE ONE (GA, Summit 2026) -- expands this into a full "agentic coworker" for business teams
+	(marketing, finance, sales, etc.), going well beyond answering one-off questions:
+		- can PRODUCE actual documents, reports, and artifacts, not just a single chart/table answer
+		- ships as an app on WEB, iOS, and ANDROID
+		- supports SCHEDULING (e.g. "email me this report every Monday morning") and ALERTS
+		  (e.g. "notify me if churn crosses X%")
+		- integrates with MCP tools (D2) -- e.g. a Genie conversation can trigger an action in an
+		  external system, not just read data
+	In short: Genie moved from "a smarter way to ask a question" to "a coworker that can also go
+	produce and deliver work product on a schedule."
+======================================================================================================================================================
+F2. Genie Ontology -- the context layer underneath Genie (and other agents)
+
+	The single biggest technical answer behind the Summit 2026 keynote line "AI doesn't have an
+	intelligence problem, it has a CONTEXT problem." Genie Ontology is a LIVE, SELF-IMPROVING
+	context layer that automatically extracts BUSINESS MEANING from your data estate -- table
+	relationships, metric definitions (pulling directly from Unity Catalog Metrics, companion
+	notepad Part E9), Business Glossary terms (companion notepad Part E10), and even
+	QUERY-POPULARITY signals (which tables/joins/filters people actually use most, as a signal
+	for what's "canonical") -- straight out of Unity Catalog and your Lakeflow pipelines.
+	Why this matters practically: without it, an LLM asked "what's our churn rate?" has NO idea
+	whether your company defines churn as "cancelled in the last 30 days" or "didn't renew at
+	contract end" -- it would have to GUESS, and often guess wrong (a hallucination, just about
+	business logic instead of a fact). Genie Ontology is what lets Genie answer using YOUR
+	company's actual, governed definition of "churn," pulled from the Business Glossary/Metrics
+	layer rather than invented on the spot.
+======================================================================================================================================================
+F3. The rest of the Genie family
+
+	GENIE AGENTS (GA) -- turn a one-off Genie conversation into a reusable, SCHEDULABLE workflow
+	-- e.g. a useful ad hoc analysis a business user did once via chat can be turned into an
+	agent that re-runs itself automatically, rather than the user re-typing the same question
+	every week.
+
+	GENIE ZEROOPS -- autonomous BACKGROUND monitoring of data/ML pipelines -- flags issues
+	(broken pipelines, quality problems, unusual patterns) proactively, before a human happens
+	to notice something's wrong. Applies the "monitor continuously in the background" philosophy
+	from Part E5 to general data operations, not just GenAI-specific quality/cost metrics.
+
+	GENIE CODE -- an AI pair-programmer SPECIFICALLY for building, debugging, and operating
+	Databricks pipelines -- it understands Lakeflow, Unity Catalog, and Spark idioms specifically
+	(companion notepad, Parts C/D/F), which is what distinguishes it from a general-purpose coding
+	assistant that doesn't know Databricks-specific patterns out of the box. Also usable to
+	analyze coding-agent LOGS in natural language (e.g. "why did this job cost more than usual
+	last week," summarized from raw execution logs).
+
+	GENIE APP BUILDER / Serverless Micro Apps -- turn a Genie space or an agent into a lightweight,
+	shareable internal TOOL/app without standing up separate hosting infrastructure -- built on
+	top of Databricks Apps (companion notepad, Part H4).
+======================================================================================================================================================
+F4. Omnigent (cross-reference)
+
+	See Part E4 -- Omnigent is the unified, governed runtime spanning Genie, Agent Bricks, and
+	custom agents, all subject to the same Unity AI Gateway policies regardless of which layer
+	actually built a given agent.
+======================================================================================================================================================
+======================================================================================================================================================
+PART G -- NEW AI-POWERED PRODUCT LINES (Summit 2026)
+======================================================================================================================================================
+======================================================================================================================================================
+G1. CustomerLake -- an agentic Customer Data Platform (CDP), built directly in the lakehouse
+
+	Historically, a "Customer Data Platform" was a SEPARATE, bolt-on piece of software whose whole
+	job was stitching together fragmented customer data (web events, purchase history, support
+	tickets, email engagement, etc., often sitting in different systems) into one unified
+	"Customer 360" profile -- and that separate CDP then needed its OWN pipeline to sync data out
+	of your actual lakehouse and back in.
+	CustomerLake builds this capability DIRECTLY inside the lakehouse instead: PROFILE AGENTS
+	automatically assemble business-ready Customer 360 views from your already-governed,
+	fragmented Unity Catalog data sources, removing a lot of the manual stitching/reconciliation
+	work a traditional CDP required, and inheriting Unity Catalog's governance model rather than
+	needing its own separate access-control system.
+======================================================================================================================================================
+G2. Lakewatch -- an agentic SIEM (Security Information and Event Management)
+
+	Announced alongside Databricks' acquisition of Panther (a security-analytics company).
+	A SIEM's job is ingesting massive volumes of security/log data and detecting/investigating
+	threats. Lakewatch applies the "agentic" pattern here too -- unlimited, unified data at
+	petabyte scale, with claimed cost savings of up to ~80% lower total cost of ownership versus
+	legacy, purpose-built SIEM tools (since it's built on the same scalable lakehouse storage/
+	compute rather than a separately-licensed, separately-scaled security product).
+	Notably, the SAME agent traces produced by Unity AI Gateway (E3) for governing your OWN AI
+	agents can feed directly into Lakewatch for security analysis -- meaning the telemetry that
+	governs what your AI is doing doubles as an input to your security monitoring, rather than
+	being two entirely separate systems that don't talk to each other.
+======================================================================================================================================================
+======================================================================================================================================================
+PART H -- DATA + AI SUMMIT 2026 RECAP (AI-specific side) + INTERVIEW QUICK HITS
+======================================================================================================================================================
+======================================================================================================================================================
+H1. Event basics (same event as the companion notepad, AI-relevant framing repeated here for a
+    self-contained read)
+
+	June 15-18, 2026, Moscone Center, San Francisco. Keynote theme (Ali Ghodsi): "AI doesn't have
+	an intelligence problem, it has a CONTEXT problem." Every AI announcement below was framed as
+	addressing one of four challenges: CONTEXT, COST, CONTROL, CHOICE.
+======================================================================================================================================================
+H2. AI-specific announcements recap
+
+	AGENTS:
+		- Genie One (GA) -- agentic coworker for business users (Part F1)
+		- Genie Ontology -- live business-context grounding layer (Part F2)
+		- Agent Bricks -- expanded into a full developer agent platform: sandboxes, memory, MCP
+		  tool catalog (Part D4)
+		- Omnigent -- unified, governed agent runtime spanning Genie + Agent Bricks + custom
+		  agents (Part E4)
+
+	GOVERNANCE:
+		- Unity AI Gateway -- runtime governance for models/agents/MCP/skills, hard spend caps,
+		  smart routing, contextual policies (Part E3)
+		- OpenSharing -- Delta Sharing expanded to also cover models/skills/unstructured data
+		  (companion notepad Part E11)
+
+	NEW PRODUCT LINES:
+		- CustomerLake -- agentic CDP built into the lakehouse (Part G1)
+		- Lakewatch -- agentic SIEM, tied to the Panther acquisition (Part G2)
+======================================================================================================================================================
+H3. Interview quick hits (AI side)
+
+	Q: "How do you keep an AI agent from seeing data it shouldn't?"
+	A: Unity Catalog governs the agent's tool/MCP connections and data access exactly like it
+	   governs a human's table access. Unity AI Gateway adds a RUNTIME policy layer on top
+	   (allow/deny/require-approval rules + spend caps), for the specific problem that agents can
+	   take ACTIONS, not just read data.
+
+	Q: "How do you evaluate an LLM-based pipeline step the way you'd unit-test a normal ETL step?"
+	A: MLflow 3 tracing + LLM judges/scorers, run the SAME way in development and in production
+	   monitoring, with a Review App turning real human feedback into an evaluation dataset.
+
+	Q: "What's the difference between Agent Bricks and the Mosaic AI Agent Framework?"
+	A: Agent Bricks = describe the task, get an auto-optimized agent fast (low-code, opinionated
+	   templates, automatic synthetic-data/benchmark/judge generation). Mosaic AI Agent Framework
+	   = full code-first control, bring your own orchestration framework. Databricks handles
+	   governance/deployment/observability underneath either path, via the same MLflow/Unity
+	   Catalog/Unity AI Gateway plumbing.
+
+	Q: "What grounds Genie so it doesn't hallucinate business terms like 'churn' or 'MRR'?"
+	A: Genie Ontology, continuously learned from Unity Catalog Metrics, the Business Glossary,
+	   Domains, and query-lineage/popularity signals (Part F2).
+
+	Q: "Why do agents need a NEW kind of governance beyond normal table permissions?"
+	A: because an agent doesn't just READ data the way a human analyst querying a table does --
+	   it can take ACTIONS via tools (send a message, call an external API, modify a record), so
+	   governance has to cover "what is this agent allowed to DO," not only "what can it see" --
+	   which is the gap Unity AI Gateway's contextual service policies fill (Part E3, Part A10).
+
+	Q: "When would you fine-tune a model instead of just using RAG or a good prompt?"
+	A: prompting/RAG solve "the model doesn't know our facts/data" problems; fine-tuning is for
+	   "the model needs to reliably adopt a specific STYLE, FORMAT, or narrow SKILL" that prompting
+	   alone can't teach reliably -- and it's generally the LAST resort tried, not the first, since
+	   it's slower/more expensive to iterate on (Part C4).
+======================================================================================================================================================
+======================================================================================================================================================
+PART I -- FURTHER GAPS FOR A SENIOR DATA ENGINEER WORKING ON DATABRICKS
+(a second, harder pass specifically checking what a DATA ENGINEER -- not an ML researcher --
+actually needs: building AI-ready pipelines, governing AI in production, operating it at scale.
+These are real omissions from Parts A-H, not extra polish. Deep ML theory -- backprop, model
+architecture internals beyond I19's primer, training infrastructure -- is deliberately OUT of
+scope here, since that's not what a senior DE interview on Databricks actually probes.)
+======================================================================================================================================================
+======================================================================================================================================================
+I1. Databricks AutoML (classical ML automation -- a real gap; Parts A-H focused almost entirely
+    on GenAI/LLM concepts and never covered Databricks' classical-ML automation tool)
+
+	AutoML automatically tries multiple classical ML algorithms (various flavors of gradient-
+	boosted trees, linear models, random forests) and hyperparameter combinations against YOUR
+	dataset for a standard classification/regression/forecasting task, and gives you back --
+	critically -- the actual GENERATED NOTEBOOK CODE for the best-performing approach, fully
+	editable, rather than just a black-box "here's your deployed model" result. This makes it a
+	fast STARTING POINT/baseline (and a fast way to establish "what accuracy is even achievable
+	on this data" before investing in a hand-tuned custom model), not a full replacement for a
+	data scientist's judgment on a genuinely hard problem.
+	Interview framing: "when would you use AutoML vs building a model by hand?" -- AutoML for a
+	fast baseline / a fairly standard tabular problem / wanting a strong starting notebook to
+	iterate from; hand-built for a custom architecture, unusual data modality, or deep domain-
+	specific feature engineering AutoML's search wouldn't discover on its own.
+	WHY A DE CARES: AutoML runs are still Delta-table-in, MLflow-tracked-out (Part A4) -- the
+	DATA PREP feeding it (clean, well-typed, joined feature tables) is exactly the kind of
+	pipeline a data engineer builds and owns, even if a data scientist drives the AutoML run itself.
+======================================================================================================================================================
+I2. Feature Store -- the actual DE-facing implementation (Part A5 explained the CONCEPT; here's
+    the concrete API a data engineer would actually write)
+
+	A "feature table" is just a Delta table with a designated PRIMARY KEY, registered with the
+	Feature Engineering client so training/serving code can look it up consistently:
+
+		from databricks.feature_engineering import FeatureEngineeringClient
+		fe = FeatureEngineeringClient()
+
+		fe.create_table(
+		    name="catalog.schema.customer_features",
+		    primary_keys=["customer_id"],
+		    df=features_df,                 # a normal Delta-backed DataFrame you built via Lakeflow
+		    description="Rolling 30-day customer spend/activity features"
+		)
+
+	TRAINING SET CREATION -- the point-in-time-correct JOIN (Part A5) is done FOR you via a
+	FeatureLookup, instead of you hand-writing a fragile "join features as-of the label's
+	timestamp" query yourself:
+
+		from databricks.feature_engineering import FeatureLookup
+		training_set = fe.create_training_set(
+		    df=labels_df,                    # has customer_id + event_timestamp + label
+		    feature_lookups=[
+		        FeatureLookup(
+		            table_name="catalog.schema.customer_features",
+		            lookup_key="customer_id",
+		            timestamp_lookup_key="event_timestamp"   # <- this is what makes it point-in-time correct
+		        )
+		    ],
+		    label="churned"
+		)
+		training_df = training_set.load_df()
+
+	WHY A DE CARES SPECIFICALLY: building and MAINTAINING the underlying feature_df -- keeping it
+	fresh via a Lakeflow pipeline (companion notepad Part F), handling schema evolution, backfills,
+	and incremental updates -- is squarely data-engineering work; the FeatureLookup/point-in-time
+	join machinery above is what makes that pipeline actually SAFE to train against later, instead
+	of a data scientist unknowingly training on leaked future information.
+======================================================================================================================================================
+I3. Feature Serving (distinct from the batch/offline Feature Store above)
+
+	Feature Serving is the REAL-TIME counterpart: a low-latency REST endpoint that looks up a
+	feature value for a SPECIFIC entity (e.g. "this customer_id's current feature values") at
+	INFERENCE time, fast enough for a live, user-facing prediction (e.g. real-time fraud scoring
+	on a transaction as it happens) -- rather than the batch/analytical training-time pattern in I2.
+		fe.create_feature_spec(name="catalog.schema.customer_feature_spec", features=[...])
+		fe.serve_feature_spec(name="catalog.schema.customer_feature_spec")
+	This is exactly the kind of workload Lakebase (companion notepad Part H1) is well-suited to
+	serve from, given its low-latency, request/response nature -- versus the batch/analytical
+	nature of the offline Feature Store side in I2. A senior DE is often the one deciding WHERE a
+	given feature needs to live (offline Delta table only, vs also synced to a low-latency online
+	store) based on whether it's needed for training only, or also for live inference.
+======================================================================================================================================================
+I4. Unity Catalog Model Registry: aliases vs the now-deprecated stages (see also the correction
+    made to Part A4 above -- expanded here since it's a common, concrete "outdated tutorial" trap)
+
+	The OLD workspace-level MLflow Model Registry used a FIXED set of lifecycle stages: None ->
+	Staging -> Production -> Archived. A LOT of still-circulating documentation/tutorials/course
+	material (and possibly your own prior mental model, if you learned MLflow before ~2024) uses
+	this vocabulary.
+	The CURRENT, Unity-Catalog-based Model Registry replaced fixed stages with ALIASES -- flexible,
+	custom-named, mutable pointers to a specific model VERSION:
+		client.set_registered_model_alias("catalog.schema.fraud_model", "champion", version=7)
+		client.set_registered_model_alias("catalog.schema.fraud_model", "challenger", version=8)
+		# load whichever alias your serving code currently points at:
+		model = mlflow.pyfunc.load_model("models:/catalog.schema.fraud_model@champion")
+	TAGS (arbitrary key-value metadata) supplement aliases for anything not captured by a simple
+	pointer (e.g. tag a version with validation_accuracy=0.94 or approved_by=jsmith).
+	Interview-relevant reason this matters: "promote a model to production" now means MOVING AN
+	ALIAS to a new version (instant, atomic, no fixed vocabulary), not changing a hardcoded stage
+	enum -- and being able to name this shift precisely (rather than confidently describing the
+	deprecated Staging/Production stages as if they're current) is exactly the kind of up-to-date
+	specificity a senior-level interview is checking for.
+======================================================================================================================================================
+I5. Vector Search index types + hybrid search (Part B5 explained Vector Search conceptually;
+    here are the concrete choices you actually make setting one up)
+
+	DELTA SYNC INDEX          -- automatically stays in sync with a SOURCE Delta table (the
+	                              behavior described in Part B5) -- the default choice for most
+	                              RAG use cases, since your knowledge base is usually already a
+	                              governed Delta table sitting in your medallion architecture.
+	DIRECT VECTOR ACCESS INDEX -- you manage inserting/updating/deleting vectors yourself via a
+	                              direct API, WITHOUT a backing Delta table driving the sync
+	                              automatically -- useful when embeddings come from a process that
+	                              doesn't naturally produce a Delta table first, or when you need
+	                              finer control over exactly WHEN the index updates.
+
+	HYBRID SEARCH -- Vector Search supports combining SEMANTIC (embedding/vector similarity, Part
+	A8) search with traditional KEYWORD (BM25-style lexical) search in one query, blending both
+	result sets -- useful because pure semantic search can sometimes miss an exact-match need
+	(e.g. a specific product SKU, error code, or acronym that a keyword search would nail
+	immediately but a semantic search might rank lower since it has no "meaning" beyond being an
+	exact string). A well-built RAG/Knowledge Assistant system on Databricks generally defaults to
+	hybrid rather than pure-semantic retrieval for exactly this reason.
+======================================================================================================================================================
+I6. Structured outputs from LLMs (a genuine DE-relevant gap -- if an LLM's output feeds a
+    downstream pipeline/table, you need it to be RELIABLY parseable, not just "usually good text")
+
+	The problem: a plain text-generation LLM call can return well-formed JSON MOST of the time,
+	but occasionally wraps it in explanatory prose, uses inconsistent field names, or produces
+	malformed JSON -- fine for a human reading a chat response, NOT fine for a Lakeflow pipeline
+	(companion notepad Part F) expecting to reliably parse every row's output into a structured
+	Delta column.
+	STRUCTURED OUTPUTS (a.k.a. "JSON mode" / schema-constrained generation) forces the model to
+	generate output conforming EXACTLY to a schema you provide, at the model-serving level --
+	rather than you hoping the prompt's instructions ("please respond only in JSON") are followed
+	perfectly every single time across millions of rows:
+		SELECT ai_query(
+		    'my-endpoint',
+		    'Extract vendor and amount from: ' || invoice_text,
+		    responseFormat => '{"type":"json_schema","json_schema":{"name":"invoice",
+		        "schema":{"type":"object","properties":{"vendor":{"type":"string"},
+		        "amount":{"type":"number"}}}}}'
+		) FROM invoices;
+	WHY A DE CARES: this is what turns "an LLM call" into a dependable step inside a normal
+	medallion pipeline (companion notepad Part G) -- output lands directly as typed, structured
+	columns (Part D11 schema handling, companion notepad) instead of needing a fragile,
+	best-effort JSON-parsing/regex cleanup step downstream of every AI Function call.
+======================================================================================================================================================
+I7. Batch LLM inference at scale -- practical operational patterns (a genuinely practical DE
+    topic that Part C5 only introduced at a conceptual level)
+
+	Running ai_query() (Part B4) or a Model Serving call across MILLIONS of rows in a Lakeflow
+	pipeline is a fundamentally different operational problem than a single chatbot request --
+	real considerations a senior DE needs to reason about:
+		- THROUGHPUT/RATE LIMITS -- a Model Serving endpoint (Databricks-hosted or external, Part
+		  C2/C3) has a max requests/tokens-per-second capacity; blasting millions of rows at it
+		  naively will hit throttling. PROVISIONED THROUGHPUT (Part C1) exists specifically to
+		  give a predictable, reserved capacity for exactly this kind of high-volume batch workload,
+		  rather than sharing best-effort pay-per-token capacity with everyone else.
+		- PARTITIONING/CONCURRENCY -- how a batch DataFrame is repartitioned (companion notepad
+		  Part C2) directly controls how many CONCURRENT calls hit the endpoint at once -- too few
+		  partitions under-utilizes available throughput; too many can overwhelm the endpoint or
+		  the driver coordinating retries.
+		- RETRIES/BACKOFF -- transient failures (rate limiting, timeouts) need retry logic with
+		  exponential backoff, ideally handled by the AI Function/SDK layer rather than hand-rolled
+		  per-call try/except sprinkled through pipeline code.
+		- IDEMPOTENCY -- if a batch job fails partway through and re-runs, you don't want to
+		  re-call (and re-pay for) rows that were already successfully processed -- the standard
+		  Delta pattern (MERGE on a "processed" flag, or checking which rows already have a
+		  non-null AI-enriched column, companion notepad Part D7-D8) applies here exactly the same
+		  way it does to any other idempotent pipeline design.
+		- COST CONTROL -- Unity AI Gateway's spend caps (Part E3) are the platform-level backstop,
+		  but at the PIPELINE level, a DE should also be thinking about whether every row genuinely
+		  NEEDS an LLM call (e.g. skip rows unchanged since the last run, using Change Data Feed --
+		  companion notepad Part J13 -- rather than re-processing a whole table every run).
+======================================================================================================================================================
+I8. AI inside Structured Streaming / Lakeflow pipelines (ties directly into companion notepad
+    Parts F1/F7 -- a DE building a REAL-TIME AI-enriched pipeline, not just a batch one)
+
+	AI Functions (Part B4) work directly inside a streaming DataFrame transformation exactly like
+	any other SQL expression -- no special streaming-specific syntax needed:
+		stream_df = spark.readStream.table("bronze_support_tickets")
+		enriched = stream_df.selectExpr(
+		    "*",
+		    "ai_classify(ticket_text, array('billing','technical','shipping')) as category"
+		)
+		enriched.writeStream.option("checkpointLocation", "/path").table("silver_support_tickets")
+	This slots directly into a Lakeflow Declarative Pipeline (companion notepad Part F7) as a
+	normal @dp.table transformation -- from the pipeline engine's perspective, an AI Function call
+	is just another expression in a SELECT, with the same checkpointing/exactly-once guarantees
+	(companion notepad Part F1) as any other streaming transformation.
+	PRACTICAL CAVEAT worth naming in an interview: LLM calls are dramatically higher-LATENCY than
+	a typical streaming transformation (network round-trip to a model endpoint vs. in-process
+	compute) -- for genuinely low-latency streaming SLAs, this can become the bottleneck stage of
+	the pipeline, and batching/micro-batch sizing (companion notepad Part F1's trigger intervals)
+	needs to account for that reality rather than assuming AI-enriched streaming is "free" the way
+	a simple filter/cast transformation is.
+======================================================================================================================================================
+I9. Multimodal AI on Databricks (documents, images -- ties to the FILE type, companion notepad
+    Part D27)
+
+	ai_parse_document() -- a specific AI Function (distinct from the more generic ai_extract(),
+	Part B4) purpose-built for parsing structured content OUT of document files (PDFs, scanned
+	forms) -- tables, layout, text -- directly from a Volume-stored or FILE-typed source, rather
+	than you first hand-rolling a separate OCR/parsing library call outside of SQL.
+	VISION-CAPABLE Foundation Models -- Model Serving (Part C2) increasingly supports models that
+	accept IMAGE input alongside text (not just text-only LLMs) -- relevant for use cases like
+	classifying a product photo, or extracting data from a scanned document as an image rather
+	than pre-extracted text.
+	WHY A DE CARES: this is where the FILE type / Volumes governance story (companion notepad
+	Parts D27/E4) and the AI Functions story (Part B4) meet directly -- unstructured, previously
+	hard-to-govern data (a folder of PDFs) becomes a proper, queryable, AI-enrichable column in a
+	medallion pipeline, using the SAME Unity Catalog governance model as everything else.
+======================================================================================================================================================
+I10. Model Serving deployment patterns
+
+	TRAFFIC SPLITTING / A-B TESTING -- route a percentage of live requests to a NEW model/agent
+	version and the rest to the current PRODUCTION version (now: the version behind the
+	"champion" alias, I4), comparing real-world outcomes (via MLflow 3 judges/scorers, Part E2)
+	before fully cutting over -- the standard, lower-risk way to roll out a model/prompt change
+	instead of an all-at-once switch.
+	SHADOW DEPLOYMENT -- send live production traffic to a NEW version IN PARALLEL with the
+	current version, but only actually SERVE the current version's response to the real user --
+	the new version's output is logged/evaluated silently for comparison, with zero user-facing
+	risk if the new version behaves badly. Typically the FIRST step before moving to a
+	traffic-split rollout for genuinely high-stakes changes.
+	SCALE-TO-ZERO / CONCURRENCY -- like serverless compute generally (companion notepad Part A9),
+	Model Serving endpoints can scale down to zero when idle and autoscale up under load -- a DE
+	sizing a production endpoint needs to reason about COLD-START latency (the first request after
+	idle takes longer) versus cost, the same trade-off that shows up everywhere else serverless
+	compute is used.
+======================================================================================================================================================
+I11. AI Playground
+
+	A no-code UI inside Databricks for quickly testing and comparing prompts across DIFFERENT
+	models/endpoints side-by-side -- useful for the earliest, most exploratory phase of building a
+	GenAI app (before any application code exists), and for quickly sanity-checking whether a
+	prompt change actually helps before wiring it into a full Mosaic AI Agent Framework (Part D3)
+	or Agent Bricks (Part D4) build, or into a batch pipeline (I7) that will run it millions of times.
+======================================================================================================================================================
+I12. LLM inference parameters (baseline vocabulary worth having cold for any AI-adjacent
+    interview question)
+
+	TEMPERATURE -- controls randomness/creativity of output. Low (near 0) = more deterministic/
+	focused/repeatable (good for factual extraction, classification, structured output where
+	consistency matters, I6); high (near 1+) = more varied/creative output (good for brainstorming,
+	creative writing). A DE running batch classification/extraction (I7) should generally default
+	to a LOW temperature for reproducibility.
+	TOP-P (nucleus sampling) -- an alternative/complementary randomness control: only sample from
+	the smallest set of next-word candidates whose cumulative probability adds up to P.
+	MAX TOKENS -- hard cap on generated response length (and, combined with the prompt's own
+	length, contributes to hitting the CONTEXT WINDOW limit, I13).
+	SYSTEM PROMPT vs USER PROMPT -- the system prompt sets persistent behavior/role/constraints for
+	the WHOLE conversation (usually not shown to the end user); the user prompt is the specific
+	input for THIS turn.
+======================================================================================================================================================
+I13. Context window & token limits (a practical constraint worth explaining plainly)
+
+	Every foundation model has a maximum CONTEXT WINDOW -- the total number of tokens (roughly,
+	word-pieces) it can consider at once, covering the system prompt + conversation history + any
+	retrieved RAG context (Part A7) + the current message + the space reserved for its own
+	response. Exceed it and older content must be dropped/summarized, or the request fails outright.
+	Practical implications: (a) RAG (Part A7) exists partly BECAUSE of this constraint -- you
+	can't paste an entire knowledge base into every prompt, so you retrieve only the most relevant
+	chunks (Part B3) to fit within the window; (b) long agent conversations (Part D) need a
+	strategy for growing history -- summarizing older turns, or relying on Agent Bricks' agent
+	MEMORY feature (Part D4, often backed by Lakebase, companion notepad Part H1) rather than
+	naively keeping the full raw transcript in every subsequent call.
+======================================================================================================================================================
+I14. Hallucination -- definition and the full mitigation toolkit (gathered as one answer to a
+    very common interview question)
+
+	HALLUCINATION -- when an LLM generates a response that sounds fluent and confident but is
+	factually WRONG or entirely fabricated -- a direct consequence of how LLMs work (predicting
+	plausible-sounding next text) rather than a bug that can be fully "fixed" the way a normal
+	software bug can be.
+	MITIGATIONS (all covered elsewhere in this handbook, gathered here as one complete answer):
+		- RAG (Part A7) -- ground answers in retrieved, real documents instead of the model's
+		  memory alone
+		- LLM judges / groundedness scoring (Part E2) -- automatically detect when an answer isn't
+		  actually supported by the retrieved context, in both dev and production monitoring
+		- STRUCTURED OUTPUTS (I6) -- constraining the SHAPE of the output reduces (though doesn't
+		  eliminate) room for fabricated free-text content in fields meant to be factual lookups
+		- lower TEMPERATURE (I12) for factual/extraction tasks specifically
+		- Genie Ontology-style grounding (Part F2) -- for business-term-specific "hallucination"
+		  (confidently using the WRONG definition of a metric), rather than a fabricated fact
+		- human review loops (MLflow 3's Review App, Part E2) to catch what automated judges miss
+	Interview-ready one-liner: "you don't eliminate hallucination entirely -- you reduce its
+	likelihood (RAG, low temperature, structured outputs) and catch what slips through (judges,
+	human review) before it reaches a real decision."
+======================================================================================================================================================
+I15. Cost optimization & observability for LLM applications (a senior-DE-relevant operational
+    topic -- ties directly to Unity AI Gateway, Part E3, but stated as concrete techniques)
+
+	- MODEL ROUTING -- send easy/cheap requests to a small, inexpensive model; escalate only
+	  genuinely hard requests to an expensive frontier model (the core Unity AI Gateway pitch, Part E3)
+	- CACHING -- if the same/similar prompt is likely to recur, cache the response instead of
+	  re-calling the model every time
+	- PROMPT COMPRESSION -- trim unnecessary verbosity from prompts/retrieved context (fewer input
+	  tokens = lower cost, and often faster responses too)
+	- BATCHING -- use batch inference (Part C5/I7) rather than many individual real-time calls for
+	  non-real-time workloads, typically priced/optimized more efficiently
+	- FINE-TUNING A SMALLER MODEL (Part C4/D4) -- once a narrow task's pattern is well understood,
+	  a small fine-tuned model can match a frontier model's quality on THAT task at a fraction of
+	  the per-call cost
+	- SKIP UNCHANGED ROWS (I7) -- use Delta's Change Data Feed (companion notepad Part J13) to only
+	  re-run AI enrichment on rows that actually changed since the last pipeline run, instead of
+	  reprocessing an entire table every time
+
+	OBSERVABILITY -- Unity AI Gateway's unified tracing (Part E3) is the primary tool, but for
+	AGGREGATE cost/usage reporting (e.g. "which team spent the most on model calls last month"),
+	the same SYSTEM TABLES pattern used for platform billing (companion notepad Part J25) extends
+	to AI/serving usage too -- queryable, account-level Delta tables rather than a separate,
+	disconnected billing dashboard (exact table names evolve -- verify against current docs).
+======================================================================================================================================================
+I16. Prompt Registry -- managed, versioned prompts (MLflow 3 + Unity Catalog)
+
+	Rather than a prompt living as a hardcoded string buried in application code (impossible to
+	version, review, or reuse across pipelines/agents cleanly), MLflow 3 supports registering
+	prompts as first-class, VERSIONED, Unity-Catalog-governed objects -- the same underlying
+	philosophy as the Model Registry (I4), applied to prompts:
+		import mlflow
+		mlflow.genai.register_prompt(
+		    name="catalog.schema.support_classifier_prompt",
+		    template="Classify this support ticket into one of: {{categories}}.\nTicket: {{ticket_text}}"
+		)
+		prompt = mlflow.genai.load_prompt("catalog.schema.support_classifier_prompt", version=3)
+	WHY A DE CARES: this is what makes a prompt change in a production AI Function/agent call an
+	AUDITABLE, VERSIONED, REVIEWABLE change -- like a schema migration or a code change -- rather
+	than an untracked string edit somewhere in a notebook, and it's what MLflow 3's "prompt/app
+	version tracking" (Part E2) is concretely built on top of.
+======================================================================================================================================================
+I17. RAG evaluation specifics -- retrieval metrics vs generation metrics
+
+	Part E1-E2 covered GenAI evaluation broadly (LLM judges/scorers). For a RAG system SPECIFICALLY,
+	it's worth knowing evaluation actually splits into TWO separate concerns:
+		RETRIEVAL quality -- did Vector Search (Part B5) actually find the RIGHT chunks? Measured
+		  with metrics like PRECISION@K (of the top K retrieved chunks, what fraction are actually
+		  relevant) and RECALL@K (of all the truly relevant chunks that exist, what fraction did we
+		  find in the top K) -- classic information-retrieval metrics, not LLM-generation metrics.
+		GENERATION quality -- given the retrieved chunks WERE good, did the model use them well?
+		  Measured via LLM judges (Part E2) scoring GROUNDEDNESS (is the answer actually supported
+		  by the retrieved context, not fabricated beyond it) and RELEVANCE (does the answer
+		  actually address the user's question).
+	Why the split matters practically: if a RAG system gives a bad answer, you need to know WHICH
+	half failed -- a retrieval failure (right answer existed in your knowledge base but wasn't
+	found) needs a different fix (better chunking, Part B3; hybrid search, I5; better embedding
+	model) than a generation failure (right context WAS retrieved, but the model still answered
+	badly, needing prompt/temperature/model tuning instead). MLflow 3's evaluation harness
+	(mlflow.genai.evaluate(), Part E2) supports built-in scorers for both categories rather than
+	you having to hand-build either from scratch.
+======================================================================================================================================================
+I18. Responsible AI / model risk basics (lightweight but interview-relevant vocabulary)
+
+		FAIRNESS/BIAS -- a model's outputs shouldn't systematically disadvantage particular groups;
+		  relevant when a model's TRAINING data reflects historical human biases.
+		EXPLAINABILITY -- being able to say WHY a model produced a given output (easier for
+		  classical ML with feature importances; genuinely harder for LLMs, part of why tracing/
+		  judges, Part E2, focus on evaluating OUTPUT quality/groundedness rather than claiming to
+		  fully explain internal reasoning).
+		PII/PRIVACY -- ensuring personal data isn't leaked in outputs or training data (Unity AI
+		  Gateway's PII guardrails, Part E3; ai_mask(), Part B4).
+		HUMAN-IN-THE-LOOP -- keeping a human able to review/override/approve high-stakes AI
+		  decisions rather than fully automating them (Unity AI Gateway's "require-approval"
+		  contextual policies, Part E3; MLflow 3's Review App, Part E2).
+	This is a genuinely fast-moving, increasingly regulated area -- treat this as VOCABULARY to
+	have ready for a values-based interview question, not a complete or final policy reference.
+======================================================================================================================================================
+I19. Transformer architecture -- a plain-English primer (baseline vocabulary interviewers
+    sometimes check even in DE-focused rounds, since it explains WHY several behaviors described
+    elsewhere in this handbook exist at all)
+
+	Modern LLMs (Part A6) are built on the TRANSFORMER architecture (introduced in a 2017 paper
+	titled "Attention Is All You Need"). The one idea worth actually understanding, in plain terms:
+
+	ATTENTION MECHANISM -- when processing any given word/token in a sequence, the model looks at
+	EVERY OTHER token in the input and learns how much "attention" (relevance/weight) to pay to
+	each one when deciding how to interpret the current token -- e.g. in "the bank raised interest
+	rates," attention lets the model weigh "interest" and "rates" heavily when interpreting "bank"
+	as FINANCIAL rather than a river bank. This is computed in PARALLEL across the whole sequence
+	(unlike older architectures like RNNs, which processed one token at a time, sequentially) --
+	which is WHY transformers train efficiently at massive scale on modern parallel hardware (GPUs/
+	TPUs), a big part of why the current generation of large models became possible at all.
+
+	NEXT-TOKEN PREDICTION -- at a high level, an LLM is trained to do ONE simple task extremely
+	well: given all the text so far, predict the most likely NEXT token. Generating a full
+	response is just repeatedly doing this one token at a time, feeding each generated token back
+	in as part of the input for predicting the next one. This simple training objective, at
+	sufficient SCALE (parameters + data), turns out to produce the surprisingly broad, general-
+	purpose capabilities (A6's "foundation model" behavior) that RAG/agents/fine-tuning all build
+	on top of.
+
+	Interview-appropriate depth: you're not expected to derive attention math in a data-engineering
+	interview -- but being able to explain "attention lets the model weigh every other word's
+	relevance in parallel, which is why it's fast to train at scale, and generation is just
+	repeated next-token prediction" is exactly the level of fluency that signals genuine
+	understanding versus having only ever used the API surface.
+======================================================================================================================================================
+I20. A senior data engineer's actual role in the AI stack (a synthesis -- tying every part of
+    THIS handbook to concrete DE responsibilities, useful as a direct answer to "walk me through
+    how you'd support an AI/GenAI initiative as the data engineer on the team")
+
+	A senior DE typically owns or heavily influences:
+		1. BUILDING the governed Delta/Volume data (companion notepad Parts D/E) that becomes an
+		   AI system's RAG knowledge base or training data (Part B1-B2) -- this is standard
+		   medallion-architecture work (companion notepad Part G), just with an AI consumer at the end.
+		2. EXPOSING safe, well-scoped TOOLS for agents -- typically Unity Catalog Functions (Part
+		   D1) wrapping existing business logic/queries, so an agent can act without needing
+		   raw table access.
+		3. MAINTAINING Feature Store pipelines (I2) -- keeping feature tables fresh, point-in-time
+		   correct, and backfillable, using the exact same Lakeflow/Auto Loader/streaming skills
+		   (companion notepad Part F) used for any other pipeline.
+		4. OPERATING AI Functions (Part B4) and batch inference (I7) INSIDE Lakeflow pipelines
+		   (I8) -- treating an LLM call as just another (higher-latency, cost-bearing) pipeline
+		   step, with the same idempotency/retry/monitoring discipline as any other step.
+		5. MANAGING Vector Search index freshness/sync (Part B5, I5) as part of the same pipeline
+		   dependency graph as the source Delta table it's built from.
+		6. GOVERNING via Unity Catalog + Unity AI Gateway (Part E3) -- registering models/agents/
+		   tools, setting spend caps and access policies, exactly as a DE already governs tables.
+		7. MONITORING quality AND cost in production (Part E5, I15) -- using system tables and
+		   MLflow 3 traces the same way they'd already monitor pipeline health and cluster spend.
+	The throughline: almost nothing here requires becoming an ML researcher -- it's the SAME data-
+	engineering skill set (governed pipelines, Unity Catalog, Lakeflow, monitoring, cost control)
+	applied to a new class of consumer (an agent) and a new class of data (embeddings, prompts,
+	traces) instead of a BI dashboard. That reframing is usually the strongest way to answer a
+	"why should we trust a data engineer with our AI initiative" interview question directly.
+======================================================================================================================================================
+*** END OF PART I ***
+======================================================================================================================================================
+======================================================================================================================================================
+*** END OF AI ON DATABRICKS HANDBOOK ***
+For the core data-engineering platform side (Spark, Delta Lake, Unity Catalog, Lakeflow, Lakebase,
+performance tuning, etc.), see: "Databricks_COMPLETE_HANDBOOK_2026.txt"
+
+Sources: Databricks product documentation and blog (databricks.com/blog, docs.databricks.com), and
+Databricks Data + AI Summit 2026 newsroom announcements (June 2026), current as of July 2026.
+Release stages (GA/Preview/Beta) move fast -- re-verify anything marked Preview/Beta against
+docs.databricks.com before relying on it in production or in an interview answer about "current"
+status.
+======================================================================================================================================================
