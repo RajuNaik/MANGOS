@@ -1,0 +1,88 @@
+Snowflake + AI / Cortex / GenAI Interview Questions
+
+Snowflake AI Fundamentals
+
+1.  What is Snowflake Cortex?
+2.  What AI capabilities does Snowflake provide?
+3.  Difference between Cortex AI and Snowpark ML.
+4.  What are Cortex LLM Functions?
+5.  What foundation models are available in Snowflake?
+6.  How does AI run inside Snowflake?
+7.  Why use Snowflake AI instead of external APIs?
+
+Cortex Functions
+
+8.  Explain COMPLETE().
+9.  Explain SUMMARIZE().
+10. Explain TRANSLATE().
+11. Explain SENTIMENT().
+12. Explain EXTRACT_ANSWER().
+13. Explain CLASSIFY_TEXT().
+14. Explain EMBED_TEXT().
+15. Explain AI_COMPLETE vs COMPLETE.
+
+Vector Search & RAG
+
+16. What are vector embeddings?
+17. Why are embeddings required?
+18. What is Vector Search?
+19. Explain RAG.
+20. How do you build a RAG pipeline in Snowflake?
+21. How are documents chunked?
+22. How are embeddings stored?
+23. How are similar documents retrieved?
+24. What similarity algorithms are used?
+25. Explain semantic search.
+
+Cortex Search
+
+26. What is Cortex Search?
+27. Difference between SQL search and Cortex Search.
+28. How do you create a Cortex Search Service?
+29. Explain indexing.
+30. How does query retrieval work?
+
+Snowpark AI
+
+31. Explain Snowpark ML.
+32. Explain Feature Store.
+33. Difference between Snowpark and Cortex.
+34. Can Python call Cortex functions?
+35. Explain model inference in Snowpark.
+
+AI Architecture
+
+36. Explain an end-to-end Snowflake AI architecture.
+37. Explain SQL Server → ADF → ADLS → Snowpipe → Cortex → Power BI.
+38. Where do embeddings fit?
+39. Where is Vector Search used?
+40. Explain document ingestion.
+
+Governance
+
+41. How is AI secured in Snowflake?
+42. Explain governance for AI workloads.
+43. How are LLM requests audited?
+44. How do you secure sensitive prompts?
+45. Explain role-based access for Cortex.
+
+Performance
+
+46. How do you optimize Vector Search?
+47. How do you optimize AI inference?
+48. How do you reduce LLM cost?
+49. Explain caching for AI workloads.
+50. How do warehouses affect AI execution?
+
+Scenario-Based
+
+51. Design an enterprise chatbot using Snowflake.
+52. Design a RAG solution in Snowflake.
+53. Explain document search using Cortex Search.
+54. Build an AI assistant over enterprise documents.
+55. Explain customer support chatbot architecture.
+56. Explain invoice Q&A using Cortex.
+57. Explain AI-powered knowledge search.
+58. Explain an enterprise AI project using Snowflake.
+59. How would you integrate dbt with AI pipelines?
+60. Explain Snowflake AI features introduced in recent releases.
