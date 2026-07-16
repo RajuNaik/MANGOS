@@ -1,0 +1,1077 @@
+SNOWFLAKE -- COMPLETE HANDBOOK (BEGINNER TO ADVANCED) -- 2026 EDITION
+Self-contained reference for a senior data engineer with a Databricks background moving into
+Snowflake interviews/work. Built fresh (you had no prior Snowflake notes), grounded in current
+Snowflake documentation and Snowflake Summit 2026 (June 1-4, San Francisco) announcements.
+This file covers the CORE PLATFORM ONLY -- Cortex AI / Snowpark ML / the agentic layer (CoWork,
+CoCo) will be a separate companion handbook, built next, matching how the Databricks notes split
+into a platform file + an AI file. Interview-trap "gotchas" are folded directly into each section
+this time -- no separate follow-up pass needed, per the lesson learned from the Databricks notes.
+======================================================================================================================================================
+======================================================================================================================================================
+PART A -- FOUNDATIONS
+======================================================================================================================================================
+======================================================================================================================================================
+A1. What Snowflake is (and isn't)
+
+	Snowflake is a fully-managed, SaaS cloud data platform -- NOT open source (contrast with Spark/
+	Delta Lake/Databricks, which are largely open source under Databricks' stewardship). You never
+	provision a VM, patch an OS, or manage a cluster manager -- Snowflake runs entirely on top of
+	AWS, Azure, or GCP (you pick one per account) and abstracts the infrastructure away completely.
+	Founded 2012, IPO 2020 (largest software IPO in history at the time). Current CEO: Sridhar
+	Ramaswamy (since 2024). Co-founder/President of Product: Benoit Dageville.
+	GOTCHA: unlike Databricks, there is no "open source Snowflake" you can self-host -- Snowflake
+	IS the product, sold as consumption-based (credits) SaaS.
+======================================================================================================================================================
+A2. The 3-layer architecture ("multi-cluster, shared data") -- THE most-asked architecture question
+
+	1. DATABASE STORAGE layer -- data is stored compressed, columnar, in micro-partitions (A3) on
+	   cloud object storage (S3/Azure Blob/GCS) that Snowflake manages for you. You never touch
+	   this layer directly.
+	2. QUERY PROCESSING (compute) layer -- Virtual Warehouses (Part B): independent MPP compute
+	   clusters that execute queries against the storage layer. Multiple warehouses can read/write
+	   the SAME data simultaneously without contending with each other for compute (each warehouse
+	   is its own isolated cluster) -- this is the "multi-cluster" half of the name.
+	3. CLOUD SERVICES layer -- the "brain": query parsing/optimization, metadata management,
+	   security/authentication, transaction management (ACID), infrastructure management. This
+	   layer is shared across ALL warehouses in an account -- this is the "shared data" half of
+	   the name (all compute clusters see one consistent, governed view of metadata/data).
+
+	WHY THIS MATTERS (the actual interview point): storage and compute are decoupled and BOTH
+	scale independently -- you can spin up 10 differently-sized warehouses against the same table
+	with zero resource contention between them, unlike a shared-nothing architecture (classic
+	Hadoop, where compute+storage are bolted together per node) or a shared-disk architecture
+	(Oracle RAC, where all compute nodes contend for the SAME storage/lock manager).
+	This is conceptually similar to what Databricks/Delta Lake later did (storage/compute
+	decoupling), but Snowflake pioneered and patented this specific "multi-cluster shared data"
+	model in its 2012 founding architecture, years before the lakehouse pattern existed.
+======================================================================================================================================================
+A3. Micro-partitions (the Snowflake equivalent of Delta's Parquet files + transaction log, combined)
+
+	Data is automatically divided into micro-partitions: ~50-500MB of UNCOMPRESSED data per
+	partition, stored compressed and COLUMNAR. Created automatically on load -- you never manually
+	partition a table (no partitionBy-style DDL exists in Snowflake the way it does in Delta).
+	IMMUTABLE -- like Delta's Parquet files, a micro-partition is never edited in place; any DML
+	creates NEW micro-partitions and marks old ones as no-longer-current (this is what powers Time
+	Travel, Part D2 -- old micro-partition versions stick around for the retention window).
+	Each micro-partition stores its own METADATA: min/max value per column, null counts, distinct
+	value counts, etc. -- this metadata is what enables PRUNING (below), all managed by the Cloud
+	Services layer automatically, no manual ANALYZE/COMPUTE STATISTICS needed the way Databricks
+	sometimes wants (companion notepad Part K5) -- Snowflake keeps micro-partition metadata fresh automatically.
+======================================================================================================================================================
+A4. Pruning -- the single biggest performance lever in Snowflake (know this cold)
+
+	When a query has a filter, Snowflake checks each micro-partition's min/max metadata (A3) --
+	if a partition's value range can't possibly satisfy the filter, that ENTIRE partition is
+	SKIPPED without reading a single byte of it. A well-pruned query on a 10TB table might only
+	physically scan a few GB.
+	GOTCHA: wrapping a filtered column in a function BREAKS pruning -- e.g.
+		WHERE TO_CHAR(order_date, 'YYYY-MM-DD') = '2026-06-01'   -- pruning BROKEN (function applied first)
+		WHERE order_date = '2026-06-01'                          -- pruning WORKS (raw column compared)
+	This is functionally the exact same "predicate pushdown gets defeated by wrapping the column"
+	trap that exists in Spark/Delta too -- same underlying principle, different engine.
+	Check pruning effectiveness in the Query Profile: "partitions scanned" vs "partitions total" --
+	scanning 500/500 = zero pruning (red flag); scanning 5/500 = excellent pruning.
+======================================================================================================================================================
+A5. Editions (know what each unlocks -- a real interview/cost-conversation topic)
+
+		Standard          -- core platform, 1-day Time Travel (default; can't extend)
+		Enterprise         -- adds: up to 90-day Time Travel, multi-cluster warehouses, materialized
+		                      views, column-level security (masking policies), the Feature Store
+		                      (AI notepad Part D2 requires Enterprise+)
+		Business Critical  -- adds: enhanced security/compliance (HIPAA, PCI, FedRAMP-track),
+		                      customer-managed encryption keys (Tri-Secret Secure), database
+		                      failover/replication for disaster recovery, private connectivity
+		Virtual Private Snowflake (VPS) -- fully isolated, dedicated Snowflake environment
+		                      (separate from the multi-tenant service) for the most stringent
+		                      regulatory/security requirements
+	GOTCHA: Hybrid Tables (Unistore, Part D7) and the Feature Store both need Enterprise Edition
+	or higher -- a real "which edition do I need for X" question.
+======================================================================================================================================================
+A6. Object hierarchy
+
+	Organization > Account > Database > Schema > Object (Table/View/Stage/Stream/Task/Function/etc.)
+	Practically comparable to Databricks Unity Catalog's catalog.schema.table -- Snowflake's
+	database.schema.object is ALSO a 3-level namespace, just with different names for the top level
+	(catalog vs database). Fully-qualified references: MY_DB.MY_SCHEMA.MY_TABLE.
+======================================================================================================================================================
+A7. Snowsight -- the web UI
+
+	Worksheets (SQL/Python editor), Dashboards, Notebooks (Part F5), Streamlit apps (Part F6),
+	Query History, Warehouse monitoring, Cost Management, Data (object browser), Marketplace
+	(Part H3), Horizon Catalog/Trust Center (governance, Part G). This is Snowflake's single
+	unified web interface -- there's no separate "admin console" vs "notebook app" the way
+	Databricks splits some of this across products.
+======================================================================================================================================================
+======================================================================================================================================================
+PART B -- COMPUTE: VIRTUAL WAREHOUSES
+======================================================================================================================================================
+======================================================================================================================================================
+B1. Sizing & credits
+
+	T-shirt sizes: X-Small, Small, Medium, Large, X-Large, 2X-Large ... up to 6X-Large. Each size
+	DOUBLES the compute (and credit consumption rate) of the size below it -- X-Small = 1 credit/
+	hour, Small = 2, Medium = 4, Large = 8, and so on. Billed PER SECOND (60-second minimum), only
+	while the warehouse is actually running.
+	CREATE WAREHOUSE my_wh WITH WAREHOUSE_SIZE = 'MEDIUM' AUTO_SUSPEND = 60 AUTO_RESUME = TRUE;
+======================================================================================================================================================
+B2. Scale UP vs scale OUT -- a real interview distinction
+
+	SCALE UP -- resize to a BIGGER warehouse (S -> M -> L). Makes a SINGLE query faster by giving
+	it more compute/memory to work with -- more parallelism WITHIN one query's execution.
+	SCALE OUT -- add MORE CLUSTERS of the SAME size (multi-cluster warehouse, B3). Doesn't make
+	any individual query faster -- it lets MORE CONCURRENT queries run without queuing.
+	GOTCHA (this is the exact question interviewers ask): "queries are queuing, what do you do?"
+	-- scale OUT (multi-cluster), NOT up. Scaling up a warehouse experiencing concurrency-driven
+	queuing just doubles the cost without fixing the actual problem (not enough concurrent
+	capacity, not too little power per query).
+	"Queries are slow but not queuing, what do you do?" -- check Query Profile pruning/spillage
+	FIRST (A4, Part I1); only reach for scale UP if the profile shows genuine memory pressure
+	(disk spillage) or heavy per-query compute need, not as the default first move.
+======================================================================================================================================================
+B3. Multi-cluster warehouses (the "scale out" mechanism, Enterprise+ only)
+
+	ALTER WAREHOUSE my_wh SET MIN_CLUSTER_COUNT = 1 MAX_CLUSTER_COUNT = 4 SCALING_POLICY = 'STANDARD';
+	SCALING_POLICY:
+		STANDARD  -- adds a cluster aggressively at the first sign of queuing (favors performance)
+		ECONOMY   -- waits longer / requires more sustained load before adding a cluster (favors cost)
+	Snowflake automatically adds/removes clusters between MIN and MAX based on load -- this is the
+	Snowflake analog to Spark's dynamic resource allocation (companion Databricks notepad Part K3),
+	just applied to whole warehouse clusters instead of executors within one Spark application.
+======================================================================================================================================================
+B4. Caching layers (THREE distinct caches -- commonly confused, a great gotcha to know precisely)
+
+	1. RESULT CACHE -- Cloud Services layer, NOT warehouse-specific. If the EXACT SAME query text
+	   is re-run and the underlying data hasn't changed, Snowflake returns the cached result with
+	   ZERO compute cost and ZERO warehouse needed at all (even a suspended warehouse can serve a
+	   result-cache hit). Persists 24 hours, resets on each hit.
+	2. LOCAL DISK CACHE (a.k.a. warehouse cache / SSD cache) -- lives on the warehouse's local SSD.
+	   Caches raw table data read from remote storage so a SECOND, DIFFERENT query touching the
+	   same data doesn't have to re-fetch it over the network. Lost when the warehouse suspends/
+	   resizes (this is WHY frequently-suspending a warehouse to save credits has a real trade-off
+	   -- you lose this cache and pay the "cold" cost again on resume).
+	3. METADATA CACHE -- Cloud Services layer caches micro-partition metadata (min/max, etc.) so
+	   pruning decisions (A4) don't require re-reading metadata from storage every time.
+	GOTCHA: "why did my query run instantly the second time?" -- almost always result cache (#1),
+	NOT the warehouse being "warmed up" -- a very common interviewer follow-up to distinguish real
+	understanding from a vague "caching" answer.
+======================================================================================================================================================
+B5. Resource Monitors (cost governance)
+
+	CREATE RESOURCE MONITOR my_monitor WITH CREDIT_QUOTA = 1000
+	  TRIGGERS ON 75 PERCENT DO NOTIFY
+	           ON 90 PERCENT DO NOTIFY
+	           ON 100 PERCENT DO SUSPEND
+	           ON 110 PERCENT DO SUSPEND_IMMEDIATE;
+	Attach to an account or specific warehouses. NOTIFY = just alert. SUSPEND = let running queries
+	finish, block new ones. SUSPEND_IMMEDIATE = kill running queries too. The standard cost
+	governance mechanism -- conceptually similar to a Databricks cluster policy's spend cap
+	(companion Databricks notepad), but Snowflake's version is credit-quota-based and time-period-
+	scoped (monthly/weekly/daily/never) rather than a per-cluster config constraint.
+======================================================================================================================================================
+B6. Query Acceleration Service (QAS) -- Enterprise+, worth knowing for cost/perf interviews
+
+	A SERVERLESS feature that offloads heavy portions of a query (large table scans, complex
+	filters) to Snowflake-managed shared compute OUTSIDE your warehouse, billed per-second
+	separately from warehouse credits. Lets a warehouse stay sized for NORMAL short-query traffic
+	while occasional heavy queries get accelerated without you having to permanently upsize the
+	whole warehouse (and pay for that bigger size 24/7 just for occasional heavy queries). Enabled
+	by default on new multi-cluster/Gen2 warehouses created from 2025 onward.
+======================================================================================================================================================
+B7. Adaptive Compute (2026, GA rolling out) -- ends manual warehouse sizing
+
+	Automatically determines the optimal mix of compute for a workload -- you stop picking XS vs
+	L yourself; Snowflake right-sizes it and you're billed only for what's actually used.
+	Benchmarked (vs Gen1/Gen2 standard warehouses): ~1.6x faster for exploratory/ad hoc analytics,
+	~2.2x higher throughput for highly concurrent operational analytics, ~3.5x faster for DML-heavy
+	workloads (transformations/ingestion/pipelines). This is Snowflake's answer to the exact same
+	"stop hand-tuning compute size" pain point Databricks addresses with serverless compute +
+	autoscaling (companion Databricks notepad Part A9) -- both platforms converged on "the platform
+	right-sizes compute for you" as the 2026-era default, just under different product names.
+======================================================================================================================================================
+B8. New interactive query compiler (2026)
+
+	A rewritten, far more memory-efficient query compiler. Every query spends time COMPILING
+	before it EXECUTES -- Snowflake reported up to ~40x faster compile time in early large-
+	customer workloads, translating to 3-4x faster overall workload completion for compile-heavy
+	patterns (many small/short queries, where compile time is a bigger fraction of total time).
+======================================================================================================================================================
+======================================================================================================================================================
+PART C -- STORAGE, CLUSTERING & PRUNING DEEP DIVE
+======================================================================================================================================================
+======================================================================================================================================================
+C1. Clustering keys -- the Snowflake analog to Databricks' Liquid Clustering, with a key difference
+
+	Natural clustering (DEFAULT, free) -- data lands in micro-partitions roughly in LOAD ORDER, no
+	config needed. If you load chronologically and query by date, this is often already good enough.
+	Explicit clustering key -- for tables where natural clustering has DEGRADED (lots of DML:
+	updates/deletes/merges scatter related rows across many micro-partitions over time) or where
+	queries filter on a column NOT correlated with load order:
+		ALTER TABLE orders CLUSTER BY (order_date, region_id);
+	CLUSTERS HIERARCHICALLY -- order matters a lot. Cluster by (date, customer_id): queries
+	filtering on date alone prune well; queries filtering on customer_id ALONE scan most of the
+	table anyway, since customer_id is only sorted WITHIN each date group. Put the column you
+	filter on MOST OFTEN first.
+	Column choice: enough DISTINCT VALUES to spread data meaningfully (not 3 status values), but
+	not SO high-cardinality that rows never actually co-locate (for very high-cardinality columns,
+	Snowflake recommends clustering on an EXPRESSION of the column, e.g. a truncated/bucketed
+	version, rather than the raw column).
+	NOT FREE: Automatic Clustering (the background re-clustering service) runs continuously and
+	bills credits every time it reorganizes data to maintain the key as new data lands/changes --
+	worth it mainly for MULTI-TERABYTE tables with materially poor pruning; per field data, ~80% of
+	scan-related warehouse cost is often tied to just the top ~5% largest tables -- start there.
+	Inspect clustering health: SYSTEM$CLUSTERING_INFORMATION('table_name'), SYSTEM$CLUSTERING_DEPTH.
+
+	GOTCHA vs Databricks Liquid Clustering: conceptually similar goal (co-locate related data,
+	improve pruning, reduce manual partition-scheme guesswork) -- but Snowflake's clustering key
+	is STILL a column-order-sensitive, hierarchical concept you have to think about like the old
+	Delta partitionBy/bucketBy world (companion Databricks notepad Part C4/D21); it did NOT get a
+	Liquid-Clustering-style "order doesn't matter, change anytime for free" upgrade. Re-clustering
+	after changing a key on a huge existing table is a real, billed operation, not a free metadata
+	change.
+======================================================================================================================================================
+C2. Search Optimization Service (SOS) -- Enterprise+, the Snowflake analog to a Bloom filter index
+
+	For highly SELECTIVE point-lookup queries (return a tiny handful of rows out of a huge table)
+	that clustering alone doesn't help enough with. Builds a background "search access path" using
+	Bloom-filter-style metadata so Snowflake can jump straight to the relevant micro-partitions
+	instead of scanning everything.
+		ALTER TABLE my_table ADD SEARCH OPTIMIZATION;
+	Best for: tables with 1,000+ micro-partitions, queries with high selectivity (few rows
+	returned), point lookups and equality/range filters. AVOID on tables with frequent updates/
+	deletes -- maintaining the search access path adds real ongoing cost. Combine with clustering:
+	clustering handles range-filter queries well; SOS handles point-lookup queries well; use both
+	together if a table genuinely needs both patterns served fast.
+	GOTCHA (direct callback to companion Databricks notepad Part K17): this is functionally the
+	same idea as Delta's legacy Bloom filter indexes -- both are probabilistic "definitely not
+	here" file-skipping structures for point lookups on large tables.
+======================================================================================================================================================
+C3. Query Profile -- how you actually debug a slow/expensive Snowflake query (know this flow cold)
+
+	Order of investigation (this exact sequence is a very common "walk me through debugging a slow
+	query" interview answer):
+		1. PARTITION PRUNING -- partitions scanned vs partitions total. Scanning ~100% = pruning
+		   failure -- check for a wrapped filter column (A4) or a missing/poor clustering key (C1).
+		2. BYTES SPILLED (local or remote storage) -- means the warehouse ran out of MEMORY and
+		   spilled intermediate results to disk (local spill) or even remote storage (remote spill,
+		   much worse) -- a strong signal the warehouse is UNDERSIZED for this query's working set,
+		   OR the query itself is doing something memory-heavy (huge sort, huge join) that could be
+		   rewritten to aggregate/filter earlier.
+		3. CARTESIAN JOINS / missing join conditions -- same anti-pattern as any SQL engine,
+		   visible as an explosive row count between join steps in the profile.
+		4. CONCURRENCY/QUEUING -- check Warehouse Load; if queries are QUEUED (not slow once
+		   running), that's a scale-OUT problem (B2/B3), not a query-rewrite problem.
+	ONLY AFTER working through 1-4 should "just make the warehouse bigger" enter the conversation
+	-- interviewers specifically probe for candidates who reach for warehouse size as the FIRST
+	lever (wrong) vs the LAST lever after ruling out pruning/spillage/skew/queuing (right).
+	Query directly via SQL too: SELECT ... FROM snowflake.account_usage.query_history WHERE
+	bytes_spilled_to_remote_storage > 0 ... -- programmatic version of reading the Query Profile UI.
+======================================================================================================================================================
+C4. Compression
+
+	Automatic, columnar, no configuration -- every micro-partition is compressed by Snowflake
+	using whatever algorithm is most efficient per column, transparently. Unlike the companion
+	Databricks notepad's Snappy-vs-Gzip choice (Part B12), you don't pick a compression codec in
+	Snowflake -- it's fully managed. This is a genuine, real "what do you configure differently
+	here vs Databricks" interview answer: compression tuning simply isn't a lever you pull in Snowflake.
+======================================================================================================================================================
+======================================================================================================================================================
+PART D -- TABLE TYPES & DATA MANAGEMENT
+======================================================================================================================================================
+======================================================================================================================================================
+D1. Permanent vs Transient vs Temporary tables (a real, commonly-tested distinction)
+
+		Permanent   -- default. Full Time Travel (per edition, A5) + Fail-safe (D3, 7 extra days).
+		              Standard choice for real production tables.
+		Transient   -- Time Travel available but capped at 0-1 day, NO Fail-safe at all. Lower
+		              storage cost (no 7-day fail-safe copy held). Good for staging/intermediate
+		              tables you can always rebuild from source -- you don't need the safety net.
+		Temporary   -- exists ONLY for the current SESSION, dropped automatically when the session
+		              ends. Not visible to other sessions/users at all. Good for scratch work.
+	GOTCHA: this maps loosely but NOT identically onto the companion Databricks notepad's
+	managed-vs-external and view-scoping concepts (Part D3/D19) -- don't conflate them; Snowflake's
+	table-type distinction is specifically about RETENTION/RECOVERY guarantees and storage cost,
+	not about who owns the underlying files (Snowflake always owns/manages the physical storage,
+	unlike Databricks' managed-vs-external table distinction).
+======================================================================================================================================================
+D2. Time Travel
+
+	Query or restore data as it existed at a past point:
+		SELECT * FROM my_table AT (TIMESTAMP => '2026-06-01 00:00:00'::TIMESTAMP);
+		SELECT * FROM my_table BEFORE (STATEMENT => '<query_id>');
+		UNDROP TABLE my_table;                          -- restore an accidentally dropped table
+		CREATE TABLE recovered CLONE my_table AT (OFFSET => -3600);   -- clone as of 1 hour ago
+	Retention: Standard Edition = 1 day max (0 or 1, configurable at table/account level).
+	Enterprise+ = up to 90 days (configurable per table via DATA_RETENTION_TIME_IN_DAYS).
+	GOTCHA (direct comparison to companion Databricks notepad's Delta time travel, Part D11): same
+	CONCEPT (query/restore historical state), but the mechanism/retention model differs -- Delta's
+	default is 7 days regardless of edition/tier; Snowflake's default is edition-gated (1 day
+	Standard vs up to 90 Enterprise+) and table-configurable.
+======================================================================================================================================================
+D3. Fail-safe
+
+	A Snowflake-MANAGED, non-configurable, non-queryable 7-day disaster-recovery window that
+	starts AFTER Time Travel retention expires -- ONLY Snowflake support can recover data from
+	Fail-safe (you cannot query or restore it yourself via SQL, unlike Time Travel). Applies to
+	PERMANENT tables only (D1) -- Transient/Temporary tables have NO Fail-safe.
+	GOTCHA: Fail-safe is NOT a substitute for a real backup/DR strategy you control -- it's a
+	Snowflake-side last-resort safety net, not a tool in your own operational toolkit the way Time
+	Travel is. A common interview trap is describing Fail-safe as if you can "restore from
+	Fail-safe" yourself with a SQL command -- you cannot; only Snowflake Support can.
+======================================================================================================================================================
+D4. Zero-copy cloning
+
+	CREATE TABLE orders_dev CLONE orders_prod;
+	CREATE SCHEMA dev_schema CLONE prod_schema;
+	CREATE DATABASE dev_db CLONE prod_db;
+	A METADATA-ONLY operation -- instant, regardless of the underlying table's size (cloning a
+	10TB table is just as fast as cloning a 10-row table), because it just creates new pointers to
+	the SAME underlying micro-partitions. Storage cost only grows as the CLONE diverges from the
+	source (copy-on-write at the micro-partition level -- only CHANGED partitions get physically
+	new storage). Can clone at TABLE, SCHEMA, or DATABASE level, and combine with Time Travel
+	(clone AS OF a past point, as shown in D2).
+	GOTCHA (direct comparison): this is the SAME underlying idea as Databricks' shallow clone
+	(companion Databricks notepad Part D18) -- metadata-only, dependent on source data staying
+	intact. Snowflake doesn't have a separate "deep clone" concept the way Delta does; Snowflake
+	cloning is always this copy-on-write style (there's no need for a "deep clone" equivalent
+	because the copy-on-write divergence model means the clone is ALREADY safe/independent going
+	forward even without physically copying everything upfront).
+======================================================================================================================================================
+D5. External tables
+
+	Define a table whose data stays in EXTERNAL cloud storage (S3/Azure/GCS) -- Snowflake reads it
+	on demand rather than loading/owning it. Good for querying data you don't want to duplicate
+	into Snowflake-managed storage, or as a landing pattern before deciding what to formally load.
+	Materializes metadata (a manifest of files/schema) but not the underlying data itself.
+	Generally slower than native tables for repeated heavy querying (no micro-partition-level
+	Snowflake-native optimization) -- often used as a staging/interop layer, not for
+	performance-critical production queries.
+======================================================================================================================================================
+D6. Iceberg Tables (2026: Iceberg v3 GA -- a major, actively-tested topic)
+
+	Snowflake can act as an Apache Iceberg REST catalog (via Horizon Catalog, powered by Apache
+	Polaris -- Snowflake's Iceberg catalog implementation, GA 2026) AND create/manage Iceberg
+	tables natively:
+		- EXTERNAL Iceberg tables -- data + Iceberg metadata live in YOUR cloud storage bucket;
+		  Snowflake reads/writes it as an Iceberg-compliant engine among others (Spark, Trino,
+		  PyIceberg can also read/write the SAME files).
+		- SNOWFLAKE-MANAGED Iceberg storage (GA 2026, AWS+Azure, GCP following) -- Snowflake now
+		  manages the storage layer for Iceberg tables directly -- no external bucket to
+		  provision/manage yourself, while the table remains a genuine, open Iceberg table other
+		  engines can still read.
+	2026 Iceberg v3 additions Snowflake supports: VARIANT type for semi-structured data, ROW
+	LINEAGE (cross-engine change tracking), DELETION VECTORS (faster row-level deletes -- same
+	underlying concept as the companion Databricks notepad's Delta deletion vectors, Part D23),
+	nanosecond timestamps, geospatial types.
+	HORIZON CATALOG bi-directional read/write (2026) -- external engines (Spark, Trino, PyIceberg)
+	can now both READ AND WRITE Iceberg tables that Snowflake manages, and Snowflake can read/write
+	Iceberg tables managed by OTHER catalogs too -- genuine multi-engine, no-copy interoperability,
+	the direct Snowflake analog to the companion Databricks notepad's UniForm (Part D25) and
+	Managed Iceberg in Unity Catalog (Part D26).
+	GOTCHA/interview framing: "Delta vs Iceberg" was a 2023-era platform-loyalty question; by 2026
+	BOTH Databricks and Snowflake have converged on treating Iceberg as a first-class, natively-
+	managed table type alongside their own native format (Delta for Databricks) -- the practical
+	answer in either ecosystem is increasingly "you don't have to choose, both engines read/write
+	the same open files now."
+======================================================================================================================================================
+D7. Hybrid Tables (Unistore) -- Snowflake's OLTP answer, GENUINELY DIFFERENT from Lakebase
+
+	Unistore = Snowflake's capability for running TRANSACTIONAL (OLTP) and analytical (OLAP)
+	workloads on ONE platform, powered by Hybrid Tables:
+		CREATE HYBRID TABLE orders_state (order_id INT PRIMARY KEY, status STRING, updated_at TIMESTAMP);
+	DUAL-STORAGE architecture: ROW-based storage for fast single-row lookups/inserts/updates/
+	deletes (the OLTP side) + data is ASYNCHRONOUSLY copied into COLUMNAR storage for analytical
+	scans (the OLAP side) -- Snowflake's optimizer routes each query to whichever storage suits it.
+	UNLIKE standard Snowflake tables, Hybrid Tables ENFORCE primary keys, foreign keys, unique
+	constraints, and support secondary indexes -- real relational integrity enforcement (contrast
+	with the companion Databricks notepad's Delta PK/FK being informational-only, Part J14 --
+	Snowflake Hybrid Tables actually enforce these).
+	Use cases: application/workflow state management (e.g. tracking thousands of parallel workers'
+	ingestion progress), low-latency serving of precomputed aggregates via API, lightweight
+	transactional apps. Requires Enterprise Edition+.
+	2026: major engine optimization improved Hybrid Table latency/throughput by ~8x.
+
+	GOTCHA -- Hybrid Tables vs Snowflake Postgres (D8, huge and very likely interview question):
+	these are TWO DIFFERENT products solving adjacent-but-distinct problems. See D8 for the full
+	distinction -- don't describe them as the same thing.
+======================================================================================================================================================
+D8. Snowflake Postgres (2026, built on the acquired Crunchy Data) -- NOT the same as Unistore
+
+	Snowflake Postgres is a fully-managed, ENTERPRISE-GRADE, wire-compatible PostgreSQL service
+	(built on Crunchy Data's technology, acquired by Snowflake in 2025) -- full Postgres, not a
+	Snowflake-native reinterpretation of transactional storage. Supports familiar Postgres tooling
+	(psql, ORMs, pg_dump, foreign data wrappers) and certified extensions (PostGIS, PL/pgSQL,
+	pg_partman, pgvector). GA since February 2026, with 2026 Summit adding Private Link,
+	customer-managed keys, and secrets management.
+	Connects to analytical Snowflake data via the pg_lake extension and Unistore Hybrid Tables --
+	you can query Postgres tables alongside Snowflake's analytical tables, run Snowpark UDFs/ML
+	models against transactional data, and use Streams+Tasks (Part D9) to orchestrate CDC from
+	Postgres into the rest of the platform.
+
+	OFFICIAL GUIDANCE ON WHEN TO USE WHICH (memorize this -- a near-certain interview question):
+		- Use SNOWFLAKE POSTGRES as the operational store for apps/AI, and to lift-and-shift
+		  EXISTING Postgres applications onto the Snowflake platform (you want real, full,
+		  standards-compliant Postgres).
+		- Use UNISTORE (Hybrid Tables) for use cases needing DEEP, NATIVE integration with
+		  Snowflake's OWN governance/analytics model specifically -- e.g. tracking app/workflow
+		  state or serving real-time data WITHIN the Snowflake object model itself (no separate
+		  "database" to manage/connect to -- it's just another Snowflake table type).
+	GOTCHA (direct comparison to the companion Databricks notepad): Snowflake Postgres is the
+	closer analog to Databricks' LAKEBASE (companion notepad Part H1) -- both are "real, managed
+	Postgres, acquired-technology-based, decoupled architecture" plays (Lakebase via the Neon
+	acquisition, Snowflake Postgres via the Crunchy Data acquisition). Unistore/Hybrid Tables is
+	the closer analog to Databricks' LTAP thesis (companion notepad Part H2) -- unifying OLTP+OLAP
+	inside the SAME native table/governance model rather than bridging to an external Postgres
+	service. Both companies made the SAME two-pronged bet (acquire real Postgres AND build a
+	native hybrid table type) within about a year of each other -- a genuinely good "how are these
+	platforms converging" interview talking point.
+======================================================================================================================================================
+D9. Streams & Tasks, and Dynamic Tables -- Snowflake's answer to CDC + declarative pipelines
+
+	STREAMS -- track CHANGES (inserts/updates/deletes) on a table since the stream was last
+	consumed, similar in spirit to the companion Databricks notepad's Delta Change Data Feed
+	(Part J13):
+		CREATE STREAM orders_stream ON TABLE orders;
+		SELECT * FROM orders_stream;   -- shows changed rows + METADATA$ACTION (INSERT/DELETE) +
+		                                   METADATA$ISUPDATE columns
+	Stream TYPES: standard (all DML types) / append-only (inserts only, faster, ignores updates/
+	deletes) / insert-only (for external tables specifically).
+	A stream has an OFFSET that advances only when consumed inside a DML transaction (e.g. inside
+	a Task) -- reading a stream via a plain SELECT does NOT advance its offset; only a DML
+	statement that CONSUMES it (INSERT/MERGE reading FROM the stream) does.
+
+	TASKS -- scheduled or triggered SQL/procedure execution:
+		CREATE TASK my_task WAREHOUSE = my_wh SCHEDULE = '5 MINUTE' AS
+		  MERGE INTO target USING orders_stream ...;
+	Tasks can form a DAG (task A triggers task B on completion via AFTER). SERVERLESS tasks (no
+	warehouse specified) let Snowflake auto-manage the compute size, billed separately.
+	The classic STREAMS + TASKS pattern = poll a stream on a schedule, merge changes into a
+	downstream table -- Snowflake's hand-rolled equivalent of an incremental Lakeflow/DLT pipeline
+	step (companion Databricks notepad Part F).
+
+	DYNAMIC TABLES (the more DECLARATIVE alternative, and Snowflake's closest analog to the
+	companion notepad's Lakeflow Declarative Pipelines / Delta Live Tables, Part F6-F7):
+		CREATE DYNAMIC TABLE silver_orders
+		  TARGET_LAG = '5 minutes'
+		  WAREHOUSE = my_wh
+		AS
+		  SELECT o.*, c.customer_name FROM orders o JOIN customers c ON o.cust_id = c.id;
+	You declare the END STATE (the query defining what the table should contain); Snowflake
+	figures out HOW to keep it incrementally refreshed to stay within TARGET_LAG of the source --
+	you do NOT write the incremental MERGE logic yourself for standard cases. Dynamic Tables form
+	a DAG automatically based on which other Dynamic Tables/tables they reference, resolving
+	dependency order for you -- the exact same "declare what, not how, and dependency order is
+	inferred from data references" philosophy as Lakeflow Declarative Pipelines.
+	2026 addition: CUSTOM INCREMENTALIZATION -- for transformation logic too complex to express
+	purely declaratively, you can now drop in your OWN MERGE/INSERT logic for the incremental
+	step, without losing Dynamic Tables' automation for everything else around it (scheduling,
+	dependency resolution, monitoring).
+
+	WHEN TO USE WHICH: Dynamic Tables for standard "keep this transformed view fresh" pipeline
+	steps (the modern DEFAULT recommendation, much like Lakeflow Declarative Pipelines is now the
+	Databricks default over hand-rolled streaming jobs). Streams+Tasks for cases needing explicit,
+	custom control over the exact change-processing logic, or non-table-shaped side effects
+	(calling an external API per batch of changes, for example) that a Dynamic Table's "just
+	define the result query" model can't express.
+======================================================================================================================================================
+======================================================================================================================================================
+PART E -- DATA LOADING & INGESTION
+======================================================================================================================================================
+======================================================================================================================================================
+E1. COPY INTO -- bulk/batch loading
+
+	COPY INTO my_table FROM @my_stage FILE_FORMAT = (TYPE = 'CSV' FIELD_DELIMITER = ',')
+	  ON_ERROR = 'CONTINUE';
+	Idempotent by default -- Snowflake tracks which files in a stage have already been loaded
+	(via file metadata) and skips them on re-run, similar in spirit to the companion Databricks
+	notepad's COPY INTO command (Part F3) -- same name, same idempotent philosophy, both platforms
+	converged on this pattern independently.
+	ON_ERROR options: CONTINUE (skip bad rows) / ABORT_STATEMENT (default, fail the whole load) /
+	SKIP_FILE (skip an entire bad file).
+======================================================================================================================================================
+E2. Stages
+
+	INTERNAL stages -- Snowflake-managed storage: USER stage (@~, per-user scratch), TABLE stage
+	(@%my_table, tied to one table), NAMED stage (@my_stage, a reusable, independently-managed
+	object).
+	EXTERNAL stages -- point at YOUR cloud storage bucket (S3/Azure/GCS) with a storage
+	integration for credentials -- the Snowflake analog to the companion Databricks notepad's
+	Unity Catalog External Locations + Storage Credentials (Part E6): a governed, reusable,
+	auditable reference to external storage instead of embedding credentials inline.
+======================================================================================================================================================
+E3. Snowpipe -- continuous, serverless, event-driven loading
+
+	Auto-ingests new files as they land in a stage, without a running warehouse or a scheduled
+	Task polling for them -- triggered by cloud storage EVENT NOTIFICATIONS (S3 event notifications
+	/ Azure Event Grid / GCS Pub/Sub) or via a REST API call. Serverless -- Snowflake manages the
+	compute, billed per-second of actual use, not warehouse credits.
+	GOTCHA vs the companion Databricks notepad's Auto Loader (Part F2/F5): conceptually near-
+	identical goal (incrementally, efficiently pick up new files without a full directory
+	re-listing), but Snowpipe is MICRO-BATCH/file-oriented (loads whole files as they complete),
+	while Auto Loader is a genuine Spark Structured Streaming source (continuous micro-batches
+	with checkpointing, exactly-once semantics via a checkpoint location). Snowpipe's equivalent
+	of "exactly-once" tracking is Snowflake's own internal file-load-history bookkeeping, not a
+	user-managed checkpoint path.
+======================================================================================================================================================
+E4. Snowpipe Streaming -- row-based, lower-latency alternative to Snowpipe
+
+	Instead of waiting for whole FILES to land and loading them, Snowpipe Streaming lets a client
+	application (via an SDK -- Java/Python) push ROWS directly into a Snowflake table with
+	sub-second-class latency, no file-staging step at all. This is the direct Snowflake analog to
+	the companion Databricks notepad's Zerobus (Part F10) -- both are "skip the file/batch step
+	entirely, write events straight into a governed table" answers to the same real-time-ingestion
+	problem, introduced by each platform independently.
+======================================================================================================================================================
+E5. Openflow (GA 2026, all 3 clouds) -- managed, connector-based data integration
+
+	A managed, NiFi-based ingestion service -- GA on AWS, Azure, AND GCP as of 2026, with a Data
+	Connectivity Proxy and wizard-driven connector setup directly in Snowsight. Connector catalog
+	includes Oracle (agentless CDC via Oracle XStream), Veeva Systems, MongoDB, MariaDB, Shopify,
+	Google BigQuery, and more, each with guided Snowsight setup, built-in observability, and
+	lower operational cost than hand-rolling the equivalent pipeline yourself.
+	GOTCHA (direct comparison): this is Snowflake's answer to the companion Databricks notepad's
+	Lakeflow Connect (Part F10) -- "100+ managed connectors with built-in CDC/schema handling"
+	is the exact same pitch on both platforms, just under different product names (Openflow vs
+	Lakeflow Connect).
+======================================================================================================================================================
+E6. Datastream (2026, private preview) -- native, Kafka-compatible streaming
+
+	A fully managed, Kafka-WIRE-COMPATIBLE streaming service BUILT INTO Snowflake -- your existing
+	Kafka clients/producers can point at Datastream with essentially a config change, no separate
+	Kafka cluster to run/operate. Data lands as governed Snowflake or Iceberg tables, automatically
+	inheriting RBAC, masking policies, lineage, and Time Travel -- "topic/table duality" collapses
+	the old boundary between "data in motion" (a Kafka topic) and "data at rest" (a governed
+	table). Aimed squarely at teams currently maintaining a separate Kafka-to-Snowflake pipeline
+	just to get event data in.
+	GOTCHA: private preview as of mid-2026 -- don't describe this as broadly production-proven yet
+	in an interview; describe it accurately as "announced, governance-native, Kafka-compatible,
+	still landing."
+======================================================================================================================================================
+E7. Zero-Copy Integrations (GA 2026)
+
+	Direct, no-ETL connections to major enterprise platforms -- SAP (GA), Salesforce (GA, 2+
+	years, connector experience being refreshed), Workday (private preview), plus newer additions
+	AVEVA (industrial data) and IBM. Eliminates an entire category of hand-built ETL pipelines
+	that exist purely to move data OUT of these systems and INTO Snowflake.
+======================================================================================================================================================
+E8. External Functions & API Integrations
+
+	Call an EXTERNAL REST API directly from SQL (e.g. to call a third-party service, or a custom
+	model endpoint not natively in Cortex) via a CREATE EXTERNAL FUNCTION definition backed by an
+	API Integration object (credentials/endpoint config, governed like a stage). The general-
+	purpose escape hatch for "call something outside Snowflake as if it were a SQL function" --
+	predates and is more general-purpose than the Cortex-specific AI Functions (AI notepad, coming
+	next), which are Snowflake's own managed, no-external-endpoint-needed version of this same
+	idea for LLM calls specifically.
+======================================================================================================================================================
+======================================================================================================================================================
+PART F -- TRANSFORMATION & DEVELOPMENT
+======================================================================================================================================================
+======================================================================================================================================================
+F1. Snowflake Scripting -- stored procedures
+
+	CREATE PROCEDURE my_proc(threshold FLOAT) RETURNS STRING LANGUAGE SQL AS
+	$$
+	BEGIN
+	  UPDATE orders SET flagged = TRUE WHERE amount > :threshold;
+	  RETURN 'done';
+	END;
+	$$;
+	Procedural SQL with control flow (IF/FOR/WHILE, exception handling via EXCEPTION blocks) --
+	Snowflake's answer to "I need real procedural logic, not just declarative SQL." Also supports
+	JavaScript, Python, Java, and Scala as procedure languages, not just native SQL scripting.
+======================================================================================================================================================
+F2. UDFs and UDTFs
+
+	UDF (scalar) -- one input row/set of values in, ONE value out, usable inline in a SELECT like
+	any built-in function. UDTF (table function) -- one call can return MULTIPLE ROWS/columns,
+	used with a LATERAL join or in the FROM clause directly.
+		CREATE FUNCTION double_it(x FLOAT) RETURNS FLOAT AS 'x * 2';                      -- scalar UDF
+		CREATE FUNCTION split_words(s STRING) RETURNS TABLE (word STRING) AS
+		  'SELECT VALUE::STRING FROM TABLE(SPLIT_TO_TABLE(s, \' \'))';                    -- UDTF
+	VECTORIZED UDFs (Python) process a whole BATCH of rows at once (as a pandas DataFrame) instead
+	of row-by-row -- meaningfully faster for row-by-row-heavy Python logic, the Snowflake analog
+	of the companion Databricks notepad's Pandas UDFs.
+	GOTCHA (a genuinely important cross-platform nuance): UDFs are a real perf consideration here
+	too, but the SPECIFIC "forces a Photon fallback" mechanism from the companion Databricks
+	notepad (Part B8/C12) doesn't exist in Snowflake -- Snowflake has no Photon-equivalent
+	execution-engine-fallback concept. The general "prefer a built-in over a UDF when one exists"
+	advice still holds (built-ins are better optimized), just for different underlying reasons
+	(Snowflake's own query engine simply executes built-ins more efficiently than a UDF sandbox call).
+======================================================================================================================================================
+F3. Snowpark -- the Spark-like DataFrame API, running entirely inside Snowflake
+
+	from snowflake.snowpark import Session
+	df = session.table("orders").filter(col("amount") > 100).group_by("region").agg(sum_("amount"))
+	df.show()
+	Available in Python, Java, and Scala. LAZILY evaluated, just like a PySpark DataFrame (companion
+	Databricks notepad Part A7) -- but critically, Snowpark does NOT spin up a separate Spark
+	cluster at all. Under the hood, Snowpark DataFrame operations get PUSHED DOWN and translated
+	into SQL, executed by the Snowflake warehouse itself.
+	GOTCHA (a very common point of confusion for someone coming from Databricks, worth having
+	precisely right): Snowpark LOOKS like PySpark (same DataFrame-chaining feel) but is NOT Spark
+	at all -- there's no separate distributed execution engine underneath; it's a Python (or Java/
+	Scala) API that COMPILES to plain Snowflake SQL, run by a regular virtual warehouse (Part B).
+	Snowpark ML (AI notepad, coming next) extends this same push-down philosophy to ML training/
+	feature engineering.
+======================================================================================================================================================
+F4. Snowpark Container Services (SPCS)
+
+	Run ARBITRARY containerized workloads (your own Docker images) directly inside Snowflake's
+	security/governance perimeter, on Snowflake-managed compute pools -- including GPU-backed
+	pools. Used for: deploying custom model-serving endpoints, running full-stack apps, or any
+	workload that doesn't fit the "SQL/Snowpark push-down" execution model and genuinely needs a
+	container. The rough Snowflake analog to the companion Databricks notepad's serverless GPU
+	compute (Part A9) combined with Databricks Apps (Part H4) -- "run your own container,
+	governed, inside the platform, without standing up separate infrastructure."
+======================================================================================================================================================
+F5. Snowflake Notebooks
+
+	Cell-based, interactive Python/SQL/Markdown notebooks running natively in Snowsight (private
+	preview -> now broadly available), with a CONTAINER RUNTIME option for GPU-backed ML work
+	(training/deep learning) beyond what a standard warehouse-backed notebook cell supports.
+	Natively integrated with RBAC (Part G) -- share/collaborate on a notebook without any special
+	export/import step, the data access permissions of whoever runs a cell apply automatically.
+	Direct analog to the companion Databricks notepad's notebook environment, though Databricks
+	notebooks predate Snowflake Notebooks by years -- this was a genuine platform gap Snowflake
+	closed relatively recently.
+======================================================================================================================================================
+F6. Streamlit in Snowflake
+
+	Build and host interactive Python web apps (Streamlit framework) DIRECTLY inside Snowflake,
+	querying governed data with no separate app-hosting infrastructure -- the Snowflake analog to
+	the companion Databricks notepad's Databricks Apps (Part H4). 2026: now runs on a CONTAINER
+	RUNTIME (GA), giving apps access to more compute flexibility (including GPU where needed) than
+	the original warehouse-backed execution model.
+======================================================================================================================================================
+F7. Git integration, Snowflake CLI, and CI/CD
+
+	Native Git integration lets you connect a repository directly to a Snowflake database schema
+	object, and execute files straight from a connected repo (EXECUTE IMMEDIATE FROM
+	@my_git_repo/branches/main/my_script.sql) -- version-controlled SQL/Python without a separate
+	deployment step. The Snowflake CLI (`snow` command) wraps REST API/SQL operations for
+	scripting/automation -- the analog to the companion Databricks notepad's Databricks CLI (Part
+	J22). dbt is also extremely common on top of Snowflake for transformation-layer version
+	control/testing -- worth knowing dbt exists as the most common third-party transformation
+	tool paired with Snowflake, even though it's not a Snowflake-native product.
+======================================================================================================================================================
+F8. Snowsight Pipeline Builder (2026, private preview)
+
+	A VISUAL representation of your data pipeline directly inside Snowsight -- see the DAG of
+	tables/streams/tasks/dynamic tables that make up a pipeline, rather than only inferring it
+	from reading SQL/task definitions. Valuable for onboarding new team members, debugging, and
+	explaining a pipeline to non-technical stakeholders -- the Snowflake analog to visually
+	inspecting a Lakeflow Declarative Pipeline's dependency graph in the companion Databricks notepad.
+======================================================================================================================================================
+======================================================================================================================================================
+PART G -- GOVERNANCE & SECURITY
+======================================================================================================================================================
+======================================================================================================================================================
+G1. RBAC hierarchy (know the built-in roles precisely -- a near-guaranteed interview question)
+
+		ACCOUNTADMIN   -- top-level, full control of the account (billing, all objects, all
+		                  security settings). Should have very few users, used sparingly.
+		SECURITYADMIN  -- manages users, roles, role grants, network policies -- the "who can do
+		                  what" administrator, separate from data ownership.
+		SYSADMIN       -- default role for creating/managing warehouses, databases, schemas, and
+		                  most day-to-day objects -- the "build things" administrator.
+		USERADMIN      -- manages users and roles specifically (a narrower slice of SECURITYADMIN's scope).
+		PUBLIC         -- automatically granted to every user/role; the "everyone" baseline.
+	Custom roles are created and GRANTED to other roles, forming a HIERARCHY -- role inheritance
+	means granting role B to role A gives A everything B can do, PLUS its own separate grants.
+	Best practice (a real interview talking point): separate FUNCTIONAL roles (what a person's JOB
+	needs -- "analyst," "data_engineer") from ACCESS roles (specific object-level grants -- "read
+	sales_db," "write staging_schema") -- functional roles are granted a combination of access
+	roles, rather than every functional role re-declaring its own object grants from scratch. This
+	mirrors the companion Databricks notepad's general RBAC-hygiene advice but is a Snowflake-
+	specific naming convention worth stating precisely if asked.
+	GOTCHA: unlike the companion Databricks notepad's Unity Catalog admin hierarchy (Part K16,
+	which separates WORKSPACE admin from DATA governance deliberately), Snowflake's roles are all
+	within ONE unified account-level RBAC system -- there's no separate "workspace admin doesn't
+	automatically get data access" split; it's role-grant-based governance top to bottom.
+======================================================================================================================================================
+G2. Grants & ownership
+
+	GRANT SELECT ON TABLE orders TO ROLE analyst_role;
+	GRANT USAGE ON DATABASE sales_db TO ROLE analyst_role;
+	GRANT ROLE access_role TO ROLE functional_role;               -- role-to-role grant (hierarchy)
+	FUTURE GRANTS -- grant privileges on objects that DON'T EXIST YET within a schema/database
+	(e.g. "grant SELECT on all FUTURE tables in this schema") -- avoids having to re-grant every
+	single new table manually as a pipeline creates them.
+	Every object has an OWNER role -- ownership itself is a grantable, transferable privilege.
+======================================================================================================================================================
+G3. Row Access Policies & Masking Policies -- the exact Snowflake analog to companion notepad Part J24
+
+	ROW ACCESS POLICY -- filters which ROWS a given role can see:
+		CREATE ROW ACCESS POLICY region_filter AS (region STRING) RETURNS BOOLEAN ->
+		  CURRENT_ROLE() IN ('GLOBAL_ANALYST') OR region = CURRENT_ROLE_REGION();
+		ALTER TABLE sales ADD ROW ACCESS POLICY region_filter ON (region);
+
+	MASKING POLICY (column-level, dynamic data masking) -- transforms/hides a COLUMN'S value based
+	on the querying role, at QUERY TIME, without changing the underlying stored data:
+		CREATE MASKING POLICY mask_ssn AS (val STRING) RETURNS STRING ->
+		  CASE WHEN CURRENT_ROLE() IN ('HR_ADMIN') THEN val ELSE '***-**-****' END;
+		ALTER TABLE employees MODIFY COLUMN ssn SET MASKING POLICY mask_ssn;
+	Both are Enterprise Edition+ features, natively integrated (not a hand-written view trick the
+	way the companion Databricks notepad describes as the LEGACY pre-Unity-Catalog pattern, Part
+	J24) -- Snowflake's row/column policies work more like the MODERN Unity Catalog row filter/
+	column mask objects described there: attached directly to the table, enforced everywhere the
+	table is queried from, including via Snowflake's own data sharing (Part H).
+======================================================================================================================================================
+G4. Object tagging
+
+	CREATE TAG cost_center;
+	ALTER TABLE orders SET TAG cost_center = 'finance';
+	Attach arbitrary key-value metadata to objects for classification, cost attribution, or
+	tag-based masking policies (apply a masking rule to every column tagged "pii" account-wide,
+	rather than manually attaching a masking policy column-by-column). The Snowflake analog to the
+	companion Databricks notepad's data classification/auto-tagging discussion (Part K15).
+======================================================================================================================================================
+G5. Network security
+
+	NETWORK POLICIES -- IP allow/block lists restricting where connections can originate from,
+	assignable at the account or individual-user level.
+	PRIVATE CONNECTIVITY (AWS PrivateLink / Azure Private Link / GCP Private Service Connect) --
+	keeps traffic between your network and Snowflake off the public internet entirely -- the
+	Snowflake analog to the companion Databricks notepad's Private Network Gateway (Part K20).
+======================================================================================================================================================
+G6. Authentication
+
+	Password + MFA (Duo-based), SSO/SAML (federated with your corporate identity provider -- the
+	Snowflake analog to the companion notepad's Automatic Identity Management/Entra integration,
+	Part J), key-pair authentication (for service accounts/automation -- no password at all,
+	public/private key pair instead, the Snowflake analog to preferring OAuth/key-based auth over
+	long-lived passwords for automation, companion notepad Part K11), and OAuth for third-party
+	tool integrations.
+======================================================================================================================================================
+G7. Encryption
+
+	Encrypted at rest AND in transit BY DEFAULT, with no configuration needed for the baseline.
+	TRI-SECRET SECURE (Business Critical+) -- combines a Snowflake-maintained key with a
+	CUSTOMER-MANAGED key, so Snowflake literally cannot decrypt your data without your
+	organization's key also being available -- the strongest customer-controlled-key posture
+	Snowflake offers, and a real differentiator to know by name for regulated-industry interviews.
+======================================================================================================================================================
+G8. Data classification (automatic PII detection)
+
+	Snowflake can automatically SCAN and SUGGEST classification tags for columns that look like
+	PII (emails, SSNs, etc.) based on name/content patterns -- feeding directly into tag-based
+	masking policies (G4) so an organization doesn't have to manually hunt down and tag every
+	sensitive column by hand. Direct analog to the companion Databricks notepad's Unity Catalog
+	automated data classification discussion (Part K15).
+======================================================================================================================================================
+G9. Trust Center (2026: AI Security Posture Management added)
+
+	A centralized security-posture dashboard -- surfaces misconfigurations, risky grants, and (as
+	of 2026) AI-SPECIFIC risk signals: prompt-injection vulnerability detection (ML-based),
+	AI Guardrails status, Agent Identity coverage (companion AI notepad, coming next). The
+	Snowflake analog to the companion Databricks notepad's system tables + security posture
+	discussion, but presented as one unified dashboard product rather than raw queryable tables alone.
+======================================================================================================================================================
+======================================================================================================================================================
+PART H -- DATA SHARING & COLLABORATION
+======================================================================================================================================================
+======================================================================================================================================================
+H1. Secure Data Sharing
+
+	CREATE SHARE my_share;
+	GRANT USAGE ON DATABASE sales_db TO SHARE my_share;
+	GRANT SELECT ON TABLE sales_db.public.orders TO SHARE my_share;
+	ALTER SHARE my_share ADD ACCOUNTS = ('partner_account_id');
+	ZERO-COPY -- the consumer queries the PROVIDER's actual data directly, live, with no
+	duplication, no ETL, no batch refresh lag -- the exact same "zero-copy, cross-org, no data
+	movement" pitch as the companion Databricks notepad's Delta Sharing/OpenSharing (Part E11).
+	Both platforms independently built this same fundamental capability; Snowflake's version
+	predates Delta Sharing as a concept (Snowflake pioneered zero-copy data sharing).
+======================================================================================================================================================
+H2. Reader accounts
+
+	For CONSUMERS who don't have their own Snowflake account -- the PROVIDER creates and manages a
+	free, restricted "reader account" on the consumer's behalf so they can query shared data
+	without needing to become a paying Snowflake customer themselves. No direct Databricks analog
+	described in the companion notepad (Delta Sharing's open protocol lets non-Databricks clients
+	consume shares differently, via any Delta Sharing-compatible client rather than a
+	provider-managed reader account).
+======================================================================================================================================================
+H3. Snowflake Marketplace
+
+	A discovery/subscription marketplace for THIRD-PARTY data listings, and (increasingly) AI
+	models/apps, built on the same Secure Data Sharing mechanics (H1). Direct analog to the
+	companion Databricks notepad's Databricks Marketplace (Part K14) -- same underlying idea
+	(browse and one-click-subscribe to shared data/models), same zero-copy delivery mechanism underneath.
+======================================================================================================================================================
+H4. Data Clean Rooms -- 2026: Multi-Party Collaboration GA
+
+	Cross-organization collaboration on SHARED data WITHOUT either party exposing their raw
+	underlying rows to the other -- only pre-approved queries run, only aggregate/non-identifying
+	results leave the clean room. Direct analog to the companion Databricks notepad's Clean Rooms
+	(Part K13) -- same problem, same restricted-compute-environment solution.
+	2026 UPGRADE -- Multi-Party Collaboration: previously a FIXED two-party (provider/consumer)
+	model; now supports MORE THAN TWO parties collaborating SYMMETRICALLY in one shared, governed
+	environment (some contributing data, some running analytics, others doing both) -- a genuine
+	capability the Databricks Clean Rooms description doesn't (yet) claim at this same multi-party
+	symmetry level, worth flagging as a real point of current differentiation if asked to compare.
+======================================================================================================================================================
+H5. Data resharing (2026 GA)
+
+	You can now RESHARE data that was shared TO you with a THIRD party -- previously a genuine gap
+	(a share you received couldn't itself become the source of a further share you create). Now GA.
+======================================================================================================================================================
+H6. Open Data Sharing (2026)
+
+	Any IRC (Iceberg REST Catalog)-COMPATIBLE external engine can now consume a Snowflake data
+	share WITHOUT needing a Snowflake account at all -- sharing the underlying Iceberg data
+	directly via the open catalog protocol. Snowflake can ALSO consume a Delta Share (i.e. read
+	data shared via the companion Databricks notepad's Delta Sharing protocol, Part E11) FROM
+	inside Snowflake -- genuine bidirectional, cross-platform, cross-protocol interoperability
+	between the two ecosystems' native sharing protocols as of 2026.
+======================================================================================================================================================
+======================================================================================================================================================
+PART I -- PERFORMANCE, COST & OPERATIONS
+======================================================================================================================================================
+======================================================================================================================================================
+I1. Cost optimization playbook (a common "how would you cut our Snowflake bill" interview scenario)
+
+	1. Fix PRUNING/CLUSTERING first (Part C1/A4) before touching warehouse size -- most "slow and
+	   expensive" queries are a pruning problem in disguise, not a compute-size problem.
+	2. Tune AUTO_SUSPEND aggressively for bursty/interactive warehouses (shorter = less idle
+	   billing), but remember the trade-off against local disk cache loss (Part B4) for
+	   frequently-reused warehouses -- there's a real balance point, not just "suspend instantly always."
+	3. Use MULTI-CLUSTER (scale out) for concurrency spikes instead of a permanently oversized
+	   single warehouse (Part B2/B3) -- don't pay for peak capacity 24/7.
+	4. Use RESOURCE MONITORS (Part B5) on every warehouse/account as a hard backstop, not just
+	   dashboards you occasionally glance at.
+	5. Prefer DYNAMIC TABLES/materialized results over ad hoc re-computation of the same
+	   expensive aggregation repeatedly by many consumers.
+	6. Separate warehouses BY WORKLOAD (ETL warehouse, BI warehouse, data-science warehouse) so
+	   one workload's resource needs/scaling pattern doesn't force compromises on another's --
+	   and so cost is cleanly attributable per workload.
+	7. Watch for ACCIDENTAL SELECT * on wide tables feeding BI tools that only need a few columns
+	   -- pruning helps with row-filtering but columnar storage ALSO benefits from not reading
+	   unneeded columns at all.
+======================================================================================================================================================
+I2. ACCOUNT_USAGE / ORGANIZATION_USAGE -- Snowflake's system tables equivalent
+
+	The direct analog to the companion Databricks notepad's system tables (Part J25): queryable,
+	governed views exposing account-level operational data --
+		SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY       -- every query run, with cost/perf metrics
+		SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY  -- credit consumption per warehouse
+		SNOWFLAKE.ACCOUNT_USAGE.ACCESS_HISTORY      -- who accessed/read/wrote what, when (audit)
+		SNOWFLAKE.ACCOUNT_USAGE.GRANTS_TO_ROLES     -- current permission grants
+		SNOWFLAKE.ORGANIZATION_USAGE...             -- rolls up across MULTIPLE Snowflake accounts
+		                                                in the same organization
+	INFORMATION_SCHEMA (per-database, near-real-time but limited history) vs ACCOUNT_USAGE
+	(account-wide, longer retention, slight latency in freshness) -- know this distinction:
+	INFORMATION_SCHEMA for "right now," ACCOUNT_USAGE for historical/trend analysis and cost attribution.
+======================================================================================================================================================
+I3. Observe by Snowflake (2026, IT operations/observability product line)
+
+	A newer Snowflake product line (built from an acquisition) extending Snowflake into IT
+	operations/observability monitoring more broadly -- storing and analyzing logs/metrics/traces
+	at scale on the same platform, rather than a separate specialized observability vendor. The
+	closest Databricks analog described in the companion notepad is Lakewatch -- though Lakewatch
+	is explicitly security/SIEM-focused while Observe is broader IT-operations-focused; similar
+	"why run a separate specialized product when the data platform can do it natively at scale"
+	thesis either way.
+======================================================================================================================================================
+======================================================================================================================================================
+PART J -- HIGH AVAILABILITY, REPLICATION & MIGRATION
+======================================================================================================================================================
+======================================================================================================================================================
+J1. Database replication & failover (Business Critical+)
+
+	CREATE DATABASE my_db AS REPLICA OF other_account.other_db;
+	ALTER DATABASE my_db REFRESH;                        -- manual/scheduled sync
+	Replicate databases across REGIONS or even across CLOUD PROVIDERS for disaster recovery.
+	FAILOVER GROUPS bundle multiple databases + their account-level objects (users, roles,
+	warehouses) together so an entire logical "account's worth" of objects can fail over as one
+	coordinated unit, not database-by-database individually.
+======================================================================================================================================================
+J2. Snowflake AIM (2026 GA) -- AI-assisted migration
+
+	Unifies migration, modernization, and workload "virtualization" for teams moving OFF Teradata,
+	Spark, or other platforms ONTO Snowflake -- combines SnowConvert AI (automated code
+	translation) and the Snowpark Migration Accelerator, plus an AIM agent (accessible via CoCo)
+	that guides a migration by identifying dependencies/risks BEFORE any production change is
+	made. Directly relevant if you're ever asked "how would you migrate an existing Databricks/
+	Spark workload onto Snowflake" -- Snowflake AIM is literally Snowflake's own tooling for
+	exactly that scenario.
+======================================================================================================================================================
+======================================================================================================================================================
+PART K -- SEMI-STRUCTURED DATA & SQL EXTENSIONS (classic interview-coding territory)
+======================================================================================================================================================
+======================================================================================================================================================
+K1. VARIANT, OBJECT, ARRAY types
+
+	VARIANT -- holds ANY semi-structured data (JSON, Avro, Parquet, XML once parsed) in a single
+	column, similar in spirit to the companion Databricks notepad's VARIANT type (Part A10/D24) --
+	both platforms landed on the SAME type name for the SAME purpose (pre-parsed semi-structured
+	storage avoiding repeated re-parsing of raw strings), independently.
+	OBJECT -- a VARIANT specifically holding key-value pairs (like a JSON object/dict).
+	ARRAY -- a VARIANT specifically holding an ordered list of values.
+		SELECT PARSE_JSON('{"name":"a","tags":["x","y"]}') AS v;
+		SELECT v:name::STRING, v:tags[0]::STRING FROM my_table;    -- colon = field access, bracket = array index
+======================================================================================================================================================
+K2. FLATTEN -- Snowflake's answer to explode()
+
+	SELECT o.order_id, f.value::STRING AS item
+	FROM orders o, LATERAL FLATTEN(input => o.items) f;
+	FLATTEN takes a VARIANT array/object column and produces ONE ROW PER ELEMENT, joined laterally
+	back to the original row -- functionally identical in purpose to the companion Databricks
+	notepad's explode() function (Part B23), just expressed as a table function + LATERAL join
+	instead of a simple column-producing function.
+======================================================================================================================================================
+K3. LATERAL joins
+
+	A join where the RIGHT side of the join can REFERENCE columns from the LEFT side (normal joins
+	can't do this -- both sides are evaluated independently before being joined). This is WHY
+	FLATTEN (K2) needs LATERAL: the flatten operation needs to reference `o.items` from the outer
+	row for each row it's flattening. Also used for "top N per group"-style correlated subquery
+	patterns without needing a window function.
+======================================================================================================================================================
+K4. QUALIFY -- a genuinely Snowflake-distinctive SQL clause worth knowing cold
+
+	SELECT *, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY order_date DESC) AS rn
+	FROM orders
+	QUALIFY rn = 1;
+	QUALIFY filters on WINDOW FUNCTION results directly, the way WHERE filters on plain columns
+	and HAVING filters on aggregates -- WITHOUT needing to wrap the query in a subquery just to
+	filter on a ROW_NUMBER()/RANK() result (the pattern you're FORCED into on most other SQL
+	engines, including plain Spark SQL, which has no QUALIFY equivalent -- companion Databricks
+	notepad's window-function patterns, Part B18/J11, all require a wrapping subquery to achieve
+	what QUALIFY does in one clause). A genuinely distinctive, well-liked Snowflake SQL feature --
+	a good one to actively demonstrate you know if given a free-form SQL question in an interview.
+======================================================================================================================================================
+K5. MERGE -- same core pattern as Delta, worth the explicit side-by-side
+
+	MERGE INTO target t USING source s ON t.id = s.id
+	  WHEN MATCHED THEN UPDATE SET t.value = s.value
+	  WHEN NOT MATCHED THEN INSERT (id, value) VALUES (s.id, s.value);
+	Syntactically almost identical to the companion Databricks notepad's Delta MERGE (Part D8/D10)
+	-- SCD1/SCD2 patterns translate directly. Snowflake has no AUTO CDC-style declarative shortcut
+	for SCD2 the way Lakeflow Declarative Pipelines does (companion notepad Part F12) -- you write
+	the two-sided MERGE (or the equivalent expire-old-row + insert-new-row pattern) by hand in
+	Snowflake, or drive it through a Dynamic Table's custom incrementalization (Part D9) if you
+	want it managed declaratively.
+======================================================================================================================================================
+======================================================================================================================================================
+PART L -- SNOWFLAKE SUMMIT 2026 RECAP + SNOWFLAKE-VS-DATABRICKS INTERVIEW ANGLE
+======================================================================================================================================================
+======================================================================================================================================================
+L1. Event basics
+
+	June 1-4, 2026, Moscone Center, San Francisco. 20,000+ attendees, largest Summit in Snowflake's
+	history, 26+ new capabilities announced across six domains. CEO Sridhar Ramaswamy's keynote
+	thesis: "The model is not your unique advantage. It's when you combine models with YOUR DATA
+	that things begin to shine." Four building blocks: Enterprise Data and Context, AI Models,
+	Applications, and an Agentic Control Plane. Anthropic President Daniela Amodei co-keynoted --
+	Claude now powers both CoWork and CoCo (companion AI notepad, coming next) under a multi-year,
+	$200M partnership. Also announced: a $6B, 5-year AWS infrastructure commitment (Graviton + AI
+	compute, Snowflake's largest cloud deal ever), and the acquisition of Natoma (an enterprise
+	MCP gateway/platform).
+======================================================================================================================================================
+L2. Condensed recap by domain
+
+	AI Agents + Productivity: CoWork + CoCo (major rebrands + capability expansion), Skill Catalog,
+	Cortex Sense (full detail in the AI notepad).
+	Context + Semantics: Horizon Context, Semantic Studio, Semantic View Autopilot, OSI (Open
+	Semantic Interchange standard, 54 vendors).
+	Security + Governance: AI Agent Identity (GA), AI Security Posture Management (Trust Center),
+	AI Guardrails (GA), Data Exfiltration Protection, Ransomware Protection.
+	Infrastructure + Interoperability: Apache Iceberg v3 (GA), Horizon Catalog/Polaris
+	bi-directional read/write (GA), Snowflake-managed Iceberg storage (GA), Datastream (private
+	preview), Openflow (GA, all 3 clouds), Zero-Copy Integrations (GA), Adaptive Compute (GA rolling
+	out), new query compiler.
+	AI Compute: Cortex Training (fine-tune open models on managed GPUs), ML feature serving GA
+	(sub-2-second freshness, ~10ms serving).
+	Collaboration: Multi-Party Clean Rooms (GA), data resharing (GA), Open Data Sharing (Delta
+	Share consumption + IRC-compatible external access).
+	Partnerships/Corporate: Anthropic (expanded), AWS ($6B), Natoma (acquisition, pending).
+======================================================================================================================================================
+L3. Snowflake vs Databricks -- quick comparison (a very likely interview question given your background)
+
+	ORIGIN/MODEL: Databricks = built around open-source Spark/Delta/Unity Catalog, "open lakehouse"
+	positioning, can technically self-host pieces. Snowflake = fully proprietary SaaS, no
+	self-hosting, but has aggressively embraced OPEN table formats (Iceberg) for interoperability
+	even while the platform itself stays closed.
+
+	COMPUTE MODEL: Both decouple storage/compute. Databricks: Spark clusters (classic or
+	serverless), Photon acceleration. Snowflake: Virtual Warehouses (T-shirt sizes), no separate
+	"engine acceleration" toggle -- the engine IS the product, always on.
+
+	PRIMARY STRENGTH PERCEPTION: Databricks historically stronger for heavy ENGINEERING/ML/AI
+	workloads, custom code, streaming, notebooks-first development. Snowflake historically
+	stronger for SQL-first ANALYTICS, ease of administration, BI workloads, governance simplicity
+	-- though by 2026 both have converged HARD toward being full-spectrum platforms (Snowflake
+	added serious ML/AI/streaming/container depth; Databricks added serious SQL/BI/governance
+	depth via Unity Catalog + DBSQL + Genie).
+
+	TABLE FORMAT: Databricks defaults to Delta Lake (UniForm bridges to Iceberg). Snowflake
+	defaults to its own native format (Iceberg-compatible via Horizon Catalog/Polaris for
+	external interop). Both now GA on Iceberg v3 support and both offer Snowflake-managed /
+	Databricks-managed Iceberg storage options.
+
+	GOVERNANCE: Databricks = Unity Catalog (catalog.schema.table, ABAC, lineage, Unity AI Gateway
+	for AI-specific governance). Snowflake = native account-wide RBAC (database.schema.object) +
+	row access/masking policies + Trust Center, with AI Agent Identity as its AI-specific
+	governance answer (2026) -- philosophically parallel to Unity AI Gateway, different implementation.
+
+	AI/AGENT STRATEGY: Databricks = Genie (business agent) + Agent Bricks (auto-optimized agent
+	building) + Mosaic AI Agent Framework (code-first) + Unity AI Gateway (governance) + MLflow 3
+	(evaluation). Snowflake = CoWork (business agent) + CoCo (coding/dev agent) + Cortex Agents
+	(orchestration API) + Cortex Sense (context layer) + AI Agent Identity (governance) -- full
+	detail in the companion AI notepad. Both platforms landed on a near-IDENTICAL two-surface
+	split (one agent for business users, one for developers/coders) within months of each other
+	in 2026 -- a genuinely notable convergence worth naming if asked to compare the two AI
+	strategies directly.
+
+	OLTP ANSWER: Databricks = Lakebase (Neon-based Postgres) + LTAP thesis. Snowflake = Snowflake
+	Postgres (Crunchy-Data-based) + Unistore/Hybrid Tables. Both acquired a Postgres company and
+	both ALSO built a native hybrid-table-style answer, within about a year of each other -- see D8's
+	full gotcha for the precise distinction between each company's two respective offerings.
+
+	COST MODEL: Databricks bills in DBUs (varies by compute type/tier). Snowflake bills in
+	CREDITS (varies by warehouse size/edition). Conceptually equivalent "normalized compute unit"
+	billing philosophy, different unit names.
+
+	INTERVIEW-READY ONE-LINER: "By 2026 the two platforms have converged on nearly the same
+	high-level architecture -- decoupled storage/compute, open table format support, a governed
+	semantic/context layer, a business-user agent and a developer agent, and a Postgres-based OLTP
+	story -- built independently, largely in parallel, which says more about where the INDUSTRY
+	is heading than about either company copying the other."
+======================================================================================================================================================
+L4. Interview quick hits (Snowflake platform side)
+
+	Q: "Queries are queuing under load -- what do you do?"
+	A: scale OUT (multi-cluster warehouse), not scale up. Scaling up doesn't address a concurrency
+	   problem, only a per-query-power problem (Part B2).
+
+	Q: "A query is slow -- walk me through debugging it."
+	A: Query Profile: check pruning ratio first, then bytes spilled, then cartesian
+	   joins/missing conditions, then concurrency/queuing -- warehouse resizing is the LAST lever,
+	   not the first (Part C3).
+
+	Q: "How does Snowflake achieve instant cloning of a 10TB table?"
+	A: zero-copy, metadata-only operation -- new pointers to the same underlying immutable
+	   micro-partitions, copy-on-write divergence only as the clone actually changes (Part D4).
+
+	Q: "Snowflake Postgres vs Unistore -- what's the difference?"
+	A: Snowflake Postgres = real, full, wire-compatible Postgres (Crunchy Data-based) for lifting
+	   existing Postgres apps/AI workloads onto the platform. Unistore/Hybrid Tables = a native
+	   Snowflake table type with enforced PK/FK for OLTP-style state INSIDE the Snowflake object
+	   model itself, no separate database to manage (Part D8).
+
+	Q: "How would you cut a team's Snowflake bill by 30%?"
+	A: fix pruning/clustering first, tune auto-suspend, use multi-cluster instead of oversized
+	   single warehouses, enforce resource monitors, separate warehouses by workload (Part I1).
+======================================================================================================================================================
+*** END OF SNOWFLAKE PLATFORM HANDBOOK ***
+Next up (separate files, per your request): "AI_on_Snowflake_COMPLETE_HANDBOOK_2026.txt" (Cortex
+AI Functions, Cortex Analyst, Cortex Search, Document AI, Snowflake ML, Feature Store, Model
+Registry, CoWork, CoCo, Cortex Sense, Agent Identity) and matching cheat sheets for both files.
+
+Sources: Snowflake product documentation (docs.snowflake.com), Snowflake product blog
+(snowflake.com/blog), and Snowflake Summit 2026 (June 1-4, 2026) coverage and press materials,
+current as of July 2026. Several 2026 features are in Private/Public Preview -- re-verify GA
+status against docs.snowflake.com before relying on it in production or citing it as "current"
+in an interview.
+======================================================================================================================================================
