@@ -1,0 +1,813 @@
+AI ON SNOWFLAKE -- COMPLETE HANDBOOK (BEGINNER TO ADVANCED) -- 2026 EDITION
+Self-contained reference for a senior data engineer working on Snowflake. Companion to
+Snowflake_COMPLETE_HANDBOOK_2026.txt (core platform) and mirrors the structure/depth of your two
+Databricks AI notes. Cross-references to "the Databricks AI notepad" point at
+AI_on_Databricks_COMPLETE_HANDBOOK_2026.txt, since you already know that platform well -- mapping
+concepts across the two is the fastest way to get fluent here. Interview-trap gotchas are folded
+directly into each section (no separate follow-up pass needed, per the lesson learned on the
+Databricks notes). Grounded in Snowflake documentation and Snowflake Summit 2026 (June 1-4,
+San Francisco) announcements.
+======================================================================================================================================================
+======================================================================================================================================================
+PART A -- FOUNDATIONS
+======================================================================================================================================================
+======================================================================================================================================================
+A1. AI/ML/GenAI, quick refresher (condensed -- full beginner explanation lives in the Databricks
+    AI notepad Part A1; repeated here briefly so this file stands alone)
+
+	AI (broadest) > Machine Learning (learns from data) > Deep Learning (neural networks) > GenAI/
+	LLMs (generates new content). This whole handbook is mostly about the GenAI/LLM layer (Cortex
+	AI, Parts B-C, E-F) plus Snowflake's classical-ML tooling (Snowflake ML, Part D) that predates
+	and still underpins a lot of production AI work.
+======================================================================================================================================================
+A2. Why AI on Snowflake -- the platform's actual thesis (know this for "why Snowflake for AI" questions)
+
+	Stated directly by CEO Sridhar Ramaswamy at Summit 2026: "The model is not your unique
+	advantage. It's when you combine models with YOUR DATA that things begin to shine." Models
+	themselves are increasingly commoditized (any vendor can call GPT/Claude/Gemini); the
+	differentiator is GOVERNED ENTERPRISE DATA plus the CONTEXT and IDENTITY that make an agent's
+	answers trustworthy.
+	Practically, this means: AI functions/agents run INSIDE the same security/governance
+	perimeter as your tables (Part B7) -- an agent's data access is governed by the exact same
+	RBAC/masking/row-access policies as a human analyst's, automatically, with zero separate
+	configuration. This is the direct Snowflake analog to the Databricks AI notepad's "why do AI
+	work on a data platform at all" argument (Databricks AI notepad Part A2) -- both companies
+	converged on the identical pitch: keep AI inside the governed platform instead of bolting on
+	a separate stack that has to be kept in sync.
+======================================================================================================================================================
+A3. Cortex AI vs Snowflake ML -- the two broad categories (know this split, it structures this
+    whole handbook and is a common opening interview question: "what AI/ML capabilities does
+    Snowflake have?")
+
+		CORTEX AI  -- Snowflake's managed, GenAI-native layer: LLM functions callable from SQL
+		              (Part B), higher-level managed services (Cortex Analyst/Search/Document AI,
+		              Part C), and the agentic surfaces (Cortex Agents, CoWork, CoCo -- Parts E-F).
+		              You call a function or API; Snowflake manages the model/infrastructure.
+		SNOWFLAKE ML -- the TRADITIONAL ML/MLOps layer (Part D): train your OWN classical ML models
+		              (scikit-learn/XGBoost/PyTorch/etc.) using Snowpark ML, track them in the
+		              Feature Store + Model Registry, deploy for inference. This existed BEFORE
+		              Cortex AI and still underpins production ML work that isn't "call an LLM."
+	Both layers run on GOVERNED data, inside the same RBAC/security perimeter, and increasingly
+	interoperate (e.g. Agentic ML via CoCo, Part D, orchestrates Snowflake ML steps using natural
+	language; Cortex Agents, Part C5, can call a Snowflake ML model as a tool).
+======================================================================================================================================================
+======================================================================================================================================================
+PART B -- CORTEX AI FUNCTIONS (AISQL) -- the SQL-native AI layer
+======================================================================================================================================================
+======================================================================================================================================================
+B1. AI_COMPLETE -- the general-purpose LLM call
+
+	SELECT AI_COMPLETE('claude-4-5-sonnet', 'Summarize this: ' || review_text) FROM reviews;
+	SELECT AI_COMPLETE('gemini-3-pro',
+	  PROMPT('Summarize this issue shown in this screenshot in one sentence: {0}', img_file)
+	) AS summary FROM images;
+	Generates a completion for a text OR image input using a selected LLM -- the Snowflake analog
+	to the Databricks AI notepad's ai_query() (Part B4). 2026 addition: AI_COMPLETE now also
+	accepts AUDIO and VIDEO as inputs, not just text/images -- multimodal in the full sense
+	(sentiment, classification, content insights on any of the four modalities, all as one SQL
+	function call).
+	Model choice: Cortex hosts models from Anthropic (Claude), OpenAI (GPT), Google (Gemini),
+	Meta (Llama), Mistral AI, DeepSeek, xAI (Grok, GA 2026), and Snowflake's own open-source
+	Arctic model -- all deployed WITHIN the Snowflake service perimeter (your data never leaves
+	Snowflake to reach an external model API).
+	STRUCTURED OUTPUT -- AI_COMPLETE supports a response-format/schema parameter to force
+	schema-conformant JSON output, directly analogous to the Databricks AI notepad's "structured
+	outputs" gap-filler (Databricks AI notepad Part I6) -- same problem (need RELIABLE, parseable
+	output for a downstream pipeline column, not "hope the prompt was followed"), same solution
+	shape, different function name.
+	CORTEX GUARD -- AI_COMPLETE supports a guardrails option for content-safety filtering on
+	output, the Snowflake analog to the Databricks AI notepad's built-in guardrails discussion
+	(Databricks AI notepad Part E3).
+======================================================================================================================================================
+B2. AI_CLASSIFY, AI_FILTER, AI_AGG, AI_SENTIMENT -- task-specific functions
+
+	AI_CLASSIFY(text_or_image, ARRAY('billing','technical','shipping'))   -- zero-shot classification
+	AI_FILTER(text_or_image, 'Is this a complaint about a refund?')       -- returns TRUE/FALSE,
+	                                                                          usable directly in a
+	                                                                          WHERE/SELECT/JOIN...ON clause
+	AI_AGG(text_column, 'Summarize the common themes across these reviews')  -- aggregates INSIGHTS
+	                                                                          across MANY rows in one
+	                                                                          call -- NOT subject to
+	                                                                          context-window limits
+	                                                                          (Snowflake chunks/
+	                                                                          combines internally)
+	AI_SENTIMENT(text)                                                    -- sentiment scoring
+	GOTCHA worth knowing precisely: AI_FILTER being usable directly inside a WHERE clause is a
+	genuinely distinctive Snowflake capability -- you can write
+		SELECT * FROM support_tickets WHERE AI_FILTER('Is this urgent?', ticket_text);
+	filtering rows with a plain-language predicate, the same way you'd write a normal WHERE clause
+	-- there's no equally terse Databricks AI notepad equivalent (the closest is combining
+	ai_classify() with a separate WHERE, not a single boolean-returning predicate function).
+======================================================================================================================================================
+B3. AI_EXTRACT, AI_TRANSLATE, AI_TRANSCRIBE
+
+	AI_EXTRACT(text_or_document, ARRAY('vendor_name','invoice_amount','due_date'))
+	  -- pulls structured fields out of unstructured text/documents based on plain-language
+	     extraction instructions -- powered by Snowflake's proprietary ARCTIC-EXTRACT model,
+	     which Snowflake reports outperforms general-purpose LLMs on document-understanding
+	     benchmarks (e.g. DocVQA) because it understands VISUAL LAYOUT and context, not just raw
+	     text -- direct analog to the Databricks AI notepad's ai_parse_document() (Databricks AI
+	     notepad Part I9), just under a different function name and folded into the more general
+	     AI_EXTRACT rather than a separate document-specific function.
+	AI_TRANSLATE(text, 'es')          -- translate text between languages
+	AI_TRANSCRIBE(audio_or_video_file) -- transcribes audio/video FROM A STAGE, extracting text,
+	                                       timestamps, AND speaker information (diarization) --
+	                                       GA'd alongside AI_CLASSIFY in November 2025.
+======================================================================================================================================================
+B4. AI_EMBED and similarity functions
+
+	AI_EMBED(text_or_image)                          -- generates an embedding vector, usable for
+	                                                     similarity search/clustering/classification
+	AI_EMBEDDING_SIMILARITY / AI_SIMILARITY           -- cosine-similarity-style comparison between
+	                                                     two embeddings
+	This is the raw building block Cortex Search (Part C3) is built on top of -- same relationship
+	as the Databricks AI notepad's Vector Search being built on embeddings (Databricks AI notepad
+	Part A8/B5): most of the time you'll reach for the higher-level managed service (Cortex
+	Search) rather than calling AI_EMBED yourself, but knowing the primitive underneath it is
+	exactly what it is matters for interview depth.
+======================================================================================================================================================
+B5. Helper functions
+
+	PROMPT('Summarize this: {0}', text_column)   -- builds a structured prompt OBJECT (rather than
+	                                                 raw string concatenation) for use with
+	                                                 AI_COMPLETE and similar functions -- safer/
+	                                                 cleaner than manually concatenating strings,
+	                                                 especially with multimodal inputs (images/files).
+	TO_FILE(stage_path)                          -- creates a reference to a file in a stage
+	                                                 (internal or external) for use with AI_COMPLETE
+	                                                 and other file-accepting functions.
+	AI_COUNT_TOKENS(text, model)                  -- returns token count for a given input against a
+	                                                 specific model/function's limits, so you can
+	                                                 pre-check/truncate before a call fails or gets
+	                                                 unexpectedly expensive -- ties directly into
+	                                                 cost management (B9).
+======================================================================================================================================================
+B6. FILE data type -- native multimodal column type
+
+	A first-class SQL column type holding references to unstructured files (images, OCR-ready
+	PDFs, audio/video blobs) directly in structured tables, natively usable as input to Cortex AI
+	Functions -- e.g. SELECT AI_CLASSIFY(img_file, 'Scratch,Dent,Perfect') FROM inspection_photos.
+	Direct analog to the Databricks AI notepad's FILE type discussion (Databricks AI notepad Part
+	B1, tied to the Databricks platform notepad's FILE type, Part D27) -- both platforms
+	independently added a native "unstructured data as a governed column type" primitive around
+	the same period, for the same reason: let AI Functions/pipelines treat unstructured data as a
+	normal, queryable, governed column rather than an external path reference.
+======================================================================================================================================================
+B7. Governance inheritance -- arguably Snowflake's single strongest AI differentiator, know it cold
+
+	Cortex AI Functions inherit Snowflake's EXISTING security model automatically: role-based
+	access control, column-level masking policies, row access policies, and network policies ALL
+	apply to Cortex AI Functions with ZERO additional configuration. If a role doesn't have SELECT
+	access to a column, that role CANNOT run an AI function against that column either -- period,
+	no separate AI-specific access-control layer to build/maintain.
+	GOTCHA/interview framing: this is functionally the SAME end goal as the Databricks AI
+	notepad's Unity AI Gateway (Databricks AI notepad Part E3) -- "govern what an agent/function
+	can see the same way you govern what a human can see" -- but the MECHANISM is different and
+	worth stating precisely: Unity AI Gateway is a SEPARATE, purpose-built governance layer SITTING
+	ON TOP of Unity Catalog specifically for AI/agent runtime behavior (spend caps, routing,
+	contextual approval policies). Snowflake's approach is that Cortex Functions DIRECTLY REUSE the
+	exact same RBAC/masking/row-policy engine that governs ordinary SQL queries -- there's no
+	separate "AI governance layer" object model at the Cortex-Functions level; it's the SAME
+	governance, automatically extended. (Snowflake's Agent Identity, Part E3, IS a more Gateway-
+	like separate layer -- but it governs AGENTS specifically, not the plain SQL-callable AI
+	Functions covered in this Part B, which just inherit ordinary table-level RBAC.)
+======================================================================================================================================================
+B8. Privileges
+
+	Calling Cortex AI Functions requires: the account-level USE AI FUNCTIONS privilege, PLUS one
+	of two database roles:
+		SNOWFLAKE.CORTEX_USER        -- access to ALL Cortex AI features (broadest)
+		SNOWFLAKE.AI_FUNCTIONS_USER  -- narrower, AI-Functions-specific access
+	By default, CORTEX_USER is granted to the PUBLIC role (meaning every user gets it
+	automatically) -- if you want to RESTRICT Cortex access to specific roles/teams, you must
+	explicitly REVOKE it from PUBLIC first, then grant it selectively. A genuinely easy-to-miss
+	governance gotcha: Cortex access is ON by default account-wide unless an admin deliberately locks it down.
+======================================================================================================================================================
+B9. Cost model & batch processing guidance
+
+	Cortex AI Functions are billed PER TOKEN (input + output), separate from warehouse compute
+	credits. Monitor via the same account-level usage views as everything else (Snowflake platform
+	notepad Part I2) plus dedicated Cortex/AI cost dashboards.
+	Cortex AI Functions are explicitly OPTIMIZED FOR THROUGHPUT/BATCH use -- Snowflake's own
+	guidance is to use these functions to process NUMEROUS inputs at once (e.g. a whole SQL table
+	of text) rather than one-off single calls, since batch processing is architecturally what
+	they're built for. This is the direct Snowflake analog to the Databricks AI notepad's "batch
+	LLM inference at scale" operational guidance (Databricks AI notepad Part I7) -- same
+	underlying advice (design for volume, not one-off calls), delivered as Snowflake's own
+	explicit product guidance rather than something you have to work out yourself.
+	Practical cost-control tips: monitor token usage via AI_COUNT_TOKENS (B5) before expensive
+	calls on long documents; prefer task-specific functions (AI_CLASSIFY/AI_SENTIMENT/etc.) over
+	the more general AI_COMPLETE where one fits, since task-specific functions are specifically
+	optimized/cost-effective for their narrow job; automate via Tasks (Snowflake platform notepad
+	Part D9) to run AI enrichment on a schedule against only NEW/CHANGED rows (via a Stream)
+	rather than reprocessing a whole table repeatedly.
+======================================================================================================================================================
+======================================================================================================================================================
+PART C -- CORTEX ANALYST, SEARCH, DOCUMENT AI & AGENTS -- the managed higher-level services
+======================================================================================================================================================
+======================================================================================================================================================
+C1. Cortex Analyst -- text-to-SQL, the Snowflake analog to the Databricks AI notepad's Genie
+    NL-to-SQL roots (Databricks AI notepad Part F1)
+
+	A fully-managed, agentic service that converts a business user's natural-language question
+	into accurate SQL and returns results -- built specifically to avoid the "generic AI solution
+	struggling with text-to-SQL because it only has a raw schema, no business context" problem.
+	The key mechanism: a SEMANTIC MODEL (C2) -- NOT just the raw database schema -- bridges the
+	gap between business language and the actual tables/columns.
+	GOVERNANCE/PRIVACY commitments worth stating precisely in an interview: Cortex Analyst does
+	NOT train on customer data; at inference time it uses ONLY the semantic model's metadata
+	(table/column names, types, descriptions) to generate the SQL query, which is then EXECUTED in
+	YOUR OWN virtual warehouse -- the LLM never sees your actual row-level data, only the metadata
+	describing its shape.
+	If configured across MANY data sources/semantic models, Cortex Analyst can automatically
+	figure out WHICH one a given question should route to -- you don't have to specify the right
+	source per query.
+	Privileges: SNOWFLAKE.CORTEX_USER (broad) or SNOWFLAKE.CORTEX_ANALYST_USER (narrower, Analyst-only).
+	Realistic framing (worth having ready, straight from practitioner guidance): treat Cortex
+	Analyst as handling ~70% of routine, well-modeled questions well; complex ad hoc analysis still
+	benefits from a skilled analyst writing SQL by hand -- and result quality depends ENTIRELY on
+	how well-built the underlying semantic model (C2) and data foundation are, not on the tool
+	being "magic."
+======================================================================================================================================================
+C2. Semantic Models -- the YAML layer that makes Cortex Analyst actually work (a senior-DE-owned artifact)
+
+	A lightweight YAML file describing tables/columns similarly to a database schema, but enriched
+	with the business meaning a raw schema lacks: business term SYNONYMS, METRIC definitions
+	(pre-built formulas, not just raw columns), RELATIONSHIPS between tables, and descriptions.
+	WHY A DATA ENGINEER OWNS THIS: this is the direct Snowflake analog to the Databricks AI
+	notepad's Genie Ontology / Unity Catalog Metrics + Business Glossary combination (Databricks
+	AI notepad Part F2, Databricks platform notepad Part E9-E10) -- a governed, explicit
+	definition of what "revenue" or "active customer" MEANS at your company, so an AI agent
+	doesn't have to guess or hallucinate business logic. Building and maintaining a good semantic
+	model is squarely data-engineering work, the same way maintaining Unity Catalog Metrics
+	definitions is on the Databricks side.
+	2026 additions: SEMANTIC STUDIO (build shared business logic/semantic views without needing
+	SQL expertise -- a lower-code authoring surface over the same underlying YAML) and SEMANTIC
+	VIEW AUTOPILOT (automatically refines/improves semantic views over time based on usage
+	patterns -- a Snowflake-specific twist on "keep the context layer accurate without 100%
+	manual upkeep," conceptually adjacent to how Genie Ontology self-improves on the Databricks
+	side, Databricks AI notepad Part F2).
+	OSI (Open Semantic Interchange) -- a 2026-announced OPEN STANDARD (54 vendors backing it) for
+	semantic-layer interoperability -- the industry-wide signal that semantic/context layers need
+	to be portable across tools, not locked into one vendor's proprietary format.
+======================================================================================================================================================
+C3. Cortex Search -- hybrid retrieval, the RAG building block
+
+	A managed search service indexing your Snowflake data for BOTH semantic (vector/embedding)
+	similarity AND traditional keyword (BM25-style lexical) matching in ONE hybrid query -- direct
+	analog to the Databricks AI notepad's Vector Search (Databricks AI notepad Part B5), with one
+	notable difference worth flagging: Cortex Search is hybrid (vector + keyword) BY DEFAULT/
+	built-in, whereas the Databricks AI notepad describes hybrid search as an additional
+	capability layered onto Vector Search (Databricks AI notepad Part I5) rather than the
+	out-of-the-box default behavior.
+	Auto-indexed/synced against the underlying Snowflake table -- same "no manual ETL to keep
+	embeddings fresh" value proposition as Databricks' Delta-Sync vector index.
+	Standard RAG pattern on Snowflake: Cortex Search retrieves relevant chunks -> AI_COMPLETE (B1)
+	generates a grounded answer using those chunks -> all governed by the same RBAC the source
+	table already has (B7).
+======================================================================================================================================================
+C4. Document AI
+
+	A managed service specifically for extracting structured data from DOCUMENTS (invoices,
+	contracts, forms, reports) -- built on the same Arctic-Extract model underneath AI_EXTRACT
+	(B3), but packaged as a purpose-built, higher-level workflow: define the fields you want
+	extracted, point it at a document type, and it handles layout-aware extraction across many
+	similar documents, with confidence scoring so low-confidence extractions can be routed to a
+	human reviewer (a common production pattern: trigger an alert/notification for low-confidence
+	extractions rather than silently trusting every automated result).
+	Practical pipeline shape (a real senior-DE-relevant pattern worth knowing end-to-end): event-
+	driven document landing (e.g. new file in an external stage) -> Document AI / AI_EXTRACT
+	parses/classifies/extracts structured fields -> results land in a normal governed table ->
+	Cortex Search indexes the documents for RAG/chat -> Streamlit (platform notepad Part F6)
+	or a BI tool surfaces it. Runs as SERVERLESS Tasks (platform notepad Part D9) that auto-scale
+	to handle variable document volume, with cost tracked per credit in the standard usage views
+	(platform notepad Part I2).
+======================================================================================================================================================
+C5. Cortex Agents -- the orchestration layer underneath CoWork/CoCo
+
+	An API that ORCHESTRATES Cortex Analyst (C1) + Cortex Search (C3) + custom tools into ONE
+	agentic interface -- given a user's question, a Cortex Agent decides whether it needs
+	structured data (route to Analyst), unstructured search (route to Search), or both, executes
+	the necessary steps, and synthesizes a final answer. This is the BUILDING BLOCK that Snowflake's
+	own flagship agent products (CoWork and CoCo, Part F) are built on top of -- direct analog to
+	how the Databricks AI notepad's Mosaic AI Agent Framework (Databricks AI notepad Part D3)
+	underlies Genie/Agent Bricks. If you need a CUSTOM agent (not CoWork/CoCo's own UI), Cortex
+	Agents is the code-first API layer you'd build against directly.
+======================================================================================================================================================
+======================================================================================================================================================
+PART D -- SNOWFLAKE ML (traditional ML / MLOps) -- predates Cortex AI, still core production tooling
+======================================================================================================================================================
+======================================================================================================================================================
+D1. Snowpark ML -- the Python library underneath everything in this Part
+
+	The snowflake-ml-python package. Two main pieces:
+		- MODELING API (snowflake.ml.modeling) -- scalable wrappers around familiar frameworks
+		  (scikit-learn, XGBoost, LightGBM) for data preprocessing/feature engineering/model
+		  training, executed using Snowflake's OWN compute (Snowpark-optimized warehouses, D7) --
+		  same "push compute to the data, no data movement" philosophy as Snowpark DataFrames
+		  (platform notepad Part F3).
+		- FRAMEWORK CONNECTORS -- optimized, secure data provisioning for PyTorch/TensorFlow in
+		  their NATIVE data-loader formats, for deep-learning workloads that need a framework
+		  Snowpark ML's own Modeling API doesn't wrap directly.
+	Median reported gains (Snowflake's own benchmarking): ~3.5x faster performance and ~34% lower
+	cost for AI/ML and data engineering workloads vs. moving data out to a separate ML environment
+	-- the same "process where the data lives" argument the Databricks AI notepad makes for
+	Feature Store pipelines (Databricks AI notepad Part I2).
+======================================================================================================================================================
+D2. Feature Store -- Entities, Feature Views, point-in-time correctness
+
+	Requires Enterprise Edition+ (Snowflake platform notepad Part A5).
+	ENTITY -- the "thing" features are about (e.g. customer, product) -- defines the join key.
+	FEATURE VIEW -- a versioned, managed definition of one or more features tied to an Entity,
+	backed by a Snowpark DataFrame transformation -- Snowflake continuously/automatically refreshes
+	it (batch OR streaming) so the feature stays current.
+	POINT-IN-TIME CORRECT training set generation -- the exact same problem/solution shape as the
+	Databricks AI notepad's FeatureLookup mechanism (Databricks AI notepad Part I2): you generate
+	a training dataset by joining labels against Feature Views AS OF each label's own timestamp,
+	avoiding training-serving skew / label leakage, without hand-writing the correlated-timestamp
+	join yourself.
+	ONLINE SERVING (2026: GA, sub-2-second freshness, ~10ms serving latency) -- the real-time
+	inference-time counterpart, direct analog to the Databricks AI notepad's Feature Serving
+	(Databricks AI notepad Part I3) -- both platforms converged on "offline Feature Store for
+	training + a separate low-latency online store for real-time lookups" as the standard shape.
+	CLUSTER_BY support on Feature Views (a 2026 addition) lets you apply the same clustering-key
+	performance thinking (platform notepad Part C1) to feature data specifically.
+======================================================================================================================================================
+D3. Model Registry -- versioned model management, works for models trained ANYWHERE
+
+	from snowflake.ml.registry import Registry
+	reg = Registry(session=session)
+	mv = reg.log_model(my_sklearn_model, model_name="churn_model", version_name="v1",
+	                    metrics={"accuracy": 0.91})
+	Logs and manages ML models regardless of whether they were trained INSIDE Snowflake (Snowpark
+	ML) or externally (any model you bring in) -- direct analog to the Databricks AI notepad's
+	MLflow Model Registry (Databricks AI notepad Part A4/I4).
+	VERSIONING + ALIASES -- each logged model gets versions; you can assign an ALIAS (a mutable,
+	custom-named pointer, e.g. "default"/"champion") to a specific version:
+		ALTER MODEL churn_model SET DEFAULT_VERSION = 'v1';         -- SQL
+		# or via Python: mv.model.default = "v1"
+	GOTCHA/direct comparison worth stating precisely: this is the SAME "aliases, not fixed stages"
+	pattern the Databricks AI notepad specifically flags as a common outdated-tutorial trap
+	(Databricks AI notepad Part I4, correcting the old Staging/Production/Archived vocabulary) --
+	Snowflake's Model Registry was ALWAYS alias/version-based, never went through an equivalent
+	"fixed stage enum" legacy phase the way MLflow's original Model Registry did. Worth knowing
+	this history if asked to compare the two registries' design.
+	INFERENCE -- call a registered model's method directly in SQL or Python:
+		SELECT churn_model!predict(*) FROM customer_features;                    -- SQL
+		remote_prediction = mv.run(test_features, function_name="predict")       -- Python, lazy-evaluated
+	Runs INSIDE the warehouse specified by your session (for CPU-scale batch/warehouse inference)
+	or can be deployed to SPCS (platform notepad Part F4) for real-time, potentially GPU-backed
+	serving via a REST endpoint.
+	SHARING -- models can be shared/replicated with granular privileges: USAGE (run inference via
+	warehouse, no visibility into internals) vs READ (also usable for SPCS inference, can see metadata).
+======================================================================================================================================================
+D4. ML Observability, Explainability, and Lineage
+
+	ML OBSERVABILITY -- monitor a deployed model's PERFORMANCE and DRIFT metrics in production,
+	set alerts on performance thresholds -- direct analog to the Databricks AI notepad's
+	production-monitoring discussion (Databricks AI notepad Part E5), applied to classical ML
+	models specifically here rather than GenAI/agent traces.
+	ML EXPLAINABILITY -- computes SHAPLEY VALUES for any model in the Model Registry, regardless
+	of where it was originally trained -- the "why did the model predict this" answer for
+	classical ML, distinct from the Databricks AI notepad's explicit note that explainability is
+	structurally HARDER for LLMs than classical models (Databricks AI notepad Part I18) -- Shapley
+	values are a classical-ML-specific tool that doesn't have a clean GenAI equivalent on either platform.
+	ML LINEAGE -- traces end-to-end lineage from SOURCE DATA -> FEATURES -> DATASETS -> MODELS,
+	enabling reproducibility/compliance/debugging across the full ML lifecycle -- direct analog to
+	Unity Catalog's automatic lineage extended to ML artifacts (Databricks platform notepad Part E5).
+======================================================================================================================================================
+D5. Datasets -- versioned, immutable training snapshots
+
+	Create a versioned, IMMUTABLE snapshot of a training dataset (e.g. as Parquet files) so a
+	model's training run can always be exactly REPRODUCED later, even if the underlying source
+	tables have since changed -- the Snowflake-native version of "pin your training data" hygiene,
+	complementary to (but distinct from) Time Travel (platform notepad Part D2), which is
+	about the SOURCE table's history, not a purpose-built, named, ML-specific training artifact.
+======================================================================================================================================================
+D6. ML Functions (pre-built, SQL-callable -- predate Cortex AI, still heavily used for classic tasks)
+
+	SQL-callable functions for COMMON predictive tasks WITHOUT writing/training a custom model
+	yourself:
+		FORECASTING          -- time-series forecasting (e.g. predict next 30 days of sales)
+		ANOMALY DETECTION    -- flag outliers/unusual patterns in a metric over time
+		CLASSIFICATION       -- general-purpose classification against a labeled training set
+		CONTRIBUTION EXPLORER -- explains WHICH dimensions/segments are driving a change in a
+		                          metric (e.g. "why did revenue drop last week" broken down by
+		                          region/product/channel)
+	These are genuinely "no-code ML" -- callable directly as SQL functions against a table, no
+	Snowpark/Python ML pipeline required. A real, practical differentiator worth knowing: for the
+	common, well-understood task shapes (forecast a metric, detect anomalies, explain a
+	contribution), you often don't need Snowpark ML/Feature Store/Model Registry at all -- just an
+	ML Function call. Reach for the fuller Snowpark ML stack (D1-D5) when the task is more custom
+	or needs a bespoke model architecture.
+======================================================================================================================================================
+D7. Training & inference compute options
+
+	Standard virtual warehouses (platform notepad Part B) -- fine for lighter feature engineering/
+	CPU-bound training.
+	Snowpark-optimized warehouses -- HIGH-MEMORY warehouse variant specifically for memory-
+	intensive ML training/preprocessing (large in-memory joins, big feature matrices) that would
+	spill/struggle on a standard warehouse.
+	Container Runtime on Snowpark Container Services (SPCS, platform notepad Part F4) -- for GPU-
+	backed training (deep learning, large models) or real-time low-latency inference endpoints --
+	the Snowflake analog to the Databricks AI notepad's serverless GPU compute (Databricks AI
+	notepad Part C4) for fine-tuning/deep learning workloads.
+======================================================================================================================================================
+D8. Cortex Training (2026) -- managed fine-tuning of open models
+
+	Fine-tune OPEN models (e.g. Qwen, Mistral) on Snowflake-MANAGED GPUs, directly inside the
+	platform -- you don't provision/manage GPU infrastructure yourself. Direct analog to the
+	Databricks AI notepad's fine-tuning discussion + serverless GPUs (Databricks AI notepad Part
+	C4) -- same "request the fine-tuning job, the platform handles the GPU compute" pitch.
+	GOTCHA -- distinct from an OLDER, narrower capability: SNOWFLAKE.CORTEX.FINETUNE (a SQL
+	function for LoRA-style fine-tuning of a SMALLER, pre-selected set of base models) predates
+	Cortex Training and is a lighter-weight, more constrained tool. Cortex Training (2026) is the
+	FULL, managed-GPU, broader-model-selection successor aimed at more serious custom-model work
+	-- if asked about "fine-tuning on Snowflake," know both exist and that Cortex Training is the
+	newer, more capable 2026 answer.
+======================================================================================================================================================
+======================================================================================================================================================
+PART E -- BUILDING AGENTS ON SNOWFLAKE
+======================================================================================================================================================
+======================================================================================================================================================
+E1. Cortex Agents API -- recap/cross-reference
+
+	See C5 -- the code-first orchestration layer (Analyst + Search + custom tools) underneath
+	Snowflake's own flagship agent products. Build directly against this API when you need a
+	CUSTOM agent experience rather than using CoWork/CoCo's built-in UI.
+======================================================================================================================================================
+E2. MCP on Snowflake -- the Natoma acquisition (2026, pending)
+
+	MCP (Model Context Protocol) is the SAME open, industry-wide standard covered in the
+	Databricks AI notepad (Databricks AI notepad Part D2) -- NOT Snowflake- or Databricks-specific,
+	originally introduced by Anthropic, now broadly adopted for how agents connect to external
+	tools/systems.
+	Snowflake's 2026 move: announced intent to ACQUIRE Natoma, an enterprise MCP GATEWAY platform
+	-- provides a CENTRALIZED gateway and a VERIFIED LIBRARY of MCP servers so agents (Cortex
+	Agents, CoWork, CoCo) connect securely to enterprise apps/databases/APIs/collaboration tools,
+	with governance extended from DATA assets to AI-DRIVEN ACTIONS/workflows specifically.
+	GOTCHA/direct comparison: this is Snowflake's version of the exact same "govern which MCP
+	tools an agent can discover/use, centrally" problem Agent Bricks' MCP tool-discovery catalog
+	addresses on the Databricks side (Databricks AI notepad Part D4) -- both platforms landed on
+	"acquire or build a centralized MCP governance/discovery layer" within the same year, another
+	genuine convergence point worth naming if asked to compare AI governance strategies.
+======================================================================================================================================================
+E3. AI Agent Identity (GA, 2026) -- the closest Snowflake analog to Unity AI Gateway
+
+	Every AI agent gets a VERIFIED, CRYPTOGRAPHIC identity -- distinct from a human user's
+	identity or a generic service account -- enabling PER-AGENT RBAC (an agent's permissions are
+	scoped/granted the same precise way a human's or service principal's are, platform notepad
+	Part G1) and a COMPLETE, agent-specific AUDIT TRAIL of everything that agent did.
+	GOTCHA/direct comparison (an important one to have precisely right): Agent Identity is
+	philosophically the closest Snowflake concept to the Databricks AI notepad's Unity AI Gateway
+	(Databricks AI notepad Part E3) -- BOTH exist because "govern what an agent is allowed to DO,
+	not just what it can see" is a genuinely new kind of policy question once agents take actions
+	(Databricks AI notepad Part A10). But the emphasis differs: Unity AI Gateway leans heavily
+	into RUNTIME behavior governance (spend caps, cost/quality ROUTING across model providers,
+	contextual allow/deny/require-approval policies). Agent Identity (as described) leans more
+	into IDENTITY/AUDIT as the foundation (WHO/WHAT this agent cryptographically IS, and a
+	complete record of its actions) -- treat these as solving the SAME underlying problem
+	(governed, accountable AI agents) with a different primary emphasis, not identical features
+	under different names.
+	Interview-ready guidance directly from practitioner analysis (worth citing): "stand up Agent
+	Identity BEFORE you scale any agent -- identity and audit are the PRECONDITION for agentic
+	work in a regulated environment, not an afterthought." It's GA now, described as having no
+	real reason to wait/delay adoption.
+======================================================================================================================================================
+E4. AI Security -- five layers (2026, "not one feature, a full stack")
+
+		AI GUARDRAILS (GA)              -- content-safety filtering, tied to AI_COMPLETE's
+		                                    guardrails option (B1) and Cortex Guard.
+		AGENT IDENTITY (public preview -> GA per most 2026 sources) -- E3.
+		DATA EXFILTRATION PROTECTION     -- prevents an agent from being tricked/misused into
+		                                    leaking sensitive data OUT of the governed perimeter.
+		RANSOMWARE PROTECTION            -- includes MULTI-PARTY APPROVAL requirements for
+		                                    high-risk destructive actions (an agent alone can't
+		                                    unilaterally trigger certain catastrophic operations
+		                                    without a second human/agent sign-off) -- a genuinely
+		                                    distinctive, security-forward feature worth naming.
+		AI SECURITY POSTURE MANAGEMENT   -- surfaced inside Trust Center (platform notepad Part
+		                                    G9); includes ML-based PROMPT-INJECTION vulnerability
+		                                    detection specifically.
+	Direct analog to the Databricks AI notepad's Unity AI Gateway guardrails discussion
+	(Databricks AI notepad Part E3: "PII exposure detection, prompt-injection detection, content
+	filtering") -- Snowflake presents this as a more explicitly-named FIVE-LAYER stack rather than
+	a single bundled Gateway feature list; the underlying concerns (content safety, identity,
+	exfiltration, destructive-action approval, posture visibility) are the same universe of
+	problems either platform is solving for.
+======================================================================================================================================================
+E5. Skill Catalog
+
+	A shared, browsable/publishable catalog of reusable AGENT SKILLS across CoWork and CoCo (Part
+	F) -- build a skill once (e.g. "generate a standard weekly sales variance report"), publish
+	it, and anyone else in the organization can find and reuse it instead of rebuilding equivalent
+	logic from scratch. Direct analog to the Databricks AI notepad's Agent Bricks MCP tool-
+	discovery catalog concept (Databricks AI notepad Part D4) and to Genie's reusable Genie Agents
+	(Databricks AI notepad Part F3) -- all three are "don't make every team reinvent the same
+	agent capability" answers, just scoped slightly differently (skills vs. MCP tools vs.
+	scheduled agent workflows).
+======================================================================================================================================================
+======================================================================================================================================================
+PART F -- CoWork & CoCo -- THE 2026 flagship agent surfaces (know these cold, heavily tested)
+======================================================================================================================================================
+======================================================================================================================================================
+F1. CoWork (formerly "Snowflake Intelligence") -- the business-user personal agent
+
+	Full rebrand + major capability expansion of what was previously called Snowflake
+	Intelligence, announced at Summit 2026, now GA. The direct analog to the Databricks AI
+	notepad's Genie One (Databricks AI notepad Part F1) -- both are "an agentic coworker for
+	business teams who won't write SQL" surfaces, rebranded/relaunched from a narrower predecessor
+	product within months of each other in 2026.
+	CoWork goes well beyond a chatbot -- it UNDERSTANDS business context, retrieves information
+	from MULTIPLE systems, performs analysis, and can TAKE ACTIONS on a user's behalf (not just
+	answer questions).
+	Key 2026 capabilities (all GA):
+		DEEP RESEARCH        -- multi-step investigations across BOTH structured Snowflake data
+		                        AND unstructured content (documents, emails, knowledge bases),
+		                        within the org's existing governance layer.
+		USER SKILLS + SKILL CATALOG (E5) -- turn daily tasks into reusable workflows, share across teams.
+		USER MEMORY           -- learns from an individual's behavior over time to personalize
+		                        planning/recommendations to that person's role -- direct analog to
+		                        the Databricks AI notepad's Agent Bricks "agent memory" feature
+		                        (Databricks AI notepad Part D4), applied to a business-user agent
+		                        specifically rather than a developer-built custom agent.
+		ARTIFACTS             -- shareable outputs (reports, analyses, dashboards) generated
+		                        through AI interactions -- includes PUBLISHABLE DASHBOARDS built
+		                        on live data (often authored via CoCo, then made available in
+		                        CoWork for business consumption).
+		PRE-BUILT PLUGINS      -- role-specific starting points (e.g. finance, sales) to get agents
+		                        into production faster.
+		MCP CONNECTORS         -- links to external tools (Google Drive, Salesforce, Slack) --
+		                        governed via the Natoma-powered MCP gateway (E2) once that
+		                        acquisition closes.
+	Distribution -- like CoCo (F2), CoWork is deliberately "everywhere you work": iOS app, Slack
+	integration, Microsoft Excel extension -- the same "go where the users already are" strategy
+	Databricks' Genie also pursues (Databricks AI notepad Part F1: web/iOS/Android).
+	Early production adopters cited at Summit 2026: Synopsys, WHOOP, Under Armour.
+======================================================================================================================================================
+F2. CoCo (formerly "Cortex Code" / "Snowflake Cortex Code") -- the developer/coding agent
+
+	Snowflake's AI coding agent -- generates, explains, and deploys code against Snowflake data,
+	tables, and applications. Was already Snowflake's FASTEST-GROWING product in company history
+	before the rename (7,100+ users pre-rebrand). The direct analog to the Databricks AI notepad's
+	Genie Code (Databricks AI notepad Part F3) -- both are AI pair-programmers specifically
+	understanding their OWN platform's idioms (Lakeflow/Unity Catalog/Spark for Genie Code;
+	Snowflake SQL/Snowpark/ML for CoCo) rather than being a generic coding assistant.
+	HOW COCO WORKS -- a four-step PLANNING LOOP (interpret intent -> plan -> execute -> verify/
+	iterate), distinguishing it from simple autocomplete-style assistants where a human executes
+	every suggestion. Routes task execution automatically across Snowflake's internal tool stack:
+	Cortex Analyst (structured, schema-grounded SQL generation), Cortex Search (semantic search
+	across Snowflake objects), Horizon Context/semantic views (business metric definitions), and
+	catalog/lineage metadata (table ownership, column origin, freshness signals).
+	2026 SUMMIT ADDITIONS (major capability expansion under the rebrand):
+		CLOUD AGENTS (new) -- every Snowsight session can spin up an ISOLATED, Snowflake-managed
+		                        SANDBOX running shell commands, Python, package installs, dbt
+		                        builds/tests, and web browsing/searching -- full CLI power inside
+		                        Snowsight with ZERO local setup. Long-running jobs complete in the
+		                        cloud and report back when finished.
+		AUTOMATIONS         -- recurring, AUTONOMOUS, scheduled workflows via async APIs (e.g.
+		                        real-time anomaly alerts triggering an investigation workflow the
+		                        MOMENT a quality rule fires; automated incident investigation
+		                        running a root-cause analysis and returning a structured report
+		                        when a pipeline fails). GOVERNANCE NOTE worth knowing precisely:
+		                        Automations run AS THE DEFINING USER'S IDENTITY -- they CANNOT
+		                        escalate privileges beyond what that user was authorized for at
+		                        creation time. This is a real, specific answer to "how do you
+		                        prevent an autonomous agent workflow from silently gaining more
+		                        access than intended" -- worth having exactly right.
+		AGENT TEAMS          -- shifts CoCo from SEQUENTIAL planning to CONCURRENT orchestration:
+		                        a lead agent assigns sub-agents to PARALLEL roles (research,
+		                        coding, testing), results synthesized before returning -- direct
+		                        analog to the Databricks AI notepad's Supervisor multi-agent
+		                        pattern (Databricks AI notepad Part D5), meaningfully reducing
+		                        total execution time on complex data-engineering tasks.
+		CLOUD AGENT API       -- a single REST endpoint letting CI/CD, Slack, cron, or internal
+		                        apps trigger CoCo WITHOUT anyone sitting in a terminal.
+		SKILL CATALOG (E5)    -- shared, publishable skills/plugins.
+	Everywhere CoCo shows up: CoCo Desktop (native app, GA), CLI, VS Code extension, Microsoft
+	Excel plugin, a Claude Code plugin, with mobile and a Slackbot on the way. Early production
+	adopters: Fanatics, Thomson Reuters, WHOOP.
+	Cortex Code powers "Agentic ML" specifically for Snowflake ML workflows (Part D) -- autonomously
+	plans/executes/iterates on data exploration, feature engineering, model training/evaluation,
+	debugging, and deployment prep from a single natural-language prompt, with an ML-specific
+	SKILL that auto-activates (or can be explicitly invoked via /machine-learning) and further
+	routes between specialized SUBSKILLS (data exploration, feature engineering, dataset
+	versioning, Feature Store setup, model training/comparison, deployment) -- switching subskills
+	automatically as the conversation's goal shifts (e.g. "train a model" -> "deploy it" seamlessly
+	hands off between subskills while preserving context).
+	GOTCHA: Snowflake's OWN documentation is inconsistent on the rename as of mid-2026 -- some
+	official pages still say "Cortex Code" rather than "CoCo." If you see "Cortex Code" anywhere
+	(docs, older blog posts, this handbook's ML section), it's the SAME product as CoCo -- the
+	rename didn't change the underlying architecture, only the brand and the surrounding
+	ecosystem/capabilities.
+======================================================================================================================================================
+F3. Cortex Sense (private preview, entering broader availability) -- the runtime context layer
+    underneath BOTH CoWork and CoCo -- arguably THE single most important 2026 AI concept to know deeply
+
+	THE PROBLEM IT SOLVES: an AI agent can know your database SCHEMA but not the BUSINESS MEANING
+	behind it -- e.g. a query for "Q3 revenue" fails or answers wrong if the agent doesn't know
+	your company's fiscal calendar starts in February, or what your specific "revenue" metric
+	formula actually is. Internal Snowflake benchmarking (cross-validated independently by
+	Anthropic) found agents WITHOUT any context layer scored only ~21-25% accuracy on hard,
+	cross-table, metric-formula-dependent business questions.
+	WHAT IT DOES: automatically builds a SHARED CONTEXT SUBSTRATE from signals your business
+	ALREADY produces -- query history (what your analysts have actually run before), metadata
+	from your transformation tools, metrics already defined in your BI tools, and Horizon Context
+	semantic views (C2) -- WITHOUT you having to hand-author a second system of record. Where a
+	governed semantic view EXISTS, Cortex Sense treats it as the AUTHORITATIVE signal (semantic
+	views remain the gold standard for governed, consistent answers); across the REST of your data
+	estate (e.g. a table for a feature launched two weeks ago with no semantic view built yet
+	yet), Cortex Sense builds understanding on its own automatically.
+	SELF-CORRECTING LOOP: continuously identifies gaps/conflicts in its own knowledge, improving
+	via three feedback sources -- your own gold-standard benchmarks, user feedback, and its own
+	suggestions for thin-coverage areas.
+	MEASURED IMPACT: raises agent accuracy from the ~21-25% ungrounded baseline to 83-86% on hard
+	benchmark questions (numbers vary slightly by source/methodology, consistently in this range)
+	-- and REDUCES COST at the same time (Snowflake-reported: ~$1.76 -> ~$0.59 per query vs. a
+	frontier agent manually inspecting tables), because a grounded agent stops wastefully running
+	DESCRIBE TABLE against dozens of objects trying to reverse-engineer what they mean. Upfront
+	INDEXING has a one-time cost that Snowflake says typically pays for itself via lower per-query
+	cost over time.
+	GOTCHA/direct comparison worth having exactly right: this is THE technical answer behind the
+	SAME "AI doesn't have an intelligence problem, it has a context problem" framing the Databricks
+	AI notepad attributes to Genie Ontology (Databricks AI notepad Part F2) -- both Snowflake and
+	Databricks independently built a "continuously-learned, automatically-assembled business
+	context layer feeding an agent" capability and used NEAR-IDENTICAL keynote language to
+	describe the underlying problem, in the SAME 2026 conference season. A genuinely striking
+	convergence, worth naming explicitly if asked to compare the two platforms' AI strategies --
+	this is probably the single best "these platforms are converging" talking point in either handbook.
+	RELATIONSHIP TO HORIZON CONTEXT (F4) -- know this distinction precisely, it's a common
+	follow-up question: Horizon Context is the GOVERNANCE/METADATA substrate (manages semantic
+	views, metadata connectors, business glossary -- the durable, curated layer). Cortex Sense is
+	the RUNTIME ENRICHMENT layer that ACTIVATES those signals FOR AGENTS AT QUERY TIME (plus
+	everything it learns automatically beyond what's been formally curated). Cortex Sense is NOT a
+	standalone product -- CoWork/CoCo are the user-facing INTERFACE; Cortex Sense is the context
+	ENGINE running underneath both.
+======================================================================================================================================================
+F4. Horizon Context / Horizon Catalog / Semantic Studio / OSI -- the governance/metadata substrate
+
+	HORIZON CATALOG -- Snowflake's broader governance/catalog product (powered by Apache Polaris
+	for Iceberg interoperability -- platform notepad Part D6) -- the umbrella under which Horizon
+	Context, Trust Center, and related governance capabilities live.
+	HORIZON CONTEXT -- specifically the context/metadata layer ensuring ONE version of the truth
+	across systems -- manages semantic views (C2), metadata CONNECTORS (pulling in context from
+	external BI/transformation tools), and the business glossary layer. This is the DURABLE,
+	CURATED substrate Cortex Sense (F3) draws from and activates at runtime.
+	SEMANTIC STUDIO -- authoring UI for defining shared business logic/semantic views WITHOUT
+	needing SQL expertise (C2).
+	OSI (Open Semantic Interchange) -- the 2026-announced OPEN STANDARD for semantic-layer
+	portability across vendors (54 backing vendors at announcement) -- Snowflake explicitly
+	positioning its context layer as interoperable rather than a closed proprietary format,
+	mirroring the broader 2026 industry theme (also visible in Iceberg v3/Horizon Catalog
+	bi-directional access, platform notepad Part D6) of "own the trust/context/governance
+	relationship, not the proprietary format."
+======================================================================================================================================================
+======================================================================================================================================================
+PART G -- GOVERNANCE FOR AI, SUMMARIZED (cross-references gathered in one place)
+======================================================================================================================================================
+======================================================================================================================================================
+G1. The governance stack, top to bottom (a good structure to recite if asked "how is AI governed on Snowflake")
+
+		Cortex AI Functions (Part B)   -- inherit ordinary table-level RBAC/masking/row-access
+		                                   policies automatically (B7) -- no separate config.
+		Cortex Analyst/Search (Part C) -- governed by the SAME RBAC on underlying tables; the LLM
+		                                   only ever sees semantic-model METADATA, never raw
+		                                   customer data, for query generation (C1).
+		Agents (CoWork/CoCo/Cortex Agents, Parts E-F) -- governed by AI Agent Identity (E3,
+		                                   cryptographic per-agent identity + audit) + the 5-layer
+		                                   AI Security stack (E4) + MCP governance via Natoma (E2).
+		Models (Snowflake ML, Part D)  -- governed via Model Registry privileges (USAGE/READ, D3)
+		                                   + ML Observability/Lineage (D4).
+	The throughline: Snowflake's philosophy is REUSE existing platform governance wherever
+	possible (Cortex Functions inheriting RBAC directly, B7) and add PURPOSE-BUILT new governance
+	only where genuinely new risk surfaces exist (agents taking autonomous actions -- Agent
+	Identity + the 5-layer AI Security stack).
+======================================================================================================================================================
+G2. Model lifecycle & Behavior Change Releases (BCRs) -- an operational-maturity topic worth knowing
+
+	Models powering Cortex features follow a defined LIFECYCLE: PREVIEW (for evaluation, may
+	change frequently, not yet stable) -> GA (stable, suitable for production).
+	Snowflake continuously updates the underlying models. A change counts as a BEHAVIOR CHANGE if
+	it could affect required syntax (e.g. how you specify a model/version) or otherwise impact how
+	you interact with a feature. These are communicated via formal BEHAVIOR CHANGE RELEASES (BCRs)
+	specifically so customers can review/prepare BEFORE a change lands in their account, rather
+	than discovering a breaking change in production. Worth knowing this exists as a genuine
+	operational-maturity/production-readiness talking point -- "how do you keep a Cortex-dependent
+	pipeline stable as Snowflake updates its underlying models" has a real, named answer (subscribe
+	to and review BCRs), not just "hope nothing changes."
+======================================================================================================================================================
+G3. Data privacy commitments (know this precisely, it's a real trust/compliance talking point)
+
+	Snowflake's stated commitment: Cortex AI features do NOT train on Customer Data -- your data
+	is never used to train or fine-tune any model made available across Snowflake's broader
+	customer base. All models run WITHIN Snowflake's security/governance perimeter (B1) -- data
+	doesn't leave Snowflake to reach an external model provider's own infrastructure for standard
+	Cortex usage. Direct analog to the Databricks AI notepad's data-privacy framing for Foundation
+	Model APIs (Databricks AI notepad Part C1-C2) -- both platforms make essentially the same
+	"your data doesn't train the shared model, and stays inside our perimeter" commitment.
+======================================================================================================================================================
+G4. Cost governance for AI specifically
+
+	Token-based billing (B9) is TRACKED separately from warehouse credits but visible through the
+	SAME account-level usage views (platform notepad Part I2) plus Cortex-specific cost
+	dashboards. Resource Monitors (platform notepad Part B5) and Trust Center's posture monitoring
+	(platform notepad Part G9) extend naturally to AI spend/risk oversight -- there's no separate
+	"AI billing system" to learn; it's the same cost-governance toolkit applied to a new
+	consumption category (tokens, alongside credits).
+======================================================================================================================================================
+======================================================================================================================================================
+PART H -- SUMMIT 2026 AI RECAP + SENIOR DE ROLE SYNTHESIS + INTERVIEW QUICK HITS
+======================================================================================================================================================
+======================================================================================================================================================
+H1. Condensed AI-specific Summit 2026 recap (cross-reference to platform notepad Part L for the
+    full, non-AI-specific event recap)
+
+	AI Agents + Productivity: CoWork (GA, major expansion) + CoCo (GA, major expansion), Skill
+	Catalog, Cortex Sense (private preview -> broadening).
+	Context + Semantics: Horizon Context, Semantic Studio, Semantic View Autopilot, OSI (open standard).
+	Security + Governance: AI Agent Identity (GA), AI Security Posture Management, AI Guardrails
+	(GA), Data Exfiltration Protection, Ransomware Protection (multi-party approval).
+	AI Compute: Cortex Training (managed-GPU fine-tuning of open models), ML feature serving GA
+	(sub-2-second freshness, ~10ms latency).
+	Corporate: Anthropic partnership expanded ($200M multi-year, Claude powers CoWork+CoCo), Natoma
+	acquisition (MCP gateway, pending).
+======================================================================================================================================================
+H2. A senior data engineer's actual role in the Snowflake AI stack (mirrors the synthesis at the
+    end of the Databricks AI notepad, Databricks AI notepad Part I20 -- same underlying answer,
+    Snowflake-specific mechanics)
+
+	A senior DE typically owns or heavily influences:
+		1. BUILDING the governed tables/Iceberg data (platform notepad Parts C-D) that become a
+		   Cortex Search knowledge base (C3) or Snowflake ML training data (D1-D2) -- standard
+		   pipeline work, just with an AI consumer at the end.
+		2. AUTHORING and MAINTAINING Semantic Models (C2) -- the YAML artifact that determines
+		   whether Cortex Analyst/CoWork actually answer business questions correctly. This is
+		   arguably the single highest-leverage AI-adjacent artifact a DE can own on Snowflake --
+		   directly analogous to owning Unity Catalog Metrics/Business Glossary definitions on Databricks.
+		3. RUNNING AI Functions (Part B) and Document AI pipelines (C4) INSIDE normal Snowflake
+		   pipelines (Streams+Tasks or Dynamic Tables, platform notepad Part D9) -- treating an
+		   LLM call as just another pipeline step, with the same idempotency/monitoring discipline
+		   as any other transformation.
+		4. MAINTAINING Feature Store pipelines (D2) and Model Registry hygiene (D3) for classical
+		   ML workloads, exactly as on any other platform.
+		5. GOVERNING via the layered model in Part G -- ensuring RBAC/masking policies that
+		   protect a table ALSO correctly protect any AI Function/agent touching that table (which
+		   happens automatically, B7, but still needs to be VERIFIED, not assumed).
+		6. MONITORING cost (tokens + credits, G4) and staying ahead of Behavior Change Releases
+		   (G2) so Cortex-dependent pipelines don't break silently as underlying models update.
+	The throughline (same one as the Databricks AI notepad closes on): this is almost entirely the
+	SAME data-engineering skill set (governed pipelines, RBAC, monitoring, cost control) applied
+	to a new consumer (agents) and new artifact types (semantic models, embeddings, agent
+	identities) rather than a BI dashboard -- not a pivot into being an ML researcher.
+======================================================================================================================================================
+H3. Interview quick hits (Snowflake AI side)
+
+	Q: "How does Snowflake govern what an AI agent can access?"
+	A: Cortex AI Functions automatically inherit the SAME RBAC/masking/row-access policies as any
+	   SQL query (B7) -- zero separate config. Agents specifically (which can take ACTIONS, not
+	   just read) get AI Agent Identity (E3) -- cryptographic per-agent identity, per-agent RBAC,
+	   full audit trail -- plus the 5-layer AI Security stack (E4).
+
+	Q: "What's the difference between Cortex Sense and Horizon Context?"
+	A: Horizon Context is the durable, CURATED governance/metadata substrate (semantic views,
+	   glossary, connectors). Cortex Sense is the RUNTIME layer that activates those signals for
+	   agents at query time, plus everything it learns automatically beyond what's been formally
+	   curated (F3).
+
+	Q: "CoWork vs CoCo -- what's the split?"
+	A: CoWork = business-user personal agent (natural language, no SQL needed, Deep Research,
+	   Artifacts). CoCo = developer/coding agent (generates/deploys code, Cloud Agents sandboxes,
+	   Agent Teams for parallel multi-agent execution). Same underlying Cortex Agents API (C5) and
+	   Cortex Sense context layer (F3) power both.
+
+	Q: "How would you build a RAG chatbot over internal documents on Snowflake?"
+	A: land documents governed via a stage/table -> Document AI or AI_EXTRACT for structured
+	   fields (C4/B3) -> Cortex Search index for retrieval (C3) -> AI_COMPLETE to generate a
+	   grounded answer using retrieved chunks (B1) -> Streamlit or CoWork/Cortex Agents (C5) as
+	   the front end -- all governed by the SAME RBAC as the source documents throughout.
+
+	Q: "Snowflake vs Databricks -- how do their AI governance strategies compare?"
+	A: both landed on a two-surface split (one business-user agent, one developer agent) and a
+	   context/semantic layer feeding both, within months of each other in 2026 -- Databricks via
+	   Genie + Genie Ontology + Unity AI Gateway; Snowflake via CoWork/CoCo + Cortex Sense + Agent
+	   Identity. Different implementations, remarkably similar underlying thesis: models are
+	   commoditized, governed enterprise context is the moat (see platform notepad Part L3 for the
+	   fuller platform-wide comparison).
+
+	Q: "What's Snowflake's data privacy commitment for Cortex AI?"
+	A: no training on customer data, ever, for models shared across the customer base; all
+	   inference runs within Snowflake's own security perimeter (G3).
+======================================================================================================================================================
+*** END OF AI ON SNOWFLAKE HANDBOOK ***
+For the core Snowflake platform (architecture, warehouses, storage, ingestion, governance, data
+sharing, etc.), see: "Snowflake_COMPLETE_HANDBOOK_2026.txt"
+For the Databricks side of your interview prep (platform + AI), see:
+"Databricks_COMPLETE_HANDBOOK_2026.txt" and "AI_on_Databricks_COMPLETE_HANDBOOK_2026.txt"
+Cheat sheets for both Snowflake files are still to come, per your request.
+
+Sources: Snowflake product documentation (docs.snowflake.com), Snowflake product blog
+(snowflake.com/blog), and Snowflake Summit 2026 (June 1-4, 2026) coverage and press materials,
+current as of July 2026. Several 2026 AI features are in Private/Public Preview -- re-verify GA
+status against docs.snowflake.com before relying on it in production or citing it as "current"
+in an interview.
+======================================================================================================================================================
