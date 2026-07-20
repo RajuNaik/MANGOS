@@ -1,0 +1,843 @@
+ADVANCED SQL SCENARIOS -- COMPLETE HANDBOOK -- 2026 EDITION
+Companion to SQL_COMPLETE_HANDBOOK_2026.txt. That file's Part E covered the classic NAMED
+patterns (Nth highest, running totals, gaps and islands, etc.) as compact one-liner templates.
+This file goes further: full, real-world, MULTI-STEP scenario problems of the kind actually asked
+in senior/staff-level SQL interview rounds -- organized by domain, each with a problem statement,
+a solution, and the reasoning/gotchas an interviewer is specifically listening for. Cross-
+references back to the core SQL handbook's Part/section numbers throughout.
+======================================================================================================================================================
+======================================================================================================================================================
+PART A -- ADVANCED AGGREGATION: MULTI-LEVEL SUBTOTALS
+======================================================================================================================================================
+======================================================================================================================================================
+A1. GROUPING SETS -- multiple GROUP BY groupings in ONE query, ONE pass over the data
+
+	SCENARIO: "Give me total sales by (region, product), AND total sales by region alone, AND the
+	grand total -- all in one result set, for one dashboard query."
+	Naive approach: three separate queries UNION ALL'd together -- three passes over the data.
+	Better:
+		SELECT region, product, SUM(sales) AS total_sales
+		FROM sales_data
+		GROUP BY GROUPING SETS ((region, product), (region), ());
+	Each set in the GROUPING SETS list is a DIFFERENT grouping level computed in ONE pass; ()
+	means "no grouping columns" = the grand total row. Columns not part of a given grouping level
+	show up as NULL in that row (e.g. the region-only subtotal rows have product = NULL).
+======================================================================================================================================================
+A2. ROLLUP -- a shorthand for HIERARCHICAL subtotals
+
+	SELECT region, product, SUM(sales) AS total_sales
+	FROM sales_data
+	GROUP BY ROLLUP (region, product);
+	Generates subtotals for EVERY PREFIX of the column list, in hierarchy order: (region, product)
+	-> (region) -> (). Equivalent to
+	GROUPING SETS ((region, product), (region), ()) -- exactly the scenario in A1, expressed more
+	concisely BECAUSE the columns have a natural hierarchical relationship (product rolls up into
+	region). Use ROLLUP when the grouping columns genuinely form a hierarchy (region > product,
+	year > quarter > month); use plain GROUPING SETS when the groupings you want are NOT a clean
+	prefix-hierarchy of each other.
+======================================================================================================================================================
+A3. CUBE -- ALL possible combinations of subtotals
+
+	SELECT region, product, SUM(sales) AS total_sales
+	FROM sales_data
+	GROUP BY CUBE (region, product);
+	Generates EVERY combination: (region, product), (region), (product), AND (). Equivalent to
+	GROUPING SETS ((region, product), (region), (product), ()). Use when you genuinely need
+	subtotals sliced EVERY possible way (a full pivot-table-style "slice and dice" output), not
+	just along one hierarchy -- more rows out than ROLLUP for the same column list, so use
+	deliberately, not as a default reach.
+======================================================================================================================================================
+A4. GROUPING() -- distinguishing a TRUE NULL from a "this is a subtotal row" NULL (the real gotcha)
+
+	After GROUPING SETS/ROLLUP/CUBE, a NULL in the result could mean TWO different things: (a)
+	this is a subtotal/grand-total row (the column wasn't part of that grouping level), or (b) the
+	underlying DATA genuinely had a NULL value in that column for a real, non-subtotal row -- and
+	from the raw output alone, YOU CANNOT TELL THEM APART.
+	GROUPING(col) returns 1 if that row is a SUBTOTAL row for that column (col was "rolled up"
+	away), 0 if it's a real, non-aggregated value (even if that real value happens to itself be NULL):
+		SELECT
+		  region, product, SUM(sales) AS total_sales,
+		  GROUPING(region) AS is_region_subtotal,
+		  GROUPING(product) AS is_product_subtotal
+		FROM sales_data GROUP BY ROLLUP (region, product);
+	A very common follow-up interview question after introducing ROLLUP/CUBE -- know GROUPING()
+	exists specifically to solve this ambiguity, not just the ROLLUP/CUBE syntax itself.
+======================================================================================================================================================
+======================================================================================================================================================
+PART B -- ADVANCED WINDOW FUNCTION SCENARIOS
+======================================================================================================================================================
+======================================================================================================================================================
+B1. Chaining window functions -- and the gotcha that you CANNOT nest OVER() directly
+
+	SCENARIO: "For each customer, rank their orders by date, then find the AVERAGE order amount
+	among only their first 3 orders."
+	GOTCHA: you cannot write `AVG(amount) OVER (...)` directly wrapping `ROW_NUMBER() OVER (...)`
+	in one single SELECT-level expression -- window functions logically compute at the SAME stage
+	(A4 in the core handbook), so one window function's OUTPUT can't be the direct INPUT to
+	another window function within the same SELECT list. You must WRAP in a subquery/CTE first:
+		WITH ranked AS (
+		  SELECT *, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY order_date) AS rn
+		  FROM orders
+		)
+		SELECT customer_id, AVG(amount) AS avg_first_3
+		FROM ranked WHERE rn <= 3 GROUP BY customer_id;
+	This exact "can't nest window functions, need a CTE/subquery layer" constraint is WHY complex
+	analytical SQL so often ends up as a CHAIN of CTEs, each adding one more layer of derived
+	columns -- a very common, very reasonable multi-CTE query shape in a real interview answer,
+	not a sign you're overcomplicating things.
+======================================================================================================================================================
+B2. Percent of total, and percent CHANGE period-over-period
+
+	-- percent of total (a plain aggregate window function, no PARTITION needed if it's % of the
+	   grand total; PARTITION BY region if you want % of each region's total instead):
+	SELECT product, sales, sales / SUM(sales) OVER () AS pct_of_total FROM sales_data;
+
+	-- period-over-period % change (needs LAG, then arithmetic on the current vs. lagged value):
+	SELECT month, revenue,
+	  (revenue - LAG(revenue) OVER (ORDER BY month)) / NULLIF(LAG(revenue) OVER (ORDER BY month), 0)
+	    AS pct_change_mom
+	FROM monthly_revenue;
+	GOTCHA: always wrap the DENOMINATOR in NULLIF(..., 0) -- if a prior period's value was
+	genuinely zero, a naive division throws a divide-by-zero error (or, on ANSI-mode-off engines
+	like pre-Spark-4.0, silently returns NULL/Infinity depending on the engine -- see the core
+	Databricks notepad's ANSI-mode discussion for exactly this class of behavior difference).
+======================================================================================================================================================
+B3. Year-over-year (YoY) growth -- the same idea, at a coarser grain, with a real date-alignment trap
+
+	SCENARIO: "Compare this month's revenue to the SAME MONTH last year, not just the previous row."
+	A plain LAG(revenue) OVER (ORDER BY month) with an offset of 1 gives you MONTH-over-month, not
+	YEAR-over-year -- you need an offset of 12 (for monthly-grain data) OR, more robustly, a SELF-
+	JOIN keyed on the actual date arithmetic rather than assuming the row offset lines up:
+		SELECT curr.month, curr.revenue, prior.revenue AS revenue_ly,
+		  (curr.revenue - prior.revenue) / NULLIF(prior.revenue, 0) AS yoy_growth
+		FROM monthly_revenue curr
+		LEFT JOIN monthly_revenue prior
+		  ON prior.month = curr.month - INTERVAL '1' YEAR;
+	The self-join-on-actual-date-arithmetic version is SAFER than `LAG(revenue, 12)` whenever
+	there's ANY chance of a missing/gap month in the data -- a fixed row-offset LAG silently gives
+	you the WRONG comparison period the moment even one month is missing from the middle of the
+	series, while the date-arithmetic join correctly returns NULL (no match) for a genuinely
+	missing comparison period instead of silently misaligning everything after the gap.
+======================================================================================================================================================
+B4. First/last N events per entity, with an explicit tie-breaking rule (a real production gotcha)
+
+	SCENARIO: "Find each user's most recent login." Naive: `ROW_NUMBER() OVER (PARTITION BY
+	user_id ORDER BY login_time DESC)`. GOTCHA: if two logins share the EXACT same timestamp
+	(entirely plausible with low-precision timestamps, or bulk-loaded/batch-inserted data), the
+	ORDER BY alone doesn't deterministically pick one -- results can be NON-DETERMINISTIC (a
+	different row "wins" on a re-run) unless you add a genuine TIE-BREAKER column:
+		ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY login_time DESC, login_id DESC) AS rn
+	Always add a guaranteed-unique tie-breaker (a primary key / auto-increment ID / insertion
+	order column) as a SECONDARY sort key whenever "most recent" or "first" could plausibly have
+	ties on the primary sort column -- a genuinely easy thing to overlook that a good interviewer
+	will specifically probe for ("what if two logins have the identical timestamp?").
+======================================================================================================================================================
+B5. Detecting streaks -- consecutive days of activity (combines gaps-and-islands with a real
+    business scenario)
+
+	SCENARIO: "Find users who were active on 3+ CONSECUTIVE calendar days."
+	Same core trick as the core handbook's gaps-and-islands pattern (Part E6), applied here:
+		WITH activity AS (
+		  SELECT DISTINCT user_id, activity_date FROM events
+		),
+		grouped AS (
+		  SELECT user_id, activity_date,
+		    activity_date - ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY activity_date) AS streak_group
+		  FROM activity
+		)
+		SELECT user_id, streak_group, COUNT(*) AS streak_length, MIN(activity_date) AS streak_start
+		FROM grouped GROUP BY user_id, streak_group HAVING COUNT(*) >= 3;
+	Note the DISTINCT in the first CTE -- if a user has MULTIPLE events on the same day, you must
+	collapse to ONE row per (user, date) FIRST, or the streak-length COUNT(*) will count raw
+	EVENTS instead of DISTINCT DAYS, silently inflating the "streak length" number -- a genuinely
+	common bug in a rushed interview answer to this exact question.
+======================================================================================================================================================
+B6. Rolling N-BUSINESS-day calculations (excluding weekends/holidays -- a real, messy scenario)
+
+	A plain `ROWS BETWEEN 6 PRECEDING AND CURRENT ROW` only gives a true "N business days" window
+	if your underlying table ALREADY has exactly one row per business day with no gaps (weekends
+	already excluded from the source data) -- if the source data includes weekend rows (e.g. a
+	continuous event stream) OR has genuine gaps (e.g. a holiday with zero activity, so no row
+	exists for that date at all), a fixed ROWS-based frame silently drifts.
+	Robust approach: build (or join against) a proper CALENDAR/DATE-SPINE table that's pre-marked
+	with is_business_day, filter/join against it explicitly, THEN apply the rolling window --
+	don't rely on the raw event table's row-count alone to represent calendar time correctly. A
+	"do you build and use a calendar dimension table" question is a very real, very practical
+	senior-DE interview signal -- most people who've done real DW work have hit this exact trap once.
+======================================================================================================================================================
+======================================================================================================================================================
+PART C -- HIERARCHICAL & GRAPH-STYLE SCENARIOS
+======================================================================================================================================================
+======================================================================================================================================================
+C1. Bill-of-materials cost rollup (recursive CTE + aggregation together)
+
+	SCENARIO: "Each product is made of sub-components, which may themselves be made of further
+	sub-components (arbitrary depth). Compute the TOTAL cost of a finished product, rolling up
+	every sub-component's cost times its quantity, all the way down."
+		WITH RECURSIVE bom_cost AS (
+		  SELECT component_id, parent_id, quantity, unit_cost, quantity * unit_cost AS line_cost
+		  FROM components WHERE parent_id IS NULL          -- anchor: top-level finished products
+		  UNION ALL
+		  SELECT c.component_id, c.parent_id, c.quantity, c.unit_cost,
+		         bc.line_cost * c.quantity * c.unit_cost
+		  FROM components c JOIN bom_cost bc ON c.parent_id = bc.component_id
+		)
+		SELECT parent_id, SUM(line_cost) AS total_rolled_up_cost FROM bom_cost GROUP BY parent_id;
+	This is the RECURSIVE CTE pattern from the core handbook (Part C8) applied to a genuinely
+	practical manufacturing/inventory scenario -- worth having this exact "recursive CTE +
+	aggregation" combination ready, since "sum a value UP a hierarchy" is a common real-world
+	variant of the pure "traverse the hierarchy" recursive-CTE question.
+======================================================================================================================================================
+C2. Org chart: total reports (direct + indirect) per manager
+
+	WITH RECURSIVE org AS (
+	  SELECT employee_id, manager_id FROM employees
+	  UNION ALL
+	  SELECT o.employee_id, e.manager_id
+	  FROM org o JOIN employees e ON o.manager_id = e.employee_id
+	  WHERE e.manager_id IS NOT NULL
+	)
+	-- (a full solution counts, for each manager_id encountered, how many employee_ids reach it
+	--  through this chain -- typically finished with a further GROUP BY manager_id, COUNT(*))
+	The subtle piece interviewers probe: this counts INDIRECT reports too (an employee 3 levels
+	below a VP still counts toward that VP's total), which is a genuinely different, HARDER
+	question than "how many DIRECT reports does each manager have" (a trivial single GROUP BY,
+	no recursion needed at all) -- always clarify OUT LOUD which one is actually being asked
+	before writing the query, since the direct-only version doesn't need a recursive CTE at all
+	and jumping straight to recursion for the wrong question wastes time.
+======================================================================================================================================================
+C3. Detecting cycles in a hierarchy (a genuine correctness gotcha, not just a performance one)
+
+	A recursive CTE traversing a hierarchy that's supposed to be ACYCLIC (a tree) can INFINITE
+	LOOP (or run until the engine's built-in recursion-depth safety limit kills it) if the data
+	actually contains a CYCLE (e.g. a data-entry bug where employee A reports to B, B reports to
+	C, and C accidentally reports back to A). Defensive pattern -- track the PATH visited so far
+	and stop if you'd revisit a node:
+		WITH RECURSIVE org AS (
+		  SELECT employee_id, manager_id, ARRAY[employee_id] AS visited_path
+		  FROM employees WHERE manager_id IS NULL
+		  UNION ALL
+		  SELECT e.employee_id, e.manager_id, o.visited_path || e.employee_id
+		  FROM employees e JOIN org o ON e.manager_id = o.employee_id
+		  WHERE NOT (e.employee_id = ANY(o.visited_path))       -- stop if we'd revisit a node
+		)
+		SELECT * FROM org;
+	Worth explicitly MENTIONING this defensive pattern even if the interview question's data is
+	promised to be a clean tree -- proactively naming "and here's how I'd guard against a cycle in
+	dirtier real-world data" is a strong senior-level signal, showing you think about production
+	robustness, not just the happy-path answer.
+======================================================================================================================================================
+C4. Finding the ROOT (top-of-hierarchy) for any given node
+
+	WITH RECURSIVE ancestry AS (
+	  SELECT employee_id, manager_id, employee_id AS original_employee FROM employees
+	  UNION ALL
+	  SELECT a.manager_id, e.manager_id, a.original_employee
+	  FROM ancestry a JOIN employees e ON a.manager_id = e.employee_id
+	  WHERE a.manager_id IS NOT NULL
+	)
+	SELECT original_employee, employee_id AS root_id
+	FROM ancestry WHERE manager_id IS NULL;
+	Walks UPWARD instead of downward -- the mirror-image of the org-chart-downward pattern in C2 --
+	a good check that you actually understand the recursive CTE mechanism (which side is the
+	"parent" and which is the "child" in the JOIN condition) rather than having memorized ONE
+	direction of the pattern without understanding why it points that way.
+======================================================================================================================================================
+======================================================================================================================================================
+PART D -- FRAUD / ANOMALY DETECTION PATTERNS
+======================================================================================================================================================
+======================================================================================================================================================
+D1. Velocity checks -- too many events for one entity in a short time window
+
+	SCENARIO: "Flag any card that was used 5+ times within any rolling 10-minute window" (a
+	classic card-testing-fraud signal).
+	SELECT DISTINCT t1.card_id, t1.transaction_time
+	FROM transactions t1 JOIN transactions t2
+	  ON t1.card_id = t2.card_id
+	  AND t2.transaction_time BETWEEN t1.transaction_time AND t1.transaction_time + INTERVAL '10' MINUTE
+	GROUP BY t1.card_id, t1.transaction_time
+	HAVING COUNT(*) >= 5;
+	This is the "overlapping ranges"-style self-join pattern from the core handbook (Part E13),
+	repurposed for a ROLLING window count rather than a static range overlap -- a genuinely common
+	real-world variant worth recognizing as the SAME underlying join-on-inequality trick, not a
+	brand new technique.
+	At real scale, this exact self-join pattern gets expensive fast (O(n^2)-ish on a busy table) --
+	worth mentioning in an interview that a PRODUCTION implementation would more likely use a
+	windowed streaming aggregation (Structured Streaming watermarking, core Databricks notepad
+	Part J16; or Snowflake Dynamic Tables/Streams, core Snowflake notepad Part D9) rather than a
+	batch self-join re-run from scratch on the full history every time.
+======================================================================================================================================================
+D2. Duplicate account / identity detection via multiple WEAK signals
+
+	SCENARIO: "Find likely duplicate customer accounts, where no single field is a perfect key,
+	but SEVERAL fields matching together is a strong signal."
+	SELECT a.customer_id, b.customer_id,
+	  (CASE WHEN a.email = b.email THEN 1 ELSE 0 END) +
+	  (CASE WHEN a.phone = b.phone THEN 1 ELSE 0 END) +
+	  (CASE WHEN LOWER(a.last_name) = LOWER(b.last_name) AND a.zip_code = b.zip_code THEN 1 ELSE 0 END)
+	  AS match_score
+	FROM customers a JOIN customers b ON a.customer_id < b.customer_id      -- avoid self-pairs + dup pairs
+	  AND (a.email = b.email OR a.phone = b.phone OR (a.last_name = b.last_name AND a.zip_code = b.zip_code))
+	HAVING match_score >= 2;                                                -- require 2+ signals to agree
+	KEY TRICK worth naming explicitly: `a.customer_id < b.customer_id` (not `<>`) in the join
+	condition -- this is the standard way to compare every PAIR of rows within the same table
+	exactly ONCE (avoiding both self-matches where a.id = b.id, AND duplicate mirror-pairs like
+	(1,2) and (2,1) both showing up) -- a small but very telling detail interviewers notice.
+======================================================================================================================================================
+D3. Round-trip / "wash" transaction detection
+
+	SCENARIO: "Flag pairs of transactions where money moves from account A to B, then BACK from B
+	to A, within a short window -- a classic money-laundering/wash-trading red flag."
+		SELECT t1.transaction_id, t2.transaction_id
+		FROM transactions t1 JOIN transactions t2
+		  ON t1.from_account = t2.to_account AND t1.to_account = t2.from_account
+		  AND t2.transaction_time BETWEEN t1.transaction_time AND t1.transaction_time + INTERVAL '1' DAY
+		  AND ABS(t1.amount - t2.amount) < 0.01;                 -- roughly the same amount back
+	Same "self-join with a reversed-direction condition" trick as C2/D1 -- the pattern that keeps
+	recurring across THIS ENTIRE PART is: self-join the table to itself with a condition
+	expressing the specific RELATIONSHIP you're hunting for (reversed direction, overlapping
+	time, matching amount) -- worth explicitly naming this as the unifying technique if asked to
+	generalize "how would you approach a new fraud-pattern-detection question you haven't seen before."
+======================================================================================================================================================
+D4. Statistical outlier detection (a z-score-style pattern, expressed in plain SQL)
+
+	SCENARIO: "Flag transactions more than 3 standard deviations above a customer's own typical
+	spending, per customer."
+		WITH stats AS (
+		  SELECT customer_id, AVG(amount) AS mean_amt, STDDEV(amount) AS std_amt
+		  FROM transactions GROUP BY customer_id
+		)
+		SELECT t.* FROM transactions t JOIN stats s ON t.customer_id = s.customer_id
+		WHERE t.amount > s.mean_amt + 3 * s.std_amt;
+	GOTCHA: STDDEV over a customer's ENTIRE history (including the very outlier you're trying to
+	detect) can be SKEWED by that same outlier inflating the standard deviation, making the
+	threshold too lenient -- a more robust real-world version computes the mean/stddev over a
+	TRAILING window EXCLUDING the current transaction, or uses a more outlier-resistant statistic
+	(median + median absolute deviation, MAD) instead of mean/stddev -- worth naming this
+	limitation even in a "good enough for an interview" plain-mean/stddev answer, since it shows
+	awareness that the naive version has a real weakness.
+======================================================================================================================================================
+======================================================================================================================================================
+PART E -- CUSTOMER ANALYTICS SCENARIOS
+======================================================================================================================================================
+======================================================================================================================================================
+E1. RFM segmentation (Recency, Frequency, Monetary)
+
+	WITH rfm_raw AS (
+	  SELECT customer_id,
+	    DATEDIFF('day', MAX(order_date), CURRENT_DATE) AS recency_days,
+	    COUNT(*) AS frequency,
+	    SUM(amount) AS monetary
+	  FROM orders GROUP BY customer_id
+	),
+	rfm_scored AS (
+	  SELECT *,
+	    NTILE(5) OVER (ORDER BY recency_days DESC) AS r_score,     -- more recent = higher score,
+	                                                                   hence ORDER BY DESC on a
+	                                                                   metric where LOWER is better
+	    NTILE(5) OVER (ORDER BY frequency ASC) AS f_score,
+	    NTILE(5) OVER (ORDER BY monetary ASC) AS m_score
+	  FROM rfm_raw
+	)
+	SELECT *, CONCAT(r_score, f_score, m_score) AS rfm_segment FROM rfm_scored;
+	NTILE (core handbook Part D2) is the direct tool for this -- splitting customers into 5
+	roughly-equal buckets along each dimension. GOTCHA worth being precise about: for RECENCY,
+	LOWER days-since-last-order is BETTER, so you order DESCENDING (oldest/worst first, so bucket
+	1 = worst, bucket 5 = best/most recent) to keep the "5 = best" convention consistent across
+	all three dimensions -- an easy detail to get backwards under interview pressure.
+======================================================================================================================================================
+E2. Customer Lifetime Value (CLV) -- simple historical version
+
+	SELECT customer_id, SUM(amount) AS historical_clv,
+	  SUM(amount) / NULLIF(DATEDIFF('month', MIN(order_date), MAX(order_date)) + 1, 0) AS avg_monthly_value
+	FROM orders GROUP BY customer_id;
+	Worth stating OUT LOUD in an interview that this is the SIMPLE, backward-looking "historical
+	CLV" (what a customer has ACTUALLY spent so far) -- a genuine PREDICTIVE CLV (forecasting
+	future value) needs a real statistical/ML model (e.g. a BG/NBD or Pareto/NBD model), not just
+	a SQL aggregation -- distinguishing "here's the SQL-only historical version" from "here's
+	where you'd actually need ML" is a good scoping/seniority signal.
+======================================================================================================================================================
+E3. Churn rate, cohort-based
+
+	Builds directly on the core handbook's cohort-analysis pattern (Part E10) with an explicit
+	CHURN DEFINITION layered on top -- and the definition itself is usually the FIRST thing to
+	clarify out loud in an interview ("churn" is ambiguous without a stated rule):
+		WITH cohorts AS (
+		  SELECT customer_id, MIN(order_date) AS cohort_month FROM orders GROUP BY customer_id
+		),
+		monthly_activity AS (
+		  SELECT DISTINCT customer_id, DATE_TRUNC('month', order_date) AS active_month FROM orders
+		),
+		churn_flagged AS (
+		  SELECT c.customer_id, c.cohort_month, m.active_month,
+		    CASE WHEN LEAD(m.active_month) OVER (PARTITION BY c.customer_id ORDER BY m.active_month)
+		         IS NULL THEN 1 ELSE 0 END AS is_last_active_month
+		  FROM cohorts c JOIN monthly_activity m ON c.customer_id = m.customer_id
+		)
+		-- churn rate for a given month = count of customers whose LAST active month was that
+		-- month, divided by count of customers active at the START of that month
+	The LEAD()-to-find-"is-this-their-last-appearance" trick is the general pattern worth
+	remembering -- "find the LAST row per entity" is very often solved with LEAD() IS NULL
+	(nothing comes after this one) rather than a separate MAX()-and-join step.
+======================================================================================================================================================
+E4. Market basket analysis -- frequently bought together
+
+	SELECT a.product_id AS product_a, b.product_id AS product_b, COUNT(DISTINCT a.order_id) AS times_bought_together
+	FROM order_items a JOIN order_items b
+	  ON a.order_id = b.order_id AND a.product_id < b.product_id     -- same "< " trick as D2,
+	                                                                     avoiding self-pairs/mirror-dupes
+	GROUP BY a.product_id, b.product_id
+	HAVING COUNT(DISTINCT a.order_id) >= 10
+	ORDER BY times_bought_together DESC;
+	A self-join of the order_items table to ITSELF on order_id is the whole trick -- pairs of
+	products that showed up in the SAME order become a single joined row, and COUNT(DISTINCT
+	order_id) tells you how often that specific PAIR co-occurred. This is the SQL-only,
+	"association-rule-lite" version -- a full market-basket analysis (with actual SUPPORT/
+	CONFIDENCE/LIFT metrics, the Apriori algorithm) goes further, but this exact query is the
+	realistic "can you do this in plain SQL" interview expectation.
+======================================================================================================================================================
+E5. New vs. Returning vs. Reactivated customers per period
+
+	SCENARIO: classify each customer, EACH MONTH, as NEW (first order ever, this month), RETURNING
+	(ordered last month too), or REACTIVATED (ordered before, but NOT last month, and now again):
+		WITH monthly AS (
+		  SELECT customer_id, DATE_TRUNC('month', order_date) AS order_month
+		  FROM orders GROUP BY customer_id, DATE_TRUNC('month', order_date)
+		),
+		classified AS (
+		  SELECT *,
+		    LAG(order_month) OVER (PARTITION BY customer_id ORDER BY order_month) AS prev_month,
+		    MIN(order_month) OVER (PARTITION BY customer_id) AS first_month
+		  FROM monthly
+		)
+		SELECT customer_id, order_month,
+		  CASE
+		    WHEN order_month = first_month THEN 'NEW'
+		    WHEN prev_month = order_month - INTERVAL '1' MONTH THEN 'RETURNING'
+		    ELSE 'REACTIVATED'
+		  END AS customer_status
+		FROM classified;
+	Combines LAG() (D3 in the core handbook's window-function part) with a plain aggregate window
+	function (MIN() OVER (PARTITION BY...), also from the core handbook Part D4) in ONE query --
+	a good demonstration that "advanced SQL" is very often just COMBINING a small set of building
+	blocks you already know, layered together, rather than needing exotic new syntax for every new scenario.
+======================================================================================================================================================
+======================================================================================================================================================
+PART F -- A/B TESTING & EXPERIMENTATION IN SQL
+======================================================================================================================================================
+======================================================================================================================================================
+F1. Conversion rate by variant
+
+	SELECT variant,
+	  COUNT(DISTINCT user_id) AS users_exposed,
+	  COUNT(DISTINCT CASE WHEN converted THEN user_id END) AS users_converted,
+	  COUNT(DISTINCT CASE WHEN converted THEN user_id END) * 1.0 / COUNT(DISTINCT user_id) AS conversion_rate
+	FROM experiment_exposures e LEFT JOIN conversions c ON e.user_id = c.user_id AND c.event_time >= e.exposure_time
+	GROUP BY variant;
+	GOTCHA worth naming: the join condition `c.event_time >= e.exposure_time` matters -- you only
+	want to count a conversion if it happened AFTER the user was exposed to the experiment, not
+	any conversion ever (which would incorrectly credit the experiment for behavior that predates it).
+======================================================================================================================================================
+F2. Sample Ratio Mismatch (SRM) check -- a real experimentation red flag, often skipped by
+    candidates who jump straight to "which variant won"
+
+	SELECT variant, COUNT(DISTINCT user_id) AS n
+	FROM experiment_exposures GROUP BY variant;
+	If the experiment was supposed to be a clean 50/50 split and the actual counts are meaningfully
+	skewed (e.g. 48%/52% on a huge sample size, which is statistically far too skewed to be random
+	chance), that's a SAMPLE RATIO MISMATCH -- a signal something is WRONG with the experiment's
+	ASSIGNMENT/LOGGING mechanism itself (a bug, not a real effect), and the conversion-rate
+	comparison (F1) shouldn't be trusted AT ALL until the SRM is investigated and fixed. Naming
+	this check PROACTIVELY, before being asked "how do you know the experiment was set up
+	correctly," is a strong senior-level, "I've actually run experiments in production" signal.
+======================================================================================================================================================
+F3. Pre/post comparison with a control group (differences-in-differences, SQL-expressible version)
+
+	SCENARIO: "Compare a metric before/after a launch, for both the treatment group AND a control
+	group, to separate the TREATMENT EFFECT from a general trend affecting everyone."
+		SELECT
+		  group_type,
+		  AVG(CASE WHEN period = 'pre' THEN metric_value END) AS avg_pre,
+		  AVG(CASE WHEN period = 'post' THEN metric_value END) AS avg_post,
+		  AVG(CASE WHEN period = 'post' THEN metric_value END) -
+		    AVG(CASE WHEN period = 'pre' THEN metric_value END) AS delta
+		FROM experiment_data GROUP BY group_type;
+		-- the TREATMENT EFFECT estimate = treatment_group's delta MINUS control_group's delta
+	Worth stating explicitly why the control group's delta matters: a naive "before vs after for
+	the treatment group ALONE" comparison can't distinguish "our change caused this" from "this
+	would have happened anyway" (seasonality, a broader market trend, etc.) -- the CONTROL group's
+	delta is the estimate of what would have happened WITHOUT the change, and subtracting it out
+	is what isolates the actual causal effect. A good, concise way to show statistical reasoning
+	maturity in a SQL-flavored answer, not just query-writing mechanics.
+======================================================================================================================================================
+======================================================================================================================================================
+PART G -- DATA RECONCILIATION & CHANGE DETECTION
+======================================================================================================================================================
+======================================================================================================================================================
+G1. Diffing two snapshots -- find INSERTED, UPDATED, and DELETED rows between two points in time
+
+	SCENARIO: "Compare yesterday's and today's full extract of a source table (no CDC feed
+	available) and produce exactly what changed."
+		SELECT
+		  COALESCE(t.id, y.id) AS id,
+		  CASE
+		    WHEN y.id IS NULL THEN 'INSERTED'
+		    WHEN t.id IS NULL THEN 'DELETED'
+		    WHEN t.row_hash <> y.row_hash THEN 'UPDATED'
+		    ELSE 'UNCHANGED'
+		  END AS change_type
+		FROM today_snapshot t
+		FULL OUTER JOIN yesterday_snapshot y ON t.id = y.id;
+	The FULL OUTER JOIN is the core trick -- a row present ONLY in today = inserted, present ONLY
+	in yesterday = deleted, present in BOTH but with different content = updated. See G2 for how
+	"different content" is actually computed efficiently across MANY columns.
+======================================================================================================================================================
+G2. Row-level hash comparison -- detecting ANY change across dozens of columns in ONE cheap comparison
+
+	SCENARIO: a table has 40 columns; you don't want to write a 40-way `OR (a.col1 <> b.col1 OR
+	a.col2 <> b.col2 OR ...)` condition by hand, and you don't want to re-check it every query.
+	Standard pattern: compute a HASH of all the relevant columns concatenated together, store it
+	as its own column, and compare hashes instead of comparing every column individually:
+		SELECT *, MD5(CONCAT_WS('|', col1, col2, col3, ..., col40)) AS row_hash FROM my_table;
+	Now G1's `t.row_hash <> y.row_hash` check is a SINGLE cheap comparison covering all 40 columns
+	at once, and re-computing the hash on load is far cheaper/simpler than maintaining a 40-column
+	manual comparison expression that has to be updated every time a column is added/removed. This
+	is exactly the mechanism underneath many real-world "detect if anything changed" CDC-adjacent
+	implementations when a proper CDC feed (Delta Change Data Feed, Snowflake Streams -- both
+	companion notepads) genuinely isn't available from the source.
+	GOTCHA: use CONCAT_WS with an explicit DELIMITER (not plain concatenation) -- without a
+	delimiter, values ('ab', 'c') and ('a', 'bc') concatenate to the IDENTICAL string "abc",
+	silently producing the SAME hash for genuinely different data -- a real, sneaky correctness bug.
+======================================================================================================================================================
+G3. Multi-column composite deduplication with SURVIVORSHIP rules
+
+	SCENARIO: "Several source systems feed the same customer table with overlapping/duplicate
+	records that don't share a clean key. When duplicates are found, keep the record from the
+	MOST TRUSTED source, or the MOST RECENTLY UPDATED one if sources are equally trusted."
+		WITH ranked_dupes AS (
+		  SELECT *,
+		    ROW_NUMBER() OVER (
+		      PARTITION BY LOWER(email), phone           -- the composite "these are probably the
+		                                                     same person" key
+		      ORDER BY
+		        CASE source_system WHEN 'CRM' THEN 1 WHEN 'WEB' THEN 2 ELSE 3 END,  -- trust order
+		        updated_at DESC                           -- tie-break: most recent wins
+		    ) AS survivorship_rank
+		  FROM customers_raw
+		)
+		SELECT * FROM ranked_dupes WHERE survivorship_rank = 1;
+	This is the deduplication pattern from the core handbook (Part E5) with a genuinely REALISTIC
+	SURVIVORSHIP RULE bolted onto the ORDER BY -- worth recognizing that "which duplicate wins" is
+	almost always a BUSINESS RULE question first (which you should ask about/clarify explicitly
+	in an interview) and a technical ORDER BY expression second, once the rule is actually known.
+======================================================================================================================================================
+======================================================================================================================================================
+PART H -- COMPLEX JOIN & ANTI-JOIN SCENARIOS
+======================================================================================================================================================
+======================================================================================================================================================
+H1. "Customers who never did X" -- three equivalent forms, with a NULL-safety ranking
+
+	-- form 1: LEFT JOIN + IS NULL (works everywhere, very common in practice):
+	SELECT c.* FROM customers c LEFT JOIN orders o ON c.customer_id = o.customer_id
+	WHERE o.customer_id IS NULL;
+	-- form 2: NOT EXISTS (often the OPTIMIZER'S preferred plan, and immune to the NULL trap below):
+	SELECT c.* FROM customers c
+	WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.customer_id);
+	-- form 3: NOT IN (DANGEROUS -- see the core handbook's I2 NULL trap: if orders.customer_id
+	--          can EVER be NULL, this silently returns ZERO rows for the entire query):
+	SELECT c.* FROM customers c WHERE c.customer_id NOT IN (SELECT customer_id FROM orders);
+	Ranking worth stating explicitly in an interview: prefer NOT EXISTS or the LEFT JOIN+IS NULL
+	form; treat NOT IN as a genuine LANDMINE unless you've explicitly verified (or filtered out)
+	that the subquery's column can never contain a NULL.
+======================================================================================================================================================
+H2. Multi-condition / inequality joins -- matching a transaction to the price tier valid AT THAT TIME
+
+	SCENARIO: prices change over time (a price_history table with effective_from/effective_to
+	ranges); match each transaction to whatever price was ACTUALLY in effect on that transaction's
+	date, not just the CURRENT price:
+		SELECT t.*, p.price
+		FROM transactions t
+		JOIN price_history p
+		  ON t.product_id = p.product_id
+		  AND t.transaction_date >= p.effective_from
+		  AND t.transaction_date < COALESCE(p.effective_to, '9999-12-31')
+	The join condition is INEQUALITY-based (a date range check), not a simple equality -- this
+	forces a genuinely different join STRATEGY under the hood on many engines (often closer to a
+	nested-loop or a range/merge join rather than a simple hash join, core Databricks notepad Part
+	J7's join-strategy discussion) -- worth mentioning that inequality joins can be noticeably
+	MORE EXPENSIVE at scale than equality joins, and that a well-designed SCD2 dimension (core
+	handbook Part B6) with the SAME start/end pattern is EXACTLY what makes this kind of "as of a
+	point in time" join possible in the first place.
+======================================================================================================================================================
+H3. As-of join / point-in-time join -- the general pattern behind H2, and directly relevant to
+    the point-in-time-correctness concept from BOTH companion AI notepads
+
+	SCENARIO, generalized: "for each event, find the MOST RECENT applicable dimension/reference
+	value as of that event's timestamp" -- exactly the mechanism underneath a Feature Store's
+	point-in-time-correct training-set generation (Databricks AI notepad Part I2's FeatureLookup,
+	Snowflake AI notepad Part D2) -- here it is, expressed as PLAIN SQL, without a managed feature
+	store doing it for you:
+		SELECT e.*, r.value AS applicable_reference_value
+		FROM events e
+		LEFT JOIN LATERAL (
+		  SELECT value FROM reference_data r
+		  WHERE r.entity_id = e.entity_id AND r.effective_date <= e.event_date
+		  ORDER BY r.effective_date DESC LIMIT 1
+		) r ON TRUE;
+	The LATERAL join (core handbook, and the companion Snowflake notepad's K3 discussion of
+	LATERAL joins for FLATTEN) is what lets the subquery reference `e.entity_id`/`e.event_date`
+	from the OUTER row -- a genuine, useful escape hatch when you need a correlated "most recent
+	as-of" lookup per row and a plain non-lateral join with a MAX() subquery gets awkward. Worth
+	explicitly naming that THIS is what "point-in-time correctness" looks like as raw SQL,
+	directly connecting your SQL fluency to the Feature Store concepts in both companion AI notepads.
+======================================================================================================================================================
+H4. Many-to-many bridge table with additional filtering
+
+	SCENARIO: "students" and "courses" are M:N via an "enrollments" bridge table (core handbook
+	Part B4) -- find students enrolled in BOTH course A AND course B (not just "either"):
+		SELECT student_id FROM enrollments WHERE course_id IN ('A', 'B')
+		GROUP BY student_id HAVING COUNT(DISTINCT course_id) = 2;
+	GOTCHA: a naive `WHERE course_id = 'A' AND course_id = 'B'` in a single-row-at-a-time filter
+	is ALWAYS false (one row's course_id column can't simultaneously equal two different values) --
+	you need the GROUP BY + COUNT(DISTINCT...) = N pattern (matching against the exact COUNT of
+	conditions you're requiring) to express a true "must satisfy ALL of these conditions ACROSS
+	MULTIPLE ROWS" requirement -- a very common beginner mistake worth being able to immediately
+	explain WHY the naive version is wrong, not just present the correct version.
+======================================================================================================================================================
+======================================================================================================================================================
+PART I -- QUERY REWRITING & PERFORMANCE-SCENARIO QUESTIONS
+======================================================================================================================================================
+======================================================================================================================================================
+I1. Correlated subquery -> window function rewrite (a common "make this faster" interview ask)
+
+	SLOW (correlated subquery, re-evaluated once PER OUTER ROW -- core handbook Part C7):
+		SELECT e.*, (SELECT AVG(salary) FROM employees e2 WHERE e2.dept = e.dept) AS dept_avg
+		FROM employees e;
+	FASTER (a single pass, window function computed once per PARTITION rather than re-scanning
+	the table once per OUTER ROW -- core handbook Part D4):
+		SELECT e.*, AVG(salary) OVER (PARTITION BY dept) AS dept_avg
+		FROM employees e;
+	Both are LOGICALLY equivalent (same result), but the window-function version typically avoids
+	the repeated re-scan/re-aggregation the correlated subquery forces -- a genuinely common,
+	very concrete "rewrite this for performance" interview exercise, and a great one to have ready
+	since it directly demonstrates you understand WHY one is faster (execution mechanism), not
+	just THAT it's faster.
+======================================================================================================================================================
+I2. "Here's a slow query, diagnose and fix it" -- a worked walkthrough of the general approach
+
+	Given a slow query, the INVESTIGATION SEQUENCE worth narrating out loud in an interview
+	(directly mirrors both companion notepads' "how do you debug a slow query" sections --
+	Databricks notepad Part K7's Spark UI walkthrough, Snowflake notepad Part C3's Query Profile
+	walkthrough -- same underlying discipline, engine-agnostic version here):
+		1. run EXPLAIN ANALYZE (core handbook Part G6) -- look for the biggest gap between
+		   ESTIMATED and ACTUAL row counts at any step (a sign of stale statistics misleading the
+		   optimizer), and for any unexpected FULL TABLE SCAN where an index scan was expected.
+		2. check for a WRAPPED/FUNCTION-ized filter column defeating an index (core handbook Part
+		   G5) -- the single most common, most fixable root cause.
+		3. check for an accidental CARTESIAN JOIN (missing/wrong join condition) inflating the
+		   row count mid-query.
+		4. check whether a CORRELATED SUBQUERY (I1) could be rewritten as a window function or a
+		   plain JOIN.
+		5. check whether the query is doing MORE WORK than necessary -- SELECT * instead of only
+		   needed columns (core handbook Part G7), or filtering AFTER a large join instead of
+		   before it.
+		6. only AFTER exhausting 1-5, consider structural fixes: adding an index, adding a
+		   covering index, materializing an intermediate result (a temp table/materialized view,
+		   core handbook Part K4), or (on a distributed engine) reconsidering partitioning/
+		   clustering (companion notepads).
+	Narrating this SEQUENCE, rather than jumping straight to "add an index" or "make the warehouse
+	bigger," is exactly the senior-level signal both companion notepads explicitly call out their
+	own platform's equivalent version of (Snowflake notepad Part C3, Databricks notepad Part K7) --
+	the underlying investigative DISCIPLINE is the same skill, just applied to a plain SQL engine
+	here instead of a specific platform's tooling.
+======================================================================================================================================================
+I3. Staging complexity across CTEs vs. one giant nested query
+
+	A very reasonable, very common senior-level practice worth stating explicitly if asked to
+	solve a genuinely complex multi-step scenario (like several in Parts C-H above) under
+	interview pressure: build the query as a CHAIN of clearly-named CTEs, each doing ONE
+	conceptual step (`raw_events` -> `deduplicated` -> `sessionized` -> `aggregated`), rather than
+	one deeply-nested, hard-to-read single expression. This is not just a readability preference --
+	most modern cost-based optimizers (including both companion notepads' engines) can often
+	INLINE/optimize a CTE chain into an equivalent execution plan to a manually-nested version
+	anyway (verify with EXPLAIN if genuinely performance-critical, since a small number of older
+	engines historically materialized every CTE as an actual temp result rather than inlining it --
+	worth checking your SPECIFIC engine's CTE optimization behavior rather than assuming), so
+	there's rarely a real performance cost to writing it the READABLE way -- and a candidate who
+	can produce a clean, staged, well-named CTE chain under interview pressure reads as
+	meaningfully more senior than one who produces a correct-but-unreadable 200-line nested query.
+======================================================================================================================================================
+======================================================================================================================================================
+PART J -- HR / OPERATIONS CLASSICS
+======================================================================================================================================================
+======================================================================================================================================================
+J1. Employees with 3+ consecutive days of activity -- see Part B5 (the general streak-detection
+    pattern) -- this is the literal HR-flavored version of that exact same technique, worth
+    recognizing as the SAME question asked in a different domain skin.
+======================================================================================================================================================
+J2. Overlapping shift-scheduling conflicts
+
+	SCENARIO: "Find any employee who's scheduled for two OVERLAPPING shifts" -- the exact
+	overlapping-date-ranges pattern from the core handbook (Part E13), applied to shifts instead
+	of bookings:
+		SELECT s1.employee_id, s1.shift_id, s2.shift_id
+		FROM shifts s1 JOIN shifts s2
+		  ON s1.employee_id = s2.employee_id AND s1.shift_id < s2.shift_id
+		  AND s1.start_time < s2.end_time AND s2.start_time < s1.end_time;
+	Same "< " self-pair-avoidance trick from D2/E4 combined with the same two-sided-inequality
+	overlap trick from the core handbook -- worth explicitly noting how many "different-sounding"
+	scenarios across this ENTIRE handbook keep reducing to the SAME small handful of underlying
+	techniques (self-join with a directional/inequality condition + the "<" self-pair trick) --
+	that pattern-recognition IS the actual skill being tested across most of these questions, more
+	than memorizing each scenario as a separate, unrelated recipe.
+======================================================================================================================================================
+J3. Tenure / time-in-role, using SCD2-style history
+
+	SCENARIO: given an SCD2 employee_role_history table (start_date/end_date/is_current, core
+	handbook Part B6), compute how long each employee has spent in EACH role they've ever held:
+		SELECT employee_id, role, start_date, COALESCE(end_date, CURRENT_DATE) AS effective_end,
+		  DATEDIFF('day', start_date, COALESCE(end_date, CURRENT_DATE)) AS days_in_role
+		FROM employee_role_history;
+	The COALESCE(end_date, CURRENT_DATE) trick handles the CURRENT/ongoing role correctly (where
+	end_date is NULL because it hasn't ended yet) -- a small but very commonly-missed detail: a
+	naive DATEDIFF against a NULL end_date silently returns NULL for every currently-active
+	employee's row instead of computing their tenure so far.
+======================================================================================================================================================
+J4. Business-day-aware date arithmetic
+
+	SCENARIO: "Calculate the SLA deadline as 3 BUSINESS days after a ticket was opened" (skip
+	weekends, possibly holidays too).
+	Robust approach (the SAME calendar-table technique flagged in B6): join against a pre-built
+	CALENDAR table with an is_business_day flag, and count forward N business-day rows rather
+	than adding a fixed number of calendar days and then trying to awkwardly adjust for weekends
+	after the fact with CASE-WHEN date-arithmetic hacks:
+		SELECT t.ticket_id, MIN(c.calendar_date) AS sla_deadline
+		FROM tickets t
+		JOIN calendar c ON c.calendar_date > t.opened_date AND c.is_business_day = TRUE
+		  AND c.calendar_date <= t.opened_date + INTERVAL '10' DAY   -- a generous upper bound to
+		                                                                cap the search window
+		WHERE (SELECT COUNT(*) FROM calendar c2
+		       WHERE c2.calendar_date > t.opened_date AND c2.calendar_date <= c.calendar_date
+		       AND c2.is_business_day = TRUE) <= 3
+		GROUP BY t.ticket_id;
+	(A window-function ROW_NUMBER()-based version, ranking business days after opened_date and
+	filtering to rank = 3, is a cleaner/more idiomatic rewrite of the same idea once you recognize
+	it as "give me the Nth qualifying row after this point," the same underlying shape as Part D2's
+	Nth-highest-value pattern.) The BROADER point worth stating: maintaining a CALENDAR/DATE-SPINE
+	dimension table is standard, real-world data-warehousing practice specifically because it
+	turns messy date-arithmetic-with-exceptions problems like this one into simple JOIN + COUNT
+	problems -- a genuinely good thing to proactively mention as "how I'd actually solve this in
+	production" even if you also derive the harder pure-date-arithmetic version under interview pressure.
+======================================================================================================================================================
+======================================================================================================================================================
+PART K -- SCHEMA-DESIGN-MEETS-QUERY MINI CASE STUDIES
+======================================================================================================================================================
+======================================================================================================================================================
+K1. Ride-sharing system (design + query)
+
+	Minimal schema: riders(rider_id, name), drivers(driver_id, name, city), rides(ride_id,
+	rider_id, driver_id, city, start_time, end_time, fare).
+	"Average trip duration by city, for completed rides only, last 30 days":
+		SELECT city, AVG(DATEDIFF('minute', start_time, end_time)) AS avg_duration_min
+		FROM rides
+		WHERE end_time IS NOT NULL AND start_time >= CURRENT_DATE - INTERVAL '30' DAY
+		GROUP BY city;
+	The DESIGN conversation worth having out loud (interviewers usually care as much about this
+	as the final query): should city live on the ride row itself, or be derived by joining to
+	drivers/riders? Storing it DIRECTLY on the ride row (a DENORMALIZED choice, core handbook Part
+	B3) is usually right here -- a driver's "home city" isn't necessarily where a SPECIFIC ride
+	happened, and you want the ride's OWN historical record to be self-contained/immutable rather
+	than depending on a join to a dimension that could change later (the driver could move cities).
+======================================================================================================================================================
+K2. Subscription/billing system (design + query) -- Monthly Recurring Revenue (MRR)
+
+	Minimal schema: subscriptions(subscription_id, customer_id, plan_id, start_date, end_date,
+	monthly_amount) -- with a NEW ROW created every time a customer upgrades/downgrades/changes
+	plan (an SCD2-flavored design, core handbook Part B6, applied to a billing domain).
+	"Total MRR as of the end of each month":
+		SELECT month_end,
+		  SUM(monthly_amount) AS mrr
+		FROM calendar_month_ends c
+		JOIN subscriptions s
+		  ON s.start_date <= c.month_end AND (s.end_date IS NULL OR s.end_date > c.month_end)
+		GROUP BY month_end;
+	Another as-of/point-in-time join (H3) -- MRR at any given month-end is "sum of monthly_amount
+	for every subscription that was ACTIVE (started already, not yet ended) as of that date" --
+	worth explicitly recognizing this as the SAME point-in-time-join pattern from H2/H3, not a new
+	technique, and worth flagging as a good follow-up conversation: how would you also break this
+	into NEW MRR, EXPANSION MRR (upgrades), CONTRACTION MRR (downgrades), and CHURNED MRR
+	components -- each is a variant of comparing one month's active-subscription set to the
+	previous month's, conceptually similar to the new/returning/reactivated customer
+	classification pattern in E5.
+======================================================================================================================================================
+K3. Social network -- mutual friends / N-degree connections
+
+	Minimal schema: friendships(user_id_a, user_id_b) -- typically stored with a CHECK constraint
+	or application-level convention that user_id_a < user_id_b, so each friendship is stored ONCE
+	(the same "avoid storing/counting a relationship twice" principle as the `<` trick used
+	throughout Part D/E/J of this handbook, just applied at the SCHEMA-design level this time
+	instead of at query time).
+	"Mutual friends of user X and user Y":
+		SELECT f1.user_id_b AS mutual_friend
+		FROM friendships f1 JOIN friendships f2 ON f1.user_id_b = f2.user_id_b
+		WHERE f1.user_id_a = 'X' AND f2.user_id_a = 'Y';
+		-- (a fuller solution needs to handle a user appearing as EITHER user_id_a or user_id_b in
+		--  a given friendship row, typically via a UNION ALL-based "normalize to one direction"
+		--  helper view first, given the storage convention above)
+	"Friends of friends within 2 degrees, excluding existing friends and the user themselves" is
+	the natural, harder follow-up -- a genuinely good use case for the SQL:2023 SQL/PGQ graph-
+	query extension covered in the core SQL handbook (Part L1) if the engine supports it, or a
+	bounded-depth recursive CTE (core handbook Part C8, with an explicit depth LIMIT rather than
+	unbounded recursion) if it doesn't -- worth naming BOTH approaches and the trade-off (SQL/PGQ
+	is more natural/concise for genuinely graph-shaped questions but isn't universally available
+	yet, per the core handbook's L1 adoption-status notes).
+======================================================================================================================================================
+======================================================================================================================================================
+PART L -- INTERVIEW STRATEGY FOR SCENARIO QUESTIONS (how to approach these live, not just the SQL)
+======================================================================================================================================================
+======================================================================================================================================================
+L1. A repeatable approach for an open-ended "write a query to..." question
+
+	1. RESTATE the problem in your own words, and CLARIFY genuinely ambiguous terms out loud
+	   before writing anything (E3's churn example: "when you say churn, do you mean X or Y?") --
+	   this alone is a strong signal, and often surfaces the ACTUAL intended scope of the question.
+	2. STATE YOUR ASSUMPTIONS explicitly if the interviewer doesn't answer a clarifying question
+	   precisely ("I'll assume a customer_id can't be NULL in the orders table -- if it can, I'd
+	   need to adjust this NOT IN to a NOT EXISTS, per the classic NULL trap" -- directly showing
+	   off core handbook Part I2 knowledge as a NATURAL part of your reasoning, not a recited fact).
+	3. START with the SIMPLEST version that's directionally correct, narrating your plan (e.g.
+	   "I'll start with a CTE to get one row per X, then window-function over it for Y") BEFORE
+	   writing every line -- lets an interviewer redirect you early if you're heading somewhere
+	   they didn't intend, rather than discovering a misunderstanding after 5 minutes of silent typing.
+	4. LAYER in complexity/edge cases explicitly, calling them out as you add them (ties, NULLs,
+	   duplicate rows, empty result sets, timezone handling) -- this is usually worth MORE credit
+	   than a perfectly-optimized first draft, since it demonstrates you think about correctness
+	   under messy real-world data, not just the clean happy path.
+	5. If genuinely stuck, VERBALIZE your reasoning about WHICH technique might apply ("this feels
+	   like a gaps-and-islands shape because we're looking for consecutive runs...") -- interviewers
+	   are very often listening for pattern-RECOGNITION as much as the final correct syntax, and
+	   partial credit for correctly identifying the SHAPE of the problem, even with an imperfect
+	   final query, is real and common.
+======================================================================================================================================================
+L2. Edge cases interviewers are specifically listening for (a checklist worth running through
+    mentally before declaring "done" on any scenario question)
+
+	- What happens with an EMPTY result set / a customer with zero orders (does a LEFT JOIN need
+	  to preserve them, or should they be excluded)?
+	- What happens with TIES (Part B4's tie-breaking discussion)?
+	- What happens with NULLs anywhere in the join/filter columns (Part I1/I2's core-handbook NULL section)?
+	- Could there be DUPLICATE rows in a source table that would silently inflate a COUNT/SUM
+	  (Part B5's DISTINCT-before-streak-counting gotcha)?
+	- Is the DATE/TIMESTAMP handling TIMEZONE-aware, and does that matter for this specific
+	  question (a very real, very commonly overlooked issue in genuinely global datasets)?
+	- Does the query need to be IDEMPOTENT/safe to re-run (core handbook Part H1) if it's framed
+	  as a pipeline step rather than a one-off analytical question?
+	Proactively naming 2-3 of these (not necessarily solving every single one in your final query,
+	time permitting) is consistently one of the highest-leverage things you can do in a scenario-
+	based SQL interview -- it's the difference between "wrote a query that works on the happy
+	path" and "thinks like someone who's actually operated production data systems."
+======================================================================================================================================================
+*** END OF ADVANCED SQL SCENARIOS HANDBOOK ***
+Companion file: SQL_COMPLETE_HANDBOOK_2026.txt (core theory, syntax, and the named-pattern
+building blocks this file builds on throughout).
+======================================================================================================================================================
