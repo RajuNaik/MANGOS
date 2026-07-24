@@ -1,0 +1,1324 @@
+PYTHON FOR AI ENGINEERS -- COMPLETE HANDBOOK -- 2026 EDITION
+Fully self-contained -- Part 0 covers core Python language fundamentals (re-framed with AI-specific
+examples) so you don't need to cross-reference anything else for this topic. Parts A onward cover
+the AI/ML-specific Python layer: NumPy, scikit-learn, PyTorch, the Hugging Face ecosystem, LLM
+APIs, RAG, and the 2026 Python agent-framework landscape. Also complements your Databricks/
+Snowflake AI notepads, which cover PLATFORM-level AI features (Cortex, Mosaic AI, MLflow-on-Unity-
+Catalog) -- this file is the portable Python/library layer underneath any platform. For the DATA-
+ENGINEERING-specific side of Python (Airflow/Dagster/Prefect orchestration, uv/Docker packaging,
+pandas/Polars, cloud SDKs, database connectivity) see the companion Python_for_Data_Engineers_
+COMPLETE_HANDBOOK_2026.txt -- the two files share the same Part-0-style language fundamentals by
+design, so either one works standalone for its respective domain. Interview-trap gotchas are
+folded directly into every section.
+======================================================================================================================================================
+======================================================================================================================================================
+PART 0 -- PYTHON LANGUAGE FUNDAMENTALS FOR AI WORK (self-contained, AI-flavored examples throughout)
+======================================================================================================================================================
+======================================================================================================================================================
+0.1 Core language gotchas -- the senior-level nuances that actually get asked, not basic syntax
+
+	MUTABLE DEFAULT ARGUMENTS -- THE classic Python trap, and it shows up constantly in ML config code:
+		def build_model(hidden_layers=[128, 64]):        # DANGEROUS
+		    hidden_layers.append(10)                        # mutates the SAME list object every
+		    return hidden_layers                             # call that doesn't pass its own list
+	The default is created ONCE at function-DEFINITION time, not per call -- every call sharing
+	the default mutates and accumulates onto the SAME object. FIX: `hidden_layers=None`, then
+	`if hidden_layers is None: hidden_layers = [128, 64]` inside the function body. This exact bug
+	shows up constantly in model-architecture configs and experiment-tracking code that build up a
+	list/dict of layers, hyperparameters, or callback functions across calls.
+
+	LATE-BINDING CLOSURES -- the classic "loop variable captured wrong" bug:
+		callbacks = [lambda: log_metric(name, value) for name, value in metrics.items()]
+	If this pattern is used to build a list of DEFERRED callbacks (e.g. per-epoch logging
+	functions, or per-layer hook functions registered in a loop), EVERY closure captures the
+	VARIABLE, not its value at loop time -- by the time any callback actually RUNS, the loop has
+	finished and `name`/`value` hold their FINAL values for every single callback. FIX: force
+	early binding via a default argument (`lambda name=name, value=value: log_metric(name, value)`).
+
+	`is` vs `==` -- use `is`/`is not` for `None` checks (`if tensor is None`), and be aware that
+	`is` checks IDENTITY (same object in memory) while `==` checks VALUE -- for NumPy/PyTorch
+	arrays specifically, `==` performs ELEMENT-WISE comparison and returns an ARRAY of booleans,
+	not a single True/False -- `if my_array == other_array:` raises a `ValueError` ("truth value
+	of an array with more than one element is ambiguous") -- use `.all()`/`.any()`, or
+	`np.array_equal()`/`torch.equal()`, to reduce it to a single boolean.
+
+	SHALLOW vs DEEP COPY -- directly relevant to tensors/configs: a shallow copy of a list of
+	NumPy arrays or tensors still shares the UNDERLYING array/tensor objects -- mutating an array
+	IN PLACE (`arr += 1`, a common pattern in numerical code) through the shallow copy also
+	mutates the "original." `copy.deepcopy()` fully isolates nested objects; for tensors
+	SPECIFICALLY, `tensor.clone()` (PyTorch) or `arr.copy()` (NumPy) creates an independent copy
+	of the ARRAY DATA itself -- neither `copy.copy()` nor `copy.deepcopy()` is the idiomatic way
+	to duplicate a single tensor/array; know the array-library-specific method instead.
+
+	SCOPE (the LEGB rule: Local -> Enclosing -> Global -> Built-in) -- assigning to a name inside
+	a function makes it LOCAL by default; `global`/`nonlocal` are needed only to ASSIGN to an
+	outer-scope variable, not to read one. Relevant in training-loop code that reads/writes a
+	module-level `best_accuracy` tracking variable across many function calls.
+
+	*args, **kwargs -- ubiquitous in ML code for building flexible wrappers around models/API
+	calls that need to pass arbitrary arguments through unchanged:
+		def with_retry(func, *args, max_attempts=3, **kwargs):
+		    for attempt in range(max_attempts):
+		        try:
+		            return func(*args, **kwargs)
+		        except TransientError:
+		            if attempt == max_attempts - 1: raise
+
+	DUCK TYPING -- Python checks whether a value SUPPORTS an operation, not its declared type --
+	WHY a function written to accept "anything with a `.shape` attribute and supports indexing"
+	can transparently accept a NumPy array, a PyTorch tensor, OR a pandas DataFrame with zero
+	type-checking code -- the philosophical foundation of why so much of the Python data/ML
+	ecosystem interoperates as smoothly as it does.
+
+	THE GIL (Global Interpreter Lock) -- only one thread executes Python bytecode at a time in
+	standard CPython, which is WHY plain `threading` doesn't speed up CPU-bound pure-Python code
+	(it DOES help I/O-bound code, like waiting on an LLM API response, Part E4). Python 3.14
+	(Oct 2025) made FREE-THREADING officially supported (not just experimental, as it was in
+	3.13) -- an opt-in build where the GIL can be disabled -- but most AI/data libraries' C
+	extensions still need updating to be fully free-threading-safe, and NumPy/PyTorch's heavy
+	numerical work already RELEASES the GIL during compute-heavy C/CUDA operations regardless,
+	which is WHY NumPy/PyTorch code has always been able to achieve real parallelism for the
+	actual math even under the classic GIL-enabled build -- the GIL mainly constrains PURE PYTHON
+	loops, not the vectorized numerical operations this whole handbook is built around.
+======================================================================================================================================================
+0.2 Data structures & complexity -- quick reference
+
+	list (ordered, mutable, O(1) index/append, O(n) search) / tuple (ordered, immutable, hashable
+	  if contents are -- usable as a dict key, e.g. keying a cache by an input SHAPE tuple) / dict
+	  (O(1) average key lookup, insertion-ordered since 3.7) / set (O(1) average membership, no
+	  duplicates -- the right tool for deduping a vocabulary list, tracking "already-processed"
+	  IDs during data loading, or fast membership checks against a stopword list).
+	`collections.defaultdict(list)` -- extremely common for grouping records by key during data
+	  preprocessing (`groups[label].append(example)` with no manual `if key not in groups` guard).
+	`collections.Counter` -- the standard tool for building a VOCABULARY frequency count from a
+	  text corpus before tokenization, or for computing class-label distribution in a dataset.
+	`collections.deque` -- O(1) append/pop from BOTH ends -- the right structure for a rolling
+	  buffer (e.g. tracking the last N loss values for an early-stopping check) or a rate limiter
+	  around API calls (Part E5).
+======================================================================================================================================================
+0.3 Generators & iteration -- the memory-efficiency technique underneath every real data pipeline
+
+	def data_generator(file_paths):
+	    for path in file_paths:
+	        for record in load_records(path):
+	            yield preprocess(record)
+	A generator computes values LAZILY, one at a time -- the standard technique for streaming a
+	training dataset too large to fit in memory (directly what PyTorch's `IterableDataset`, Part
+	C5, and Hugging Face `datasets`' `streaming=True` mode, Part D3, are built on top of).
+	GOTCHA: a generator can only be iterated ONCE -- if you need multiple EPOCHS over the same
+	data, either recreate the generator each epoch, or use `itertools.tee()`, or (more commonly
+	in practice) use a proper `Dataset`/`DataLoader` (Part C5) which handles re-iteration correctly
+	for you across epochs.
+	`itertools.islice(iterable, n)` -- the standard way to pull a fixed-size BATCH off a lazy
+	stream without materializing the whole thing: `batch = list(islice(data_stream, batch_size))`.
+======================================================================================================================================================
+0.4 Decorators & context managers -- both used constantly in real AI code, not just abstract concepts
+
+	DECORATORS you'll see and write constantly in AI code:
+		@torch.compile                    # Part C7 -- JIT-compiles a model/function
+		@lru_cache(maxsize=None)          # memoize an expensive, deterministic function (e.g.
+		                                     caching a tokenizer's output for a repeated input)
+		@retry(stop=stop_after_attempt(3)) # tenacity-style retry wrapper around a flaky LLM API call
+	Writing your own is a common interview ask:
+		import time, functools
+		def timed(func):
+		    @functools.wraps(func)             # preserves the wrapped function's name/docstring --
+		    def wrapper(*args, **kwargs):         without this, debugging/introspection tools see
+		        start = time.perf_counter()        the WRAPPER's identity instead of the real function's
+		        result = func(*args, **kwargs)
+		        print(f"{func.__name__}: {time.perf_counter()-start:.2f}s")
+		        return result
+		    return wrapper
+		@timed
+		def run_inference(model, batch): ...
+
+	CONTEXT MANAGERS -- THE canonical AI example is `torch.no_grad()` (Part C2):
+		with torch.no_grad():
+		    predictions = model(x_test)          # no gradient graph retained -- saves memory
+	Writing your own (e.g. a timing/profiling context manager around a training step):
+		from contextlib import contextmanager
+		@contextmanager
+		def timer(label):
+		    start = time.perf_counter()
+		    try:
+		        yield
+		    finally:
+		        print(f"{label}: {time.perf_counter()-start:.2f}s")
+		with timer("forward pass"):
+		    output = model(batch)
+	The core value in BOTH cases: guaranteed setup/teardown (or state save/restore) around a block
+	of code, regardless of whether an exception occurs inside it -- `torch.no_grad()` specifically
+	SAVES the current grad-tracking mode on entry and RESTORES it on exit, which is exactly the
+	context-manager pattern at work.
+======================================================================================================================================================
+0.5 OOP essentials for AI code
+
+	DATACLASSES for model/experiment configs (the standard, modern pattern -- avoids the mutable-
+	default trap in 0.1 automatically via `field(default_factory=...)`):
+		from dataclasses import dataclass, field
+		@dataclass
+		class TrainingConfig:
+		    learning_rate: float = 1e-4
+		    batch_size: int = 32
+		    hidden_layers: list[int] = field(default_factory=lambda: [128, 64])
+	Auto-generates `__init__`/`__repr__`/`__eq__` -- eliminates the boilerplate of a hand-written
+	config class, and `@dataclass(frozen=True)` gives you an immutable, hashable config object
+	(usable as a dict key, e.g. caching results per unique config).
+
+	ABSTRACT BASE CLASSES for a consistent pipeline/model interface:
+		from abc import ABC, abstractmethod
+		class Trainer(ABC):
+		    @abstractmethod
+		    def train_step(self, batch) -> float: ...        # must return the loss
+	Lets you define a consistent `Trainer`/`Evaluator`/`DataLoader` INTERFACE that many concrete
+	implementations (a PyTorch trainer, a scikit-learn trainer, a custom loop) all satisfy,
+	so orchestration code can work uniformly against any of them.
+
+	`nn.Module` (Part C4) IS this same OOP pattern, specialized by PyTorch -- `__init__` defines
+	layers (state), `forward` defines computation -- the exact "define state in `__init__`,
+	behavior in a method" shape every custom Python class follows, just with PyTorch's own
+	bookkeeping (parameter registration, `.to(device)` propagating to all sub-layers) layered on top.
+
+	DUNDER METHODS worth knowing: `__repr__` (what shows up in a debugger/log for your config/
+	model-wrapper objects), `__eq__` (comparing two config objects by VALUE, not identity --
+	dataclasses give you this for free), `__len__`/`__getitem__` (implementing these on a custom
+	`Dataset` class, Part C5, is EXACTLY what makes it work with PyTorch's indexing/batching
+	machinery -- duck typing, 0.1, in action).
+======================================================================================================================================================
+0.6 Type hints & runtime validation (Pydantic) -- basics here, full LLM-specific usage in Part E3
+
+	def preprocess(texts: list[str], max_length: int = 512) -> list[list[int]]:
+	    ...
+	Type hints are NOT enforced by Python itself at runtime -- purely for static tools (mypy, IDEs)
+	and readability. For genuine RUNTIME enforcement (validating an incoming API request, a config
+	file, or a parsed model response actually matches an expected shape), use Pydantic:
+		from pydantic import BaseModel
+		class InferenceRequest(BaseModel):
+		    text: str
+		    max_tokens: int = 256
+	`InferenceRequest(**raw_dict)` raises a clear validation error at RUNTIME if the shape/types
+	don't match -- the standard way to validate anything crossing a real boundary (an API request,
+	a config file, a parsed LLM response) in modern AI-serving code (Part J1 shows this exact
+	pattern powering FastAPI request validation).
+======================================================================================================================================================
+0.7 Concurrency -- the decision framework (full depth in the companion DE handbook; the core
+    framework, since it's used constantly throughout this file's Parts C/E/F)
+
+		I/O-BOUND (waiting on an API call, a file read, a network request)  -> threading or asyncio
+		CPU-BOUND (heavy Python-level computation, not delegated to C/CUDA)  -> multiprocessing
+	AI-specific application of this rule: calling an LLM API (Part E) is textbook I/O-bound --
+	`asyncio`/`AsyncOpenAI` (Part E4) is the right tool for firing many concurrent requests.
+	`DataLoader(num_workers=4)` (Part C5) uses `multiprocessing` under the hood specifically
+	because data augmentation/preprocessing is often genuine CPU-bound Python work. The actual
+	NUMERICAL computation inside NumPy/PyTorch (matrix multiplies, etc.) runs in compiled C/CUDA
+	code that RELEASES the GIL while it runs -- which is why a single Python-level training loop
+	can still achieve full GPU utilization despite the GIL, even without free-threading (0.1) --
+	the GIL constrains PURE PYTHON loops, not the vectorized math this whole handbook builds on.
+======================================================================================================================================================
+0.8 Error handling essentials
+
+	try:
+	    result = model(batch)
+	except torch.cuda.OutOfMemoryError:                  # catch SPECIFIC exceptions, never a bare `except:`
+	    torch.cuda.empty_cache()
+	    raise
+	except Exception as e:
+	    logger.error(f"Inference failed: {e}", exc_info=True)
+	    raise
+	Custom exception hierarchies (`class ModelLoadError(Exception): ...`) let calling code catch
+	broadly or specifically as needed, and make LOGGING/monitoring able to distinguish failure
+	CATEGORIES cleanly (a data-validation failure vs. a genuine model/inference failure vs. an
+	upstream API failure) -- the same discipline as any production Python system, just with
+	AI-specific failure modes (OOM errors, API rate limits, malformed model outputs) to plan for
+	explicitly.
+======================================================================================================================================================
+This Part 0 covers what's specifically load-bearing for the rest of THIS file. For deeper
+coverage of concurrency (full threading/multiprocessing/asyncio treatment), testing (pytest
+fixtures/mocking in depth), and packaging/tooling (uv, Docker, Ruff) -- all genuinely shared
+ground with data-engineering work rather than AI-specific -- see the companion Python_for_Data_
+Engineers_COMPLETE_HANDBOOK_2026.txt, Parts G, L, and M respectively.
+======================================================================================================================================================
+======================================================================================================================================================
+PART A -- NUMPY: THE FOUNDATION OF EVERYTHING
+======================================================================================================================================================
+======================================================================================================================================================
+A1. ndarray basics
+
+	import numpy as np
+	arr = np.array([[1, 2, 3], [4, 5, 6]])
+	arr.shape       # (2, 3)
+	arr.dtype       # int64 (or platform-dependent int32/int64) -- ALL elements share ONE dtype,
+	                   unlike a Python list which can mix types -- this uniformity is WHY NumPy
+	                   can store data as a contiguous block of memory and operate on it via fast,
+	                   compiled C loops instead of iterating boxed Python objects one at a time.
+======================================================================================================================================================
+A2. Broadcasting -- THE most commonly misunderstood NumPy mechanism, and a near-guaranteed
+    interview/debugging topic
+
+	Broadcasting lets NumPy perform element-wise operations on arrays of DIFFERENT shapes, by
+	virtually "stretching" the smaller array, WITHOUT actually copying data, according to
+	precise rules:
+		1. align shapes from the RIGHT (trailing dimensions first).
+		2. two dimensions are COMPATIBLE if they're EQUAL, or one of them is 1.
+		3. a dimension of size 1 is virtually stretched to match the other array's size in that dimension.
+	a = np.array([[1,2,3],[4,5,6]])     # shape (2,3)
+	b = np.array([10,20,30])              # shape (3,)   -- aligns as (1,3), broadcasts to (2,3)
+	a + b                                   # [[11,22,33],[14,25,36]] -- b is added to EVERY row
+	GOTCHA: `a.shape == (2,3)` and `b.shape == (2,1)` broadcast fine (b's size-1 dim stretches
+	across a's 3 columns); `a.shape == (2,3)` and `b.shape == (2,)` does NOT broadcast (aligning
+	from the right, 3 vs 2 in the trailing dimension are neither equal nor 1) -- raises a
+	`ValueError: operands could not be broadcast together`. This EXACT class of error ("why does
+	my shape not match") is one of the single most common real bugs in ML code (a model output of
+	shape (batch, 1) accidentally broadcasting against a label of shape (batch,) in a loss
+	calculation, silently producing a WRONG but non-crashing result via unintended broadcasting,
+	rather than a clean error) -- always explicitly check/print `.shape` when debugging a
+	numerical result that "looks wrong but didn't crash."
+======================================================================================================================================================
+A3. Vectorization vs Python loops -- the same theme as pandas (companion DE notepad Part H2),
+    here at the NumPy layer underneath it
+
+	Never write `for i in range(len(arr)): arr[i] = arr[i] * 2` -- write `arr * 2` directly. The
+	vectorized version runs the multiplication in a tight, compiled C loop over contiguous memory;
+	the Python-loop version pays Python-bytecode-interpretation + object-boxing overhead PER
+	ELEMENT. This is the identical underlying principle as the companion Python-for-DE notepad's
+	pandas vectorization discussion (companion DE notepad Part H2) -- pandas itself is BUILT on
+	NumPy arrays under the hood, so the same "never loop when a vectorized operation exists" rule
+	applies at both layers.
+======================================================================================================================================================
+A4. Views vs copies -- the NumPy-specific version of the DE handbook's shallow-copy gotcha
+
+	Basic SLICING (`arr[1:3]`, `arr[:, 0]`) returns a VIEW -- it shares the SAME underlying memory
+	as the original array; mutating the slice mutates the original. FANCY INDEXING (indexing with
+	a list/array of indices, `arr[[0, 2, 4]]`) returns a COPY -- independent memory, mutating it
+	does NOT affect the original. Same underlying "which operations alias memory vs. which
+	genuinely copy it" gotcha family as the companion Python-for-DE notepad's shallow-vs-deep-copy
+	discussion (companion DE notepad Part A4) and pandas' SettingWithCopyWarning (companion DE
+	notepad Part H1) -- know explicitly, for any given indexing operation, whether you're looking
+	at a view or a copy before relying on (or being surprised by) whether a mutation propagates.
+======================================================================================================================================================
+A5. Core operations for ML work
+
+	arr.reshape(new_shape)          -- changes shape WITHOUT changing data (must have the same
+	                                     total element count) -- returns a VIEW where possible.
+	arr.T / np.transpose(arr)       -- transpose (swap axes).
+	a @ b  (or np.matmul(a, b))     -- matrix multiplication (NOT `a * b`, which is ELEMENT-WISE
+	                                     multiplication -- a genuinely common beginner mix-up: `*`
+	                                     is Hadamard/element-wise, `@` is true matrix multiply).
+	np.einsum('ij,jk->ik', a, b)   -- Einstein summation notation -- a general, sometimes-faster,
+	                                     often-clearer way to express complex tensor contractions
+	                                     (batched matrix multiplies, attention-score computations)
+	                                     once you're comfortable with the index notation -- worth
+	                                     recognizing in code you're reading even if you don't
+	                                     write it from scratch often.
+======================================================================================================================================================
+A6. Random seeds & reproducibility
+
+	np.random.seed(42)              -- legacy global-state seeding (still extremely common in
+	                                     practice, but shares global mutable state across your
+	                                     WHOLE program -- a library you import could silently
+	                                     reset/consume from the same global state).
+	rng = np.random.default_rng(42)  -- the MODERN, recommended approach: an explicit, isolated
+	rng.random(5)                       random generator OBJECT, not shared global state -- safer
+	                                     in larger codebases/notebooks with multiple contributors.
+	Reproducibility in ML requires seeding EVERY source of randomness independently -- NumPy's
+	seed does NOT also seed Python's built-in `random` module, PyTorch's RNG (Part C), or CUDA's
+	GPU-level randomness -- a genuinely common cause of "I set a seed but my results still aren't
+	reproducible" confusion (see Part K1 for the full checklist).
+======================================================================================================================================================
+======================================================================================================================================================
+PART B -- CLASSICAL ML: SCIKIT-LEARN
+======================================================================================================================================================
+======================================================================================================================================================
+B1. The universal fit/predict/transform API
+
+	model = LogisticRegression()
+	model.fit(X_train, y_train)              # learns parameters from training data
+	predictions = model.predict(X_test)       # uses learned parameters on new data
+	scaler = StandardScaler()
+	scaler.fit(X_train)                        # learns mean/std FROM TRAINING DATA ONLY
+	X_train_scaled = scaler.transform(X_train)
+	X_test_scaled = scaler.transform(X_test)   # applies the SAME learned mean/std -- does NOT
+	                                               re-fit on the test set (Part B3's gotcha)
+	Every scikit-learn estimator/transformer follows this SAME shape (`fit`, `predict` or
+	`transform`, and `fit_transform` as a convenience combining both on the SAME data) -- learning
+	this ONE pattern lets you pick up any new sklearn class immediately.
+======================================================================================================================================================
+B2. Pipelines -- preventing preprocessing mistakes structurally, not just by discipline
+
+	from sklearn.pipeline import Pipeline
+	from sklearn.compose import ColumnTransformer
+	pipeline = Pipeline([
+	    ('scaler', StandardScaler()),
+	    ('model', LogisticRegression())
+	])
+	pipeline.fit(X_train, y_train)            # fits the scaler AND the model, in order, using
+	                                              ONLY X_train
+	pipeline.predict(X_test)                   # applies the ALREADY-FITTED scaler's transform,
+	                                              then the model's predict -- structurally
+	                                              impossible to accidentally leak test-set
+	                                              statistics into the scaler this way
+	`ColumnTransformer` extends this to apply DIFFERENT preprocessing to different COLUMNS (e.g.
+	scale numeric columns, one-hot-encode categorical columns) within one combined pipeline
+	object. Wrapping preprocessing + model together in a Pipeline is the single best STRUCTURAL
+	defense against the data-leakage gotcha in B3 -- it's not just cleaner code, it makes the
+	leakage bug structurally harder to write by accident.
+======================================================================================================================================================
+B3. Data leakage via train/test split ordering -- THE single most common classical-ML interview
+    gotcha, know this cold
+
+	WRONG (leaks test-set information into preprocessing):
+		scaler = StandardScaler()
+		X_scaled = scaler.fit_transform(X)              # fit on the WHOLE dataset, incl. test rows
+		X_train, X_test = train_test_split(X_scaled, ...)
+	The scaler's mean/std now reflect the TEST SET too -- the model's evaluation on that test set
+	is now OPTIMISTICALLY BIASED, because information about the test set's distribution leaked
+	into how the training data was preprocessed, in a way that wouldn't be available in genuine
+	production use (where you don't have future/test data available at training time).
+	CORRECT (split FIRST, fit only on train):
+		X_train, X_test = train_test_split(X, ...)
+		scaler = StandardScaler()
+		scaler.fit(X_train)                              # fit ONLY on train
+		X_train_scaled = scaler.transform(X_train)
+		X_test_scaled = scaler.transform(X_test)           # transform test using train's learned stats
+	This EXACT gotcha (fit preprocessing before splitting) is a near-guaranteed thing an
+	interviewer will probe for, either by asking directly or by planting it in a "spot the bug in
+	this code" exercise. The general PRINCIPLE worth stating: ANY step that "learns" something
+	from data (scaling, imputation, feature selection, encoding category frequencies) must be
+	FIT only on training data, and merely APPLIED (transform) to validation/test data -- this
+	generalizes to the SAME point-in-time-correctness principle covered in both companion AI
+	notepads' Feature Store discussions (Databricks AI notepad Part I2, Snowflake AI notepad Part
+	D2) -- don't let information "from the future" (relative to what you're predicting) leak into
+	what a model learns from.
+======================================================================================================================================================
+B4. Cross-validation
+
+	from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score
+	KFold(n_splits=5)                 -- splits data into 5 folds, trains on 4, validates on 1,
+	                                      rotating which fold is held out -- gives a more robust
+	                                      performance ESTIMATE than a single train/test split,
+	                                      especially on smaller datasets.
+	StratifiedKFold(n_splits=5)       -- like KFold, but PRESERVES the class-label proportions in
+	                                      each fold -- CRITICAL for imbalanced classification
+	                                      problems (e.g. 95%/5% class split) -- plain KFold could,
+	                                      by chance, put almost none of the minority class into a
+	                                      given fold's validation set, producing a wildly
+	                                      misleading metric for that fold. Know to reach for
+	                                      Stratified specifically when classes are imbalanced.
+======================================================================================================================================================
+B5. Common estimators -- quick reference (know the CATEGORY, not necessarily every hyperparameter)
+
+	Linear/Logistic Regression -- simple, interpretable, fast, a good baseline.
+	Decision Tree / Random Forest / Gradient Boosting (XGBoost/LightGBM/CatBoost -- the dominant
+	  choice for tabular data in real practice, frequently outperforming deep learning on
+	  structured/tabular problems specifically) -- handle non-linearity, feature interactions,
+	  mixed feature types well, less sensitive to feature scaling than linear models.
+	SVM -- effective in high-dimensional spaces, less common as a default choice in 2026 practice
+	  than gradient-boosted trees for tabular data, still relevant for certain smaller/specialized problems.
+	K-Means / DBSCAN -- unsupervised clustering.
+	PCA -- dimensionality reduction, also useful for visualization/understanding variance structure.
+======================================================================================================================================================
+B6. Evaluation metrics -- know when each is appropriate, not just the formula
+
+	ACCURACY -- misleading on IMBALANCED data (a model predicting "not fraud" for every single
+	  transaction can be 99% "accurate" on a dataset that's 99% non-fraud, while being completely
+	  useless) -- a classic interview trap: "is accuracy a good metric here?" -- almost always
+	  "depends on class balance," not a blind yes.
+	PRECISION -- of everything the model FLAGGED as positive, what fraction was actually positive
+	  (minimizes FALSE POSITIVES -- important when a false alarm is costly, e.g. flagging a
+	  legitimate transaction as fraud and blocking a real customer).
+	RECALL -- of everything that WAS actually positive, what fraction did the model catch
+	  (minimizes FALSE NEGATIVES -- important when missing a true positive is costly, e.g. missing
+	  an actual fraudulent transaction or a real disease case).
+	F1 SCORE -- harmonic mean of precision and recall -- a single number balancing both, useful
+	  when you need ONE metric but care about both types of error.
+	CONFUSION MATRIX -- the full breakdown (true positive/false positive/true negative/false
+	  negative counts) underneath all of the above -- the right first thing to look at before
+	  picking a single summary metric.
+	ROC-AUC -- measures ranking quality across ALL possible classification thresholds, not tied
+	  to one specific threshold choice -- useful for comparing models independent of where you'll
+	  eventually set the decision threshold in production.
+	Interview-ready framing: "which metric do you optimize for" always comes back to the BUSINESS
+	COST of each error type (false positive vs false negative) -- stating this trade-off
+	explicitly, rather than reciting formulas, is what separates a senior-level answer.
+======================================================================================================================================================
+======================================================================================================================================================
+PART C -- DEEP LEARNING: PYTORCH (the dominant framework as of 2026)
+======================================================================================================================================================
+======================================================================================================================================================
+C1. Tensors -- NumPy arrays, plus GPU support and autograd
+
+	import torch
+	x = torch.tensor([1.0, 2.0, 3.0])
+	x.shape / x.dtype                       -- same concepts as NumPy (Part A1), deliberately
+	                                            similar API for easy transfer of NumPy intuition.
+	The TWO things a PyTorch tensor adds beyond a NumPy array: it can live on a GPU (`.to('cuda')`,
+	C6) for massively parallel computation, and it can track GRADIENTS for automatic
+	differentiation (`requires_grad=True`, C2) -- these two capabilities are the entire reason
+	PyTorch (or any deep learning framework) exists rather than just using NumPy for everything.
+======================================================================================================================================================
+C2. Autograd -- automatic differentiation, the mechanism underneath all of deep learning training
+
+	x = torch.tensor(2.0, requires_grad=True)
+	y = x ** 2 + 3 * x
+	y.backward()                              # computes dy/dx via the chain rule, automatically
+	x.grad                                     # tensor(7.0)  -- dy/dx = 2x + 3 = 2(2)+3 = 7
+	PyTorch builds a COMPUTATIONAL GRAPH dynamically as operations execute (tracking every
+	operation performed on any tensor with `requires_grad=True`), then `.backward()` walks that
+	graph BACKWARDS applying the chain rule automatically -- this is literally what "backpropagation"
+	IS, mechanically: reverse-mode automatic differentiation over a recorded computation graph.
+	`torch.no_grad()` (a context manager, companion DE notepad Part C6) or `.detach()` -- used
+	during INFERENCE/evaluation, or whenever you want to do a tensor operation WITHOUT it being
+	tracked for gradient computation (saves memory/compute, since PyTorch doesn't need to retain
+	the graph for operations you'll never call `.backward()` through):
+		with torch.no_grad():
+		    predictions = model(x_test)          # no gradient tracking needed for pure inference
+	GOTCHA: forgetting `torch.no_grad()` during evaluation/inference doesn't produce WRONG
+	results, but wastes memory/compute retaining a graph you'll never backprop through -- a real,
+	common performance oversight, not just a style nitpick.
+======================================================================================================================================================
+C3. The canonical PyTorch training loop -- memorize this shape cold, it's asked constantly
+
+	model.train()                                    # sets modules like Dropout/BatchNorm to
+	                                                     TRAINING behavior (see the gotcha below)
+	for epoch in range(num_epochs):
+	    for batch_x, batch_y in train_loader:          # Part C5
+	        optimizer.zero_grad()                       # 1. clear gradients from the PREVIOUS step
+	        outputs = model(batch_x)                    # 2. forward pass
+	        loss = loss_fn(outputs, batch_y)             # 3. compute loss
+	        loss.backward()                              # 4. backward pass -- computes gradients
+	        optimizer.step()                             # 5. update weights using those gradients
+
+	GOTCHA #1 (extremely common, a real bug in rushed code): FORGETTING `optimizer.zero_grad()`.
+	PyTorch ACCUMULATES gradients by default (`.backward()` ADDS to existing `.grad` values rather
+	than replacing them) -- without zeroing first, each step's gradient gets contaminated by every
+	PREVIOUS step's gradient too, silently corrupting training (this accumulation behavior is
+	actually a DELIBERATE feature, used intentionally for gradient accumulation across
+	multiple mini-batches when you want a larger effective batch size than fits in memory at once
+	-- but it's a footgun if you forget to zero it when you DON'T want accumulation).
+	GOTCHA #2: forgetting `model.eval()` before evaluation/inference (and forgetting to switch
+	BACK to `model.train()` before resuming training). Certain layers (Dropout, BatchNorm)
+	behave DIFFERENTLY during training vs. evaluation -- Dropout randomly zeroes activations
+	during training but should NOT during inference; BatchNorm uses per-batch statistics during
+	training but RUNNING/accumulated statistics during evaluation. Forgetting `.eval()` silently
+	produces WORSE/inconsistent inference results without any error being raised -- a genuinely
+	common, hard-to-spot production bug.
+======================================================================================================================================================
+C4. `nn.Module` -- building a custom model
+
+	import torch.nn as nn
+	class SimpleNet(nn.Module):
+	    def __init__(self):
+	        super().__init__()
+	        self.layer1 = nn.Linear(784, 128)
+	        self.relu = nn.ReLU()
+	        self.layer2 = nn.Linear(128, 10)
+	    def forward(self, x):
+	        x = self.relu(self.layer1(x))
+	        return self.layer2(x)
+	Every custom model subclasses `nn.Module`, defines its LAYERS in `__init__`, and defines the
+	actual COMPUTATION in `forward()` -- you call `model(x)`, NOT `model.forward(x)` directly
+	(calling the module instance triggers additional PyTorch bookkeeping -- hooks, etc. -- around
+	the actual forward call; calling `.forward()` directly bypasses that machinery, a subtle
+	footgun worth knowing about even if you rarely hit it in practice).
+======================================================================================================================================================
+C5. `Dataset` and `DataLoader` -- batching, shuffling, parallel loading
+
+	from torch.utils.data import Dataset, DataLoader
+	class MyDataset(Dataset):
+	    def __len__(self): return len(self.data)
+	    def __getitem__(self, idx): return self.data[idx], self.labels[idx]
+	loader = DataLoader(MyDataset(...), batch_size=32, shuffle=True, num_workers=4)
+	`Dataset` defines HOW to get one item; `DataLoader` wraps it to produce shuffled, batched
+	tensors automatically, and `num_workers > 0` uses SEPARATE PROCESSES (companion DE notepad
+	Part G3's multiprocessing, not threading -- data loading/augmentation is often CPU-bound work
+	that benefits from true process-level parallelism) to prefetch/prepare the NEXT batch while
+	the GPU is still busy computing on the CURRENT one, keeping the GPU fed instead of idle
+	waiting on data.
+======================================================================================================================================================
+C6. Device management -- CPU vs GPU
+
+	device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+	model = model.to(device)
+	batch_x = batch_x.to(device)
+	GOTCHA: a model and the data it's operating on must be on the SAME device -- a common,
+	immediate-crash error is calling a GPU-resident model on CPU-resident data (or vice versa).
+	Silently falling back to CPU (rather than erroring) can also happen if you request a CUDA
+	version that doesn't match your installed NVIDIA driver -- always verify with
+	`torch.cuda.is_available()` after any environment change, don't assume GPU usage just because
+	you wrote `.to('cuda')` somewhere.
+======================================================================================================================================================
+C7. `torch.compile` -- production-relevant performance, current as of 2026
+
+	compiled_model = torch.compile(model)                  # or @torch.compile as a decorator
+	JIT-compiles PyTorch code (tracing via TorchDynamo, optimizing via TorchInductor) into fused,
+	optimized kernels -- often just ONE line of code for a real speedup, with NO manual kernel-
+	writing needed. By PyTorch 2.6, `torch.compile` is described as PRODUCTION-STABLE specifically
+	for LLM INFERENCE, with real benchmarked gains (roughly 35-40% time-to-first-token improvement
+	and 25-30% throughput improvement at batch size 32 in published 2026 benchmarks) via KERNEL
+	FUSION (combining many small GPU kernel launches into fewer, larger ones -- meaningful because
+	eager-mode PyTorch launches one kernel PER OPERATION, and a single forward pass through even a
+	modest transformer issues thousands of small kernel launches, each with real CPU-side dispatch
+	overhead) plus CUDA GRAPH capture (eliminating per-step launch overhead entirely once the
+	compiled graph is stable). PyTorch is up to version 2.11 as of March 2026, with `torch.compile`,
+	ExecuTorch (edge/mobile deployment), and expanded AMD/Apple Silicon hardware support alongside
+	NVIDIA as ongoing areas of active development.
+	Practical gotcha: the FIRST call after compiling incurs a real compilation delay (commonly
+	30-90 seconds for LLM-scale models) before the optimized, fast path kicks in on SUBSEQUENT
+	calls -- fine for a long-running service, a real consideration for short-lived scripts/jobs
+	where that warm-up cost might dominate total runtime.
+======================================================================================================================================================
+C8. Mixed precision training
+
+	Training in lower precision (FP16 or, increasingly preferred, BF16 -- better numerical range/
+	stability than FP16) instead of full FP32 roughly HALVES memory usage and can meaningfully
+	speed up training on GPUs with hardware support for lower-precision math (modern NVIDIA
+	Tensor Cores), with automatic loss-scaling (`torch.cuda.amp` / `torch.autocast`) handling the
+	numerical-stability risk of very small gradient values underflowing to zero in lower precision.
+	Standard, near-default practice for training/fine-tuning any reasonably large model in 2026 --
+	worth knowing it exists and roughly WHY (memory + speed, with a stability safeguard), even if
+	you're not manually tuning the loss-scaling parameters yourself.
+======================================================================================================================================================
+C9. Debugging tensor shape mismatches -- a genuinely practical, extremely common day-to-day skill
+
+	The single most common PyTorch runtime error in practice is a shape mismatch inside a matrix
+	multiply or a loss function. Practical debugging approach worth stating explicitly: print
+	`.shape` at EVERY intermediate step when something breaks (`print(x.shape)` after each layer)
+	rather than staring at the final error message alone -- PyTorch's error messages tell you
+	WHICH operation failed and what the incompatible shapes were, but not WHICH LAYER upstream
+	produced the wrong shape in the first place; tracing shapes forward through the model is the
+	fastest way to localize the actual root cause.
+======================================================================================================================================================
+C10. Saving and loading models
+
+	torch.save(model.state_dict(), 'model.pt')          # RECOMMENDED: save just the learned
+	                                                        weights/parameters (a dict of tensor
+	                                                        names -> values)
+	model = SimpleNet()                                    # re-create the ARCHITECTURE in code first
+	model.load_state_dict(torch.load('model.pt'))          # then load the saved weights into it
+	GOTCHA: saving the WHOLE model object (`torch.save(model, 'model.pt')`) instead of just its
+	`state_dict()` ties the saved file to the EXACT class definition/file structure that existed
+	at save time -- if you refactor/move the model class later, loading an old whole-model save
+	can break in confusing ways. Saving just the `state_dict` (weights only) and re-instantiating
+	the architecture in code is the more robust, standard-recommended pattern.
+======================================================================================================================================================
+======================================================================================================================================================
+PART D -- THE HUGGING FACE ECOSYSTEM
+======================================================================================================================================================
+======================================================================================================================================================
+D1. `transformers` -- the standard library for pretrained models
+
+	from transformers import pipeline
+	classifier = pipeline("sentiment-analysis")
+	classifier("I love this product!")                    # quick, zero-boilerplate inference
+
+	from transformers import AutoModel, AutoTokenizer
+	tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+	model = AutoModel.from_pretrained("bert-base-uncased")
+	The `Auto*` classes (`AutoModel`, `AutoTokenizer`, `AutoModelForSequenceClassification`, etc.)
+	automatically resolve to the RIGHT underlying model/tokenizer architecture just from the
+	model-name string, without you needing to know/import the specific class for every different
+	model family -- the standard, idiomatic entry point for loading essentially any model from the
+	Hugging Face Hub.
+======================================================================================================================================================
+D2. Tokenization gotchas -- padding, truncation, attention masks
+
+	inputs = tokenizer(texts, padding=True, truncation=True, max_length=512, return_tensors="pt")
+	PADDING -- sentences in a batch have DIFFERENT lengths, but a tensor needs a UNIFORM shape --
+	  shorter sequences get padded (with a special pad token) up to the batch's longest sequence
+	  (or a fixed `max_length`).
+	ATTENTION MASK -- a companion tensor marking which tokens are REAL content (1) vs PADDING (0)
+	  -- the model uses this to IGNORE padding tokens during attention computation. GOTCHA:
+	  forgetting to pass the attention mask (or a library defaulting it incorrectly) can let a
+	  model attend to meaningless padding tokens, subtly corrupting results without necessarily
+	  crashing -- always confirm the attention mask is being passed through correctly, especially
+	  in custom training loops that don't use a high-level `pipeline()`/`Trainer` wrapper.
+	TRUNCATION -- sequences longer than `max_length` get CUT -- silently losing content past that
+	  point, directly analogous to the context-window truncation concern in both companion AI
+	  notepads (Databricks AI notepad Part I13, Snowflake AI notepad's LLM-inference-parameters section).
+======================================================================================================================================================
+D3. `datasets` -- loading and streaming large datasets efficiently
+
+	from datasets import load_dataset
+	ds = load_dataset("imdb", split="train")
+	ds = ds.map(lambda x: tokenizer(x["text"], truncation=True), batched=True)
+	Built on Apache Arrow underneath (the SAME columnar in-memory format the companion DE notepad's
+	PyArrow section describes, Python-for-DE notepad Part H4) -- memory-mapped, so datasets far
+	larger than RAM can be used without loading everything into memory at once, similar in spirit
+	to the generator/lazy-evaluation philosophy throughout the companion DE notepad (Part C1, Part
+	H3's Polars lazy API). `streaming=True` on `load_dataset` goes further, never materializing
+	the full dataset locally at all, iterating it like a generator directly from the source.
+======================================================================================================================================================
+D4. `accelerate` -- hardware-agnostic distributed/mixed-precision training
+
+	from accelerate import Accelerator
+	accelerator = Accelerator()
+	model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+	...
+	accelerator.backward(loss)          # instead of loss.backward() directly
+	Abstracts away the boilerplate of running the SAME training loop code across different
+	hardware setups (single GPU, multi-GPU, multi-node, with or without mixed precision) with
+	MINIMAL code changes -- you write approximately the same training loop as C3, and `accelerate`
+	handles distributing it appropriately for whatever hardware is actually available at
+	run time, without hand-writing separate code paths for each scenario.
+======================================================================================================================================================
+D5. `peft` -- Parameter-Efficient Fine-Tuning (LoRA/QLoRA in code)
+
+	from peft import LoraConfig, get_peft_model
+	lora_config = LoraConfig(r=8, lora_alpha=16, target_modules=["q_proj","v_proj"], lora_dropout=0.05)
+	model = get_peft_model(base_model, lora_config)
+	model.print_trainable_parameters()          # typically shows well under 1% of the FULL
+	                                                model's parameters are actually trainable
+	LoRA (Low-Rank Adaptation) freezes the ENTIRE base model's original weights and injects small,
+	trainable "adapter" matrices into specific layers (commonly the attention projection layers) --
+	dramatically reducing the number of trainable parameters (and therefore memory/compute needed)
+	versus full fine-tuning, while still achieving competitive task performance for many use
+	cases. QLoRA extends this by additionally QUANTIZING the frozen base model to 4-bit precision
+	(D6) before applying LoRA adapters on top -- fine-tuning a genuinely large model on a single,
+	comparatively modest GPU becomes feasible. Directly relevant to (and the underlying, portable-
+	Python-library mechanism behind) both companion notepads' platform-level fine-tuning features
+	(Databricks AI notepad's Cortex Training equivalent discussion, Snowflake AI notepad Part D8's
+	Cortex Training) -- those platform features are largely managed wrappers AROUND this same
+	underlying LoRA/PEFT technique.
+======================================================================================================================================================
+D6. Quantization -- `bitsandbytes` and friends
+
+	from transformers import BitsAndBytesConfig
+	bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
+	model = AutoModelForCausalLM.from_pretrained(model_name, quantization_config=bnb_config)
+	Loading a model's weights in a LOWER PRECISION (8-bit or 4-bit integers, instead of the
+	original 16/32-bit floating point) dramatically reduces the MEMORY footprint needed to even
+	LOAD a large model (a model that needs ~28GB in FP16 might fit in ~7GB at 4-bit), at some cost
+	to numerical precision/quality -- often a genuinely worthwhile trade-off for running a large
+	open model on limited hardware, and the standard companion technique to LoRA/QLoRA (D5) for
+	fine-tuning large models affordably.
+======================================================================================================================================================
+D7. The Hub pattern, and a real security caveat
+
+	`from_pretrained("org/model-name")` downloads (and caches locally) a model/tokenizer's weights
+	and config directly from the Hugging Face Hub. GOTCHA worth knowing: some models on the Hub
+	require `trust_remote_code=True` to load, because they ship CUSTOM PYTHON CODE (not just
+	weights) that gets EXECUTED on your machine at load time -- only set this flag for models
+	from sources you genuinely trust, since it's a real, direct arbitrary-code-execution surface,
+	not just a bureaucratic warning to click through.
+======================================================================================================================================================
+======================================================================================================================================================
+PART E -- WORKING WITH LLM APIS (OpenAI, Anthropic)
+======================================================================================================================================================
+======================================================================================================================================================
+E1. OpenAI Python SDK -- the standard pattern
+
+	from openai import OpenAI
+	client = OpenAI()
+	response = client.chat.completions.create(
+	    model="gpt-5.1", messages=[{"role": "user", "content": "Summarize this: ..."}]
+	)
+	print(response.choices[0].message.content)
+	STREAMING (token-by-token, for a responsive UX rather than waiting for the full response):
+		stream = client.chat.completions.create(..., stream=True)
+		for chunk in stream:
+		    print(chunk.choices[0].delta.content or "", end="")
+======================================================================================================================================================
+E2. Anthropic Python SDK -- the standard pattern (structurally similar, some naming differences)
+
+	import anthropic
+	client = anthropic.Anthropic()
+	response = client.messages.create(
+	    model="claude-...", max_tokens=1024,
+	    messages=[{"role": "user", "content": "Summarize this: ..."}]
+	)
+	print(response.content[0].text)
+	TOOL USE (the Anthropic term for function/tool calling) is expressed via a `tools` parameter
+	describing available tools' names/schemas -- the model's response includes a `tool_use`
+	content block when it wants to call one, which your code executes and feeds back as a
+	`tool_result` in the next turn -- the concrete Python-code shape of the "tool calling" concept
+	both companion AI notepads describe at the platform/conceptual level (Databricks AI notepad
+	Part D1, Snowflake AI notepad Part E1).
+======================================================================================================================================================
+E3. Structured outputs -- native schema enforcement vs the `instructor` library pattern
+
+	Both major providers now support NATIVE structured/schema-constrained output (a `response_format`
+	/ schema parameter forcing the model's output to conform to a JSON schema you provide) --
+	directly analogous to both companion AI notepads' "structured outputs" discussions (Databricks
+	AI notepad Part I6, Snowflake AI notepad Part B1's AI_COMPLETE responseFormat parameter) at
+	the platform-AI-function layer -- here it's the same concept at the raw-API-client layer.
+	The `instructor` library is a widely-used, POPULAR third-party wrapper that layers PYDANTIC
+	models (companion DE notepad Part E4) directly onto this same underlying capability, giving
+	you a fully Pythonic, type-checked response object instead of raw JSON to parse yourself:
+		import instructor
+		from pydantic import BaseModel
+		client = instructor.from_openai(OpenAI())
+		class Extraction(BaseModel):
+		    vendor: str
+		    amount: float
+		result = client.chat.completions.create(
+		    model="gpt-5.1", response_model=Extraction,
+		    messages=[{"role": "user", "content": invoice_text}]
+		)
+		result.vendor, result.amount                  # a genuine, validated Python object, not raw JSON
+	This is exactly the pattern that turns an LLM call into something you can RELIABLY feed into a
+	downstream data pipeline (companion DE notepad's dataclass/Pydantic discussion, Parts D2/E4) --
+	structured, typed, validated -- instead of hoping raw text output happens to parse correctly.
+======================================================================================================================================================
+E4. Async clients -- for concurrent LLM calls (cross-ref companion DE notepad Part G5's asyncio)
+
+	from openai import AsyncOpenAI
+	client = AsyncOpenAI()
+	async def get_completion(prompt):
+	    return await client.chat.completions.create(model="...", messages=[{"role":"user","content":prompt}])
+	results = await asyncio.gather(*[get_completion(p) for p in prompts])
+	LLM API calls are the textbook I/O-bound workload (companion DE notepad Part G1's decision
+	framework) -- waiting on a network round-trip to a model provider -- making `asyncio` (or
+	threading) the correct tool for running MANY calls concurrently, exactly as described generically
+	in the companion DE notepad, just applied specifically to LLM API traffic here.
+======================================================================================================================================================
+E5. Rate limits & retries for LLM APIs specifically
+
+	LLM provider APIs enforce BOTH request-count rate limits AND token-throughput rate limits
+	(and sometimes a separate "requests per minute" vs "tokens per minute" cap) -- a batch job
+	firing many concurrent requests needs the SAME rate-limiting/semaphore pattern described
+	generically in the companion DE notepad (Part G6), plus RETRY logic (companion DE notepad
+	Part F3's `tenacity` pattern) specifically watching for HTTP 429 (rate limited) responses and
+	backing off accordingly -- both provider SDKs' official client libraries include SOME built-in
+	retry behavior for transient errors, but a high-volume batch pipeline typically still needs an
+	explicit outer retry/backoff/rate-limiting layer of its own, directly mirroring the companion
+	AI notepads' "batch LLM inference at scale" operational guidance (Databricks AI notepad Part
+	I7, Snowflake AI notepad's batch-processing guidance Part B9) -- same operational discipline,
+	expressed here as raw Python code instead of a managed platform feature.
+======================================================================================================================================================
+E6. Token counting
+
+	`tiktoken` (OpenAI's own tokenizer library) lets you count tokens LOCALLY, without an API
+	call, before sending a request -- useful for pre-emptively checking you're within a model's
+	context window (companion AI notepads' context-window discussions) and for ESTIMATING cost
+	before actually making an expensive call, the direct Python-library equivalent of the
+	Snowflake AI notepad's AI_COUNT_TOKENS() SQL function.
+======================================================================================================================================================
+======================================================================================================================================================
+PART F -- BUILDING RAG PIPELINES IN PYTHON
+======================================================================================================================================================
+======================================================================================================================================================
+F1. Embedding models
+
+	from sentence_transformers import SentenceTransformer
+	model = SentenceTransformer('all-MiniLM-L6-v2')
+	embeddings = model.encode(["some text", "more text"])       # returns numpy arrays
+	`sentence-transformers` is the standard OPEN-SOURCE library for generating embeddings LOCALLY
+	(no API call needed) -- an alternative to calling OpenAI's/Cohere's hosted embedding APIs
+	directly, useful when you want to avoid per-call cost/latency, or need embeddings to run fully
+	offline/on-prem.
+======================================================================================================================================================
+F2. Vector database client libraries
+
+	FAISS (Facebook AI Similarity Search) -- a LOCAL, in-process library (not a hosted database)
+	  for extremely fast approximate-nearest-neighbor search over embeddings -- the standard
+	  choice for prototyping/smaller-scale RAG entirely in a single Python process, no separate
+	  service to run.
+	Chroma -- a lightweight, easy-to-run VECTOR DATABASE (can run embedded in-process OR as a
+	  separate service) -- a very common "getting started with real RAG" choice, sitting between
+	  FAISS's pure-library simplicity and a full managed vector DB.
+	Pinecone / Weaviate / pgvector (a Postgres EXTENSION, notably usable directly inside the
+	  companion notepads' Lakebase/Snowflake Postgres, Databricks platform notepad Part H1) --
+	  managed or self-hosted vector database SERVICES, for production-scale RAG needing
+	  persistence, replication, and a real client-server architecture beyond a single process.
+	Both companion AI notepads' managed Vector Search products (Databricks AI notepad Part B5,
+	Snowflake AI notepad Part C3) are the PLATFORM-managed equivalent of hand-wiring one of these
+	libraries yourself -- know both the raw-library layer (this Part) and the managed-platform
+	layer (companion notepads) since interviews can probe either.
+======================================================================================================================================================
+F3. Chunking strategies in code
+
+	from langchain_text_splitters import RecursiveCharacterTextSplitter
+	splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+	chunks = splitter.split_text(long_document)
+	RECURSIVE character/token splitting tries progressively SMALLER separators (paragraphs, then
+	sentences, then words) to keep chunks close to a target size WITHOUT cutting mid-sentence
+	where avoidable -- the standard, practical default. CHUNK OVERLAP (a small amount of shared
+	text between consecutive chunks) helps preserve context that would otherwise be split awkwardly
+	right at a chunk boundary. SEMANTIC chunking (splitting based on actual meaning/topic shifts,
+	using embeddings to detect where the topic changes, rather than a fixed character count) is a
+	more sophisticated, sometimes-better-quality alternative worth knowing exists, at the cost of
+	more compute to compute chunk boundaries in the first place. Same underlying concept as both
+	companion AI notepads' chunking discussions (Databricks AI notepad Part B3, referenced
+	conceptually in the Snowflake AI notepad too) -- here at the concrete code-library level.
+======================================================================================================================================================
+F4. The RAG pipeline anatomy, end to end in code
+
+	# 1. INDEX (offline, done once / incrementally as documents change)
+	chunks = splitter.split_text(document)
+	chunk_embeddings = embed_model.encode(chunks)
+	vector_db.add(chunk_embeddings, chunks)
+
+	# 2. RETRIEVE (at query time)
+	query_embedding = embed_model.encode([user_question])
+	relevant_chunks = vector_db.search(query_embedding, top_k=5)
+
+	# 3. AUGMENT + GENERATE
+	context = "\n\n".join(relevant_chunks)
+	prompt = f"Answer using ONLY this context:\n{context}\n\nQuestion: {user_question}"
+	answer = llm_client.chat.completions.create(model="...", messages=[{"role":"user","content":prompt}])
+	This three-stage shape (Index -> Retrieve -> Augment+Generate) is worth being able to draw out
+	and narrate cleanly in an interview -- it's the SAME conceptual pipeline underneath every
+	managed RAG product in both companion AI notepads (Cortex Search + AI_COMPLETE on Snowflake,
+	Vector Search + Foundation Model APIs on Databricks), just with the platform doing steps 1-2
+	for you there instead of hand-wiring them as shown here.
+======================================================================================================================================================
+F5. Hybrid search -- combining semantic + keyword search in code
+
+	Pure vector/semantic search can miss EXACT matches (a specific product SKU, an error code, an
+	acronym) that a plain keyword search would nail immediately (the same gotcha both companion
+	AI notepads flag, Snowflake AI notepad Part I5/C3). A hybrid approach runs BOTH a vector
+	similarity search AND a traditional keyword search (e.g. BM25, via a library like `rank_bm25`
+	or a vector DB's own built-in hybrid mode), then COMBINES/RE-RANKS the two result sets
+	(commonly via Reciprocal Rank Fusion, a simple, effective, parameter-light method for merging
+	two differently-scored ranked lists into one) -- worth knowing this exists as the standard fix
+	for pure-semantic-search's exact-match blind spot, and that several managed platforms (e.g.
+	Snowflake's Cortex Search) now provide this hybrid behavior BUILT IN by default rather than
+	requiring you to hand-wire the fusion logic yourself.
+======================================================================================================================================================
+======================================================================================================================================================
+PART G -- BUILDING AGENTS IN PYTHON (the 2026 framework landscape)
+======================================================================================================================================================
+======================================================================================================================================================
+G1. The 2026 agent-framework landscape -- know the SHAPE of this space, not every framework in
+    exhaustive depth
+
+	Roughly a dozen production-relevant Python agent frameworks exist as of 2026, falling into a
+	few clear categories worth being able to name and compare:
+
+		LangGraph -- GRAPH-based, stateful orchestration (agent steps as NODES, edges control
+		  data flow/transitions) -- built-in persistence/CHECKPOINTING and human-in-the-loop
+		  support -- the go-to choice when an agent is genuinely a STATE MACHINE needing
+		  pause/resume, conditional branching, and durable state across steps. Part of the broader
+		  LangChain ecosystem.
+		OpenAI Agents SDK -- OpenAI's own lightweight, production-oriented framework, built around
+		  THREE core primitives: agents, HANDOFFS (one agent explicitly transfers control to
+		  another, carrying conversation context through the transition), and guardrails --
+		  minimal abstraction overhead, the fastest path to production if you're committed to the
+		  OpenAI model ecosystem specifically.
+		Claude Agent SDK (Anthropic) / Google ADK (Agent Development Kit) -- the equivalent
+		  FIRST-PARTY, vendor-native agent SDKs from Anthropic and Google respectively -- all
+		  three major model vendors shipped their own native agent SDK within roughly the same
+		  window in 2025-2026, a genuinely notable industry convergence (mirrors the exact
+		  "vendor-native agent tooling" pattern both companion AI notepads describe at the
+		  PLATFORM level -- Genie/Agent Bricks on Databricks, CoWork/CoCo on Snowflake -- here it's
+		  the MODEL-PROVIDER-level equivalent).
+		PydanticAI -- TYPE-SAFE agents built around Pydantic (companion DE notepad Part E4)
+		  validated structured outputs -- the choice when reliable, strictly-typed output is
+		  non-negotiable and you want a Python-first (not YAML/config-heavy) developer experience.
+		CrewAI -- ROLE-based multi-agent collaboration (explicitly modeling agents as "planner,"
+		  "researcher," "writer" roles working together) -- a notably LOW learning curve; a
+		  working multi-agent system is genuinely achievable in roughly 20-50 lines of Python --
+		  the pragmatic choice when a workflow maps cleanly onto defined roles.
+		LlamaIndex -- grew from a pure RAG/data-indexing library into a full agent framework, but
+		  its center of gravity REMAINS data-heavy retrieval -- the strongest choice when an
+		  agent's hardest problem is genuinely "find the right facts across a huge, messy document
+		  corpus" rather than complex multi-step reasoning/orchestration.
+		AutoGen (Microsoft Research) / Semantic Kernel (Microsoft) -- AutoGen skews toward
+		  RESEARCH-grade multi-agent CONVERSATION patterns; Semantic Kernel is Microsoft's more
+		  enterprise-oriented equivalent, often the natural pick inside an Azure-committed stack.
+	Decision framework worth having ready: LangGraph for genuine state-machine complexity with
+	pause/resume needs; a vendor-native SDK (OpenAI/Claude/Google) when you're committed to that
+	model ecosystem and want minimal abstraction; PydanticAI when typed, validated output is the
+	top priority; CrewAI for role-based teams shipped fast; LlamaIndex when retrieval quality over
+	a large corpus is the hard part of the problem.
+======================================================================================================================================================
+G2. The tool/function-calling pattern in code -- the mechanism underneath every framework above
+
+	tools = [{
+	    "type": "function",
+	    "function": {
+	        "name": "get_weather",
+	        "description": "Get current weather for a city",
+	        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
+	    }
+	}]
+	response = client.chat.completions.create(model="...", messages=messages, tools=tools)
+	if response.choices[0].message.tool_calls:
+	    for call in response.choices[0].message.tool_calls:
+	        args = json.loads(call.function.arguments)
+	        result = dispatch_table[call.function.name](**args)         # actually EXECUTE the tool
+	        messages.append({"role": "tool", "tool_call_id": call.id, "content": str(result)})
+	    # send messages (now including the tool result) back to the model for a final answer
+	Every agent framework in G1 is, underneath its own abstractions, built on THIS raw mechanism:
+	describe available tools via a JSON SCHEMA, let the model decide to request a call, YOUR code
+	executes it (the model never runs code itself), feed the result back, repeat until the model
+	produces a final answer instead of another tool call. Understanding this raw loop is what lets
+	you debug/reason about ANY higher-level framework built on top of it, rather than only knowing
+	one framework's specific abstraction.
+======================================================================================================================================================
+G3. MCP (Model Context Protocol) -- the Python SDK layer
+
+	The OPEN, cross-vendor standard (companion AI notepads, Databricks AI notepad Part D2,
+	Snowflake AI notepad Part E2) for how an agent connects to external tools, now with an
+	official Python SDK for BOTH building an MCP SERVER (exposing your own tools/data to any
+	MCP-compatible agent) and an MCP CLIENT (consuming tools from someone else's MCP server):
+		from mcp.server import Server
+		server = Server("my-tools")
+		@server.tool()
+		async def query_database(sql: str) -> str:
+		    return run_query(sql)
+	Nearly every framework in G1 now documents MCP integration explicitly (PydanticAI documents
+	multiple MCP integration patterns; the OpenAI Agents SDK has explicit MCP docs) -- MCP has
+	become the DEFAULT, framework-agnostic way to expose/consume tools across this whole
+	ecosystem, rather than each framework inventing its own incompatible tool-definition format.
+======================================================================================================================================================
+G4. Multi-agent patterns in code
+
+	HANDOFF pattern (OpenAI Agents SDK's core primitive, G1) -- one agent explicitly transfers
+	  control to a DIFFERENT, more specialized agent, carrying the conversation context forward --
+	  a lightweight, explicit way to route between specialists without a heavyweight supervisor
+	  layer managing every hop.
+	SUPERVISOR/orchestrator pattern (the general pattern both companion AI notepads describe at
+	  the platform level, Databricks AI notepad Part D5, and which CrewAI/LangGraph both support
+	  in code) -- one top-level agent DECIDES which specialist sub-agent handles a given
+	  sub-task, and SYNTHESIZES their outputs into one final answer -- the more general, flexible
+	  (if slightly heavier) alternative to a simple handoff chain.
+	A2A (Agent-to-Agent protocol) -- a NEWER, complementary open standard (distinct from MCP, which
+	  is agent-to-TOOL) specifically for letting agents built on DIFFERENT frameworks discover and
+	  invoke EACH OTHER directly (e.g. a LangGraph agent invoking a CrewAI agent through a shared,
+	  standardized task interface) -- worth knowing this exists as the newest layer of the
+	  interoperability stack, alongside MCP, as of 2026.
+======================================================================================================================================================
+G5. Agent memory & state management in code
+
+	SHORT-TERM (conversation) memory -- typically just the running message history passed back
+	  into each API call (E1-E2) -- bounded by the context window (companion AI notepads), often
+	  summarized/truncated once it grows too large.
+	LONG-TERM memory (persisting facts/preferences ACROSS separate sessions) -- commonly
+	  implemented via embeddings + a vector store (F2), retrieving relevant past facts the same
+	  way RAG retrieves relevant documents (F4) -- OR via a low-latency key-value/relational store
+	  (directly analogous to both companion notepads' Lakebase/Snowflake-Postgres-as-agent-state-
+	  store discussions, Databricks platform notepad Part H1, Snowflake AI notepad Part I2/D2's
+	  online Feature Serving) for structured state that needs fast, precise lookups rather than
+	  semantic retrieval.
+	LangGraph's built-in CHECKPOINTING (G1) is a framework-native answer to persisting an agent's
+	FULL execution state (not just conversational memory) across a pause/resume boundary --
+	useful specifically for long-running, human-in-the-loop workflows where an agent might sit
+	idle for hours/days waiting on a human approval step before resuming exactly where it left off.
+======================================================================================================================================================
+======================================================================================================================================================
+PART H -- EVALUATING & TESTING AI SYSTEMS
+======================================================================================================================================================
+======================================================================================================================================================
+H1. Classical ML evaluation -- see Part B6 (accuracy/precision/recall/F1/ROC-AUC) -- the same
+    metrics apply here whenever a component of an AI system is a classical model (a classifier,
+    a ranking model) rather than an LLM.
+======================================================================================================================================================
+H2. LLM/RAG evaluation frameworks -- the Python-library layer underneath both companion AI
+    notepads' evaluation discussions
+
+	`ragas` -- purpose-built for evaluating RAG pipelines SPECIFICALLY, with metrics split exactly
+	  along the same retrieval-vs-generation line both companion AI notepads describe (Databricks
+	  AI notepad Part I17): FAITHFULNESS/groundedness (is the answer actually supported by the
+	  retrieved context), ANSWER RELEVANCY, CONTEXT PRECISION/RECALL (did retrieval find the right
+	  chunks) -- computed via LLM-as-judge techniques (H3) under the hood.
+	`DeepEval` -- a broader LLM-evaluation framework, structured explicitly to feel like `pytest`
+	  for LLM outputs (test-case/assertion-style API) -- lets you write LLM QUALITY tests
+	  alongside your normal test suite (companion DE notepad Part L).
+	`promptfoo` -- a tool specifically for comparing PROMPT/model variants side by side against a
+	  test dataset, useful for the "does this prompt change actually help" iteration loop.
+	All three are the portable, library-level equivalent of what both companion AI notepads
+	describe as a managed platform capability (MLflow 3's LLM judges/scorers on Databricks AI
+	notepad Part E2, `mlflow.genai.evaluate()`; Snowflake's evaluation discussion) -- know both
+	layers: the raw Python libraries (this Part) and the managed platform wrapper (companion notepads).
+======================================================================================================================================================
+H3. LLM-as-judge, implemented directly in code
+
+	def llm_judge(question, answer, context):
+	    judge_prompt = f"""Given this question, context, and answer, rate the answer's
+	    groundedness in the context on a scale of 1-5. Question: {question}
+	    Context: {context}
+	    Answer: {answer}
+	    Respond with ONLY a number 1-5."""
+	    response = client.chat.completions.create(model="...", messages=[{"role":"user","content":judge_prompt}])
+	    return int(response.choices[0].message.content.strip())
+	The core technique underneath `ragas`/`DeepEval`/both companion notepads' MLflow-judges and
+	Cortex-evaluation discussions -- use ANOTHER LLM call to SCORE a first LLM call's output
+	against a specific quality dimension, since a rule-based/exact-match check can't meaningfully
+	evaluate free-form text quality. Worth being able to write this pattern from scratch, not just
+	name-drop the libraries that wrap it.
+======================================================================================================================================================
+H4. Testing non-deterministic AI outputs -- a genuine, Python-testing-specific gotcha
+
+	A classic `assert result == expected_value` (companion DE notepad Part L1's pytest pattern)
+	DOESN'T work reliably for LLM output, since the same prompt can produce genuinely DIFFERENT
+	valid phrasings across calls (even at low temperature, companion AI notepads' inference-
+	parameters discussions). Practical testing strategies worth knowing: assert on STRUCTURED
+	properties instead of exact text (does a structured-output field, E3, have the right TYPE/
+	VALUE, rather than checking the raw text matches character-for-character); use an LLM-as-judge
+	assertion (H3) with a PASS/FAIL threshold rather than an exact-match assertion; and for
+	genuinely deterministic-output tests (e.g. testing that your OWN code correctly PARSES a
+	given LLM response, independent of what the LLM itself would say), MOCK the LLM call entirely
+	(companion DE notepad Part L2's mocking discussion) and feed a fixed, known response into your
+	parsing/downstream logic instead of calling a real, non-deterministic model in the test at all.
+======================================================================================================================================================
+======================================================================================================================================================
+PART I -- MLOPS & EXPERIMENT TRACKING IN PYTHON
+======================================================================================================================================================
+======================================================================================================================================================
+I1. MLflow -- the Python API layer (both companion AI notepads cover MLflow from the PLATFORM-
+    integration angle; here's the plain library usage)
+
+	import mlflow
+	with mlflow.start_run():
+	    mlflow.log_param("learning_rate", 0.01)
+	    mlflow.log_metric("accuracy", 0.94)
+	    mlflow.pytorch.log_model(model, "model")           # framework-specific flavors exist for
+	                                                           sklearn, pytorch, tensorflow, etc.
+	Works standalone (a local `mlruns` directory, or a self-hosted tracking server) just as well
+	as it does INSIDE Databricks (companion Databricks AI notepad Part A4) -- MLflow is itself an
+	independent, open-source project; Databricks' integration is a MANAGED, Unity-Catalog-governed
+	deployment of the same underlying open-source library and APIs.
+======================================================================================================================================================
+I2. Weights & Biases (`wandb`) -- the other dominant experiment tracker
+
+	import wandb
+	wandb.init(project="my-project", config={"lr": 0.01, "batch_size": 32})
+	wandb.log({"loss": loss.item(), "accuracy": acc})
+	Broadly comparable PURPOSE to MLflow (experiment tracking, comparing runs, logging metrics/
+	artifacts), with a strong reputation specifically for its rich, real-time dashboarding/
+	visualization UX and its popularity in the RESEARCH/deep-learning community specifically --
+	worth knowing it exists as the other major option alongside MLflow, since both show up
+	across real production and research codebases.
+======================================================================================================================================================
+I3. Configuration management for experiments
+
+	Beyond a plain dict or the companion DE notepad's dataclasses (Part D2), larger ML projects
+	commonly use a dedicated config framework like Hydra, which supports COMPOSING configs from
+	multiple smaller YAML files and OVERRIDING specific values from the command line without
+	editing any file (`python train.py model.lr=0.001 data.batch_size=64`) -- genuinely useful once
+	you're running many experiment VARIATIONS and don't want to hand-edit a config file for every
+	single run. For simpler projects, a `@dataclass`-based config object (companion DE notepad
+	Part D2) is often perfectly sufficient and avoids an extra dependency.
+======================================================================================================================================================
+======================================================================================================================================================
+PART J -- MODEL SERVING
+======================================================================================================================================================
+======================================================================================================================================================
+J1. FastAPI -- the dominant Python framework for serving ML/AI models
+
+	from fastapi import FastAPI
+	from pydantic import BaseModel
+	app = FastAPI()
+	class PredictionRequest(BaseModel):
+	    features: list[float]
+	@app.post("/predict")
+	def predict(request: PredictionRequest):               # Pydantic (companion DE notepad Part
+	    result = model.predict([request.features])            E4) validates the incoming request
+	    return {"prediction": result[0]}                       body automatically -- malformed
+	                                                            requests are rejected with a clear
+	                                                            error before your code even runs
+	FastAPI's tight Pydantic integration (automatic request/response VALIDATION + auto-generated
+	OpenAPI/Swagger docs from your type hints) plus NATIVE async support (companion DE notepad
+	Part G5 -- important for an LLM-serving endpoint that's mostly waiting on a model-inference
+	call, an I/O-bound-shaped wait even though the underlying work is GPU compute) has made it the
+	de facto standard for serving both classical ML models and LLM/GenAI applications in Python,
+	displacing Flask as the default choice for new ML-serving projects.
+======================================================================================================================================================
+J2. Streaming responses -- serving token-by-token output over HTTP
+
+	from fastapi.responses import StreamingResponse
+	@app.post("/chat")
+	async def chat(request: ChatRequest):
+	    async def token_stream():
+	        async for chunk in llm_client_stream(request.message):
+	            yield chunk.choices[0].delta.content or ""
+	    return StreamingResponse(token_stream(), media_type="text/event-stream")
+	Server-Sent Events (SSE) is the standard mechanism for streaming an LLM's tokens to a client
+	as they're generated (rather than making the user wait for the ENTIRE response before seeing
+	anything) -- combines the generator pattern (companion DE notepad Part C1) with FastAPI's
+	async support directly.
+======================================================================================================================================================
+J3. Batching requests for throughput
+
+	Serving requests ONE AT A TIME underutilizes a GPU (which is built for massive PARALLEL
+	throughput, not fast single-item latency) -- production LLM/model-serving systems commonly
+	BATCH multiple incoming requests together (waiting a small amount of time, or until a batch-
+	size threshold is hit, whichever comes first) before running one larger, more GPU-efficient
+	forward pass, then splitting results back out to each original requester -- a real throughput-
+	vs-latency trade-off (batching improves throughput/cost-efficiency but adds a small amount of
+	latency to any individual request while it waits to be grouped into a batch) worth being able
+	to articulate if asked how you'd scale a model-serving endpoint under load, directly analogous
+	to both companion AI notepads' batch-inference-at-scale discussions (Databricks AI notepad
+	Part I7) applied here at the raw-serving-infrastructure layer.
+======================================================================================================================================================
+J4. Model export formats (brief)
+
+	ONNX (Open Neural Network Exchange) -- a framework-agnostic model format letting a model
+	  trained in PyTorch (or another framework) be exported and run by a DIFFERENT, often faster/
+	  lighter-weight, inference-only runtime, without needing the full training framework
+	  installed at serving time -- relevant for edge/latency-sensitive deployment scenarios.
+	Worth knowing this exists as an option for "train in PyTorch, deploy somewhere leaner" needs,
+	without needing deep hands-on expertise unless a specific role calls for it.
+======================================================================================================================================================
+======================================================================================================================================================
+PART K -- COMMON GOTCHAS FOR AI ENGINEERS IN PYTHON (a consolidated, practical checklist)
+======================================================================================================================================================
+======================================================================================================================================================
+K1. Reproducibility -- seeding EVERY randomness source, not just one
+
+	True reproducibility requires seeding Python's built-in `random`, NumPy's RNG (Part A6),
+	AND PyTorch's RNG (`torch.manual_seed(seed)`), AND (for GPU work) CUDA's own RNG
+	(`torch.cuda.manual_seed_all(seed)`) -- setting only ONE of these and assuming full
+	reproducibility is a very common, incomplete-fix mistake. Even with ALL of these seeded,
+	certain GPU operations are NON-DETERMINISTIC by default for performance reasons (some CUDA
+	kernels use algorithms whose exact floating-point summation order can vary run to run) --
+	`torch.use_deterministic_algorithms(True)` forces fully deterministic (but sometimes slower)
+	behavior when bit-for-bit reproducibility genuinely matters (e.g. for debugging a suspected
+	training bug), at a real performance cost you wouldn't want to pay in normal production training.
+======================================================================================================================================================
+K2. Data leakage -- see Part B3 in full; the single highest-value classical-ML gotcha in this
+    entire handbook, worth a second mention here in the consolidated list given how often it's asked.
+======================================================================================================================================================
+K3. CUDA out-of-memory (OOM) errors -- causes and fixes
+
+	CAUSES: batch size too large for available GPU memory; not using `torch.no_grad()`/`.eval()`
+	  during inference (Part C2, unnecessarily retaining a computation graph); accumulating
+	  tensors that still hold gradient history in a Python list/variable across iterations
+	  without detaching them first (a classic memory-leak-shaped bug in a training loop); model
+	  simply too large for the available GPU.
+	FIXES, roughly in order of "least invasive to most invasive": reduce batch size; use mixed
+	  precision (Part C8, roughly halves memory use); use GRADIENT ACCUMULATION (accumulate
+	  gradients over several smaller mini-batches -- deliberately leaning on the gradient-
+	  accumulation behavior flagged as a gotcha in C3 -- before calling `optimizer.step()`,
+	  simulating a larger effective batch size without needing it to fit in memory all at once);
+	  use GRADIENT CHECKPOINTING (trade compute for memory by NOT storing every intermediate
+	  activation during the forward pass, recomputing them during the backward pass instead --
+	  slower per step, but uses meaningfully less memory); use quantization (Part D6) or a smaller
+	  model; or, ultimately, use more/bigger GPUs.
+======================================================================================================================================================
+K4. Tensor shape mismatches -- see Part C9's debugging approach; worth a second mention here as
+    genuinely the single most common day-to-day PyTorch error in practice.
+======================================================================================================================================================
+K5. Mutable default arguments in ML config objects specifically
+
+	The EXACT companion-DE-notepad gotcha (Part A1) shows up constantly in ML config/experiment
+	code specifically: `def __init__(self, layers=[128, 64]): ...` shares the SAME default list
+	across every instance that doesn't pass its own -- exactly as dangerous here as anywhere else
+	in Python, just worth flagging because ML config classes (model architecture definitions,
+	hyperparameter dataclasses) are a genuinely common place this bug shows up in practice, given
+	how often ML code defines classes with list/dict-shaped configuration defaults.
+======================================================================================================================================================
+======================================================================================================================================================
+PART L -- PRACTICAL "IMPLEMENT THIS FROM SCRATCH" INTERVIEW PATTERNS
+======================================================================================================================================================
+======================================================================================================================================================
+L1. Gradient descent from scratch (NumPy only, no PyTorch)
+
+	def gradient_descent(X, y, lr=0.01, n_iters=1000):
+	    m, n = X.shape
+	    weights = np.zeros(n)
+	    bias = 0
+	    for _ in range(n_iters):
+	        y_pred = X @ weights + bias
+	        error = y_pred - y
+	        dw = (2 / m) * (X.T @ error)                # gradient of MSE loss w.r.t. weights
+	        db = (2 / m) * np.sum(error)                  # gradient of MSE loss w.r.t. bias
+	        weights -= lr * dw
+	        bias -= lr * db
+	    return weights, bias
+	A near-universal "show me you understand what's happening under the hood, not just calling
+	`.fit()`" interview exercise -- know the shape of this cold: forward pass (prediction),
+	compute error, compute GRADIENT of the loss with respect to each parameter (calculus, not
+	magic), step the parameters in the direction that REDUCES loss, repeat.
+======================================================================================================================================================
+L2. A simple neural network forward pass from scratch
+
+	def relu(x): return np.maximum(0, x)
+	def forward(X, W1, b1, W2, b2):
+	    z1 = X @ W1 + b1
+	    a1 = relu(z1)
+	    z2 = a1 @ W2 + b2
+	    return z2                                          # raw logits; apply softmax (L3)
+	                                                          separately for a classification output
+	Being able to write out a 2-layer forward pass (linear -> activation -> linear) from
+	scratch, correctly tracking matrix SHAPES at each step (Part A2's broadcasting rules apply
+	directly here), demonstrates real understanding beyond "I imported `nn.Linear`."
+======================================================================================================================================================
+L3. Softmax (and a real numerical-stability gotcha worth knowing)
+
+	def softmax(x):
+	    x_shifted = x - np.max(x)              # SUBTRACT the max BEFORE exponentiating -- for
+	    exp_x = np.exp(x_shifted)                 numerical stability
+	    return exp_x / np.sum(exp_x)
+	NAIVE softmax (`np.exp(x) / np.sum(np.exp(x))` with no shift) can OVERFLOW to `inf` for even
+	moderately large input values, since `exp()` grows explosively fast -- subtracting the max
+	value BEFORE exponentiating is mathematically EQUIVALENT (softmax is shift-invariant) but
+	keeps every exponentiated value in a numerically safe range. This exact "why do we subtract
+	the max" numerical-stability detail is a genuinely common, specific interview follow-up after
+	asking someone to implement softmax -- know the REASON, not just the trick.
+======================================================================================================================================================
+L4. Attention mechanism, the core computation (scaled dot-product attention)
+
+	def attention(Q, K, V):
+	    scores = Q @ K.T / np.sqrt(K.shape[-1])       # scale by sqrt(d_k) -- prevents dot products
+	                                                     from growing too large in magnitude as
+	                                                     dimensionality increases, which would
+	                                                     otherwise push softmax into extremely
+	                                                     flat/saturated regions (very peaked or
+	                                                     very uniform gradients, hurting training)
+	    weights = softmax(scores)                       # (using L3's stable softmax)
+	    return weights @ V
+	Q (query), K (key), V (value) -- the attention mechanism computes how much each position
+	should "attend to" every other position (via the Q@K.T similarity scores), turns those scores
+	into a probability distribution (softmax), then produces a WEIGHTED AVERAGE of the V (value)
+	vectors according to that distribution. This is the SAME mechanism described conceptually in
+	the companion AI on Databricks notepad's transformer primer (Databricks AI notepad Part I19)
+	-- here it is as actual, runnable NumPy code. Being able to write this exact function, and
+	explain the `sqrt(d_k)` scaling specifically, is a genuinely common "show real understanding"
+	interview ask for an AI/ML engineering role, distinct from a pure data-engineering role.
+======================================================================================================================================================
+L5. Cosine similarity / K-nearest-neighbors from scratch
+
+	def cosine_similarity(a, b):
+	    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+	def knn_search(query_vec, all_vecs, k=5):
+	    similarities = [cosine_similarity(query_vec, v) for v in all_vecs]
+	    top_k_indices = np.argsort(similarities)[-k:][::-1]     # argsort ascending, take the
+	                                                                LAST k (highest), then reverse
+	                                                                for descending order
+	    return top_k_indices
+	The literal computation underneath F2's vector-database libraries and both companion AI
+	notepads' Vector Search products -- knowing how to implement the raw similarity search
+	yourself (even a naive, non-indexed O(n) version, without needing to implement a real
+	approximate-nearest-neighbor index structure like FAISS uses internally) demonstrates you
+	understand what "vector search" actually computes under the managed-product abstraction.
+======================================================================================================================================================
+======================================================================================================================================================
+PART M -- CONSOLIDATED INTERVIEW GOTCHAS (read this section twice before an interview)
+======================================================================================================================================================
+======================================================================================================================================================
+- Data leakage (fitting a scaler/preprocessing on data that includes the test set) is THE single
+  most common classical-ML interview gotcha -- always split first, fit only on train -- Part B3.
+- Broadcasting rules: align from the right, dimensions must be equal or one of them must be 1 --
+  a silent shape-broadcast mismatch produces a WRONG but non-crashing result, the worst kind of bug -- Part A2.
+- `*` is element-wise multiplication; `@` is true matrix multiplication -- a common, easy mix-up -- Part A5.
+- Forgetting `optimizer.zero_grad()` silently accumulates gradients across steps (this
+  accumulation is deliberate/useful for gradient accumulation, but a footgun if unintended) -- Part C3.
+- Forgetting `model.eval()` before inference gives silently WORSE results (Dropout/BatchNorm
+  behave differently in train vs eval mode) with no error raised -- Part C3.
+- Reproducibility requires seeding random, NumPy, PyTorch, AND CUDA separately -- one seed alone
+  isn't enough -- Part K1.
+- Softmax needs the max-subtraction trick for numerical stability -- naive softmax overflows on
+  large inputs -- Part L3.
+- Attention's `sqrt(d_k)` scaling exists to prevent softmax saturation as dimensionality grows -- Part L4.
+- Testing non-deterministic LLM output needs structured-property assertions or LLM-as-judge, not
+  exact-match `assert ==` -- Part H4.
+- CUDA OOM fix order: reduce batch size -> mixed precision -> gradient accumulation -> gradient
+  checkpointing -> quantization/smaller model -> more hardware -- Part K3.
+- `trust_remote_code=True` on Hugging Face `from_pretrained` executes arbitrary code from that
+  model's repo -- only for sources you genuinely trust -- Part D7.
+- Structured outputs (native schema params, or the `instructor` + Pydantic pattern) are what make
+  an LLM call reliable enough to feed a downstream pipeline -- Part E3.
+======================================================================================================================================================
+*** END OF PYTHON FOR AI ENGINEERS HANDBOOK ***
+Companion files: Python_for_Data_Engineers_COMPLETE_HANDBOOK_2026.txt (core Python, concurrency,
+testing, packaging) and your Databricks/Snowflake AI notepads (platform-level Cortex/Mosaic AI/
+MLflow-on-Unity-Catalog features this file's libraries plug into).
+
+Sources: Python agent-framework landscape coverage (Langfuse, multiple 2026 comparison articles),
+PyTorch 2.6-2.11 and torch.compile coverage (Spheron, Tech Insider, PyTorch docs), and standard
+ML/Python library documentation, current as of July 2026. The agent-framework and LLM-API space
+moves very fast -- re-verify specific framework/model names against current docs before relying
+on them in production or citing them as "current" in an interview.
+======================================================================================================================================================
