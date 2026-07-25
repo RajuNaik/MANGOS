@@ -1,0 +1,773 @@
+================================================================================
+DATA MODELING — COMPLETE HANDBOOK (2026)
+MAANG / Top-Tier Tech Interview Preparation
+================================================================================
+Companion to: System_Design_for_Data_Engineers_COMPLETE_HANDBOOK_2026,
+Spark_Internals_Deep_Dive_COMPLETE_HANDBOOK_2026,
+Streaming_and_Kafka_COMPLETE_HANDBOOK_2026,
+Databricks_COMPLETE_HANDBOOK_2026, Snowflake_COMPLETE_HANDBOOK_2026,
+Advanced_SQL_Scenarios_COMPLETE_HANDBOOK
+
+This handbook is standalone. No external references required. It covers the
+modeling patterns interviewers actually probe: normalization vs.
+denormalization tradeoffs, dimensional modeling (Kimball), Data Vault, wide
+table / OBT patterns for the modern lakehouse, and — the part candidates most
+often get wrong under interview pressure — SCD handling with concrete SQL/
+MERGE logic.
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+ 1. Why Data Modeling Interviews Trip People Up
+ 2. Normalization: 1NF Through BCNF, and Why OLTP Wants It
+ 3. Denormalization: Why Analytics Wants the Opposite
+ 4. Dimensional Modeling (Kimball) — Facts and Dimensions
+ 5. Fact Table Types and Grain — The Single Most-Tested Concept
+ 6. Dimension Table Patterns
+ 7. Slowly Changing Dimensions (SCD) — All Types, With SQL
+ 8. Star Schema vs. Snowflake Schema
+ 9. Data Vault Modeling
+10. One Big Table (OBT) / Wide Table Pattern for the Lakehouse Era
+11. Modeling for the Medallion Architecture
+12. Modeling for Streaming / Semi-Structured Data
+13. Modeling for ML Feature Pipelines
+14. Choosing a Modeling Approach — Decision Framework
+15. Common Design Problems (worked examples)
+16. Interview Question Bank with Model Answers
+17. Quick-Reference Cheat Sheet
+
+================================================================================
+1. WHY DATA MODELING INTERVIEWS TRIP PEOPLE UP
+================================================================================
+
+Data modeling questions look easy ("design a schema for X") and are actually
+one of the highest-signal interview formats, because a shallow answer
+("I'd have an orders table and a customers table") reveals itself
+immediately once the interviewer asks two follow-ups: "what's the grain of
+your fact table?" and "how do you handle a customer's address changing?" Most
+candidates who fumble data modeling interviews know the vocabulary (star
+schema, SCD2) but can't apply it precisely to a novel scenario, or can't
+write the actual MERGE logic when pushed. This handbook is built to close
+exactly that gap — every pattern here comes with the SQL, not just the name.
+
+================================================================================
+2. NORMALIZATION: 1NF THROUGH BCNF, AND WHY OLTP WANTS IT
+================================================================================
+
+1NF (First Normal Form)
+  Every column holds atomic (indivisible) values, no repeating groups —
+  no comma-separated lists in a single cell, no "phone1, phone2" columns;
+  instead a separate phone_numbers table/row per phone number.
+
+2NF
+  1NF, plus every non-key column depends on the WHOLE primary key, not
+  just part of it (relevant for composite keys) — eliminates partial
+  dependency. Example violation: order_items(order_id, product_id,
+  product_name) — product_name depends only on product_id, not the full
+  composite key, so it belongs in a separate products table.
+
+3NF
+  2NF, plus no transitive dependencies — non-key columns depend ONLY on
+  the primary key, not on other non-key columns. Example violation:
+  orders(order_id, customer_id, customer_zip, customer_city) — city
+  depends on zip, which depends on customer_id, not directly on
+  order_id — city/zip belong in a customer or location table.
+
+BCNF (Boyce-Codd Normal Form)
+  A stricter version of 3NF handling edge cases with multiple overlapping
+  candidate keys — rarely the focus of an interview beyond naming it
+  exists; 3NF is the practical target for most OLTP schema design
+  discussions.
+
+WHY OLTP SYSTEMS WANT NORMALIZATION
+  - Eliminates update anomalies: a customer's address stored in one place
+    means updating it once is correct everywhere, rather than needing to
+    find and update every denormalized copy.
+  - Reduces storage redundancy — relevant at OLTP row-level write volume
+    and consistency, less relevant at analytics read/scan volume where
+    storage is cheap and joins are the expensive operation.
+  - Enforces referential integrity naturally via foreign keys between
+    normalized tables.
+  Interview framing: "Normalization optimizes for write correctness and
+  avoiding update anomalies — exactly what a transactional system needs,
+  since it's constantly mutating individual records. It's the wrong
+  optimization target for an analytical system that's mostly doing large
+  scans and aggregations across history, which is why analytics schemas
+  deliberately denormalize."
+
+================================================================================
+3. DENORMALIZATION: WHY ANALYTICS WANTS THE OPPOSITE
+================================================================================
+
+Denormalization intentionally introduces redundancy to reduce the number
+of joins needed at query time, trading storage cost and update complexity
+for read/scan performance — the correct tradeoff for analytical workloads
+where:
+  - Data is loaded in batches (not constantly mutated row-by-row like
+    OLTP), so redundancy doesn't create the same update-anomaly risk —
+    you control exactly when and how redundant copies get refreshed.
+  - Query patterns are large scans/aggregations across many rows, where
+    join cost (especially shuffle joins at scale, Spark Internals handbook
+    Section 8) dominates query time far more than it does for OLTP's
+    single-row point lookups.
+  - Columnar storage (Parquet/Delta) makes wide, denormalized tables cheap
+    to scan since unused columns aren't read at all (column pruning) —
+    denormalization's storage cost is mitigated by compression and
+    columnar pruning in a way it wouldn't be in row-oriented OLTP storage.
+
+THE CENTRAL TRADEOFF TO STATE EXPLICITLY IN ANY INTERVIEW
+  "Normalize to optimize for write correctness and storage efficiency
+  under frequent mutation. Denormalize to optimize for read/scan
+  performance under infrequent, batch-controlled updates. Analytical
+  systems overwhelmingly favor denormalization because they're
+  read-heavy and batch-loaded; OLTP systems favor normalization because
+  they're write-heavy and continuously mutated."
+
+================================================================================
+4. DIMENSIONAL MODELING (KIMBALL) — FACTS AND DIMENSIONS
+================================================================================
+
+Ralph Kimball's dimensional modeling is still the dominant vocabulary for
+analytics schema design in interviews, even in a lakehouse-native org —
+know it cold.
+
+FACT TABLE
+  Stores measurable, numeric events/transactions — the "what happened."
+  Contains foreign keys to dimension tables plus numeric measures (additive
+  facts like revenue, quantity; semi-additive like account balance;
+  non-additive like a ratio/percentage that can't simply be summed across
+  dimensions).
+
+DIMENSION TABLE
+  Stores descriptive context — the "who, what, where, when" that gives
+  meaning to a fact row. Typically has a surrogate key (not the natural/
+  business key — see Section 6 for why), and business attributes used for
+  filtering/grouping in BI queries (customer name, product category, store
+  region).
+
+WHY THIS SEPARATION EXISTS
+  Facts grow very large (one row per event, potentially billions of rows)
+  while dimensions are comparatively small and slow-changing — separating
+  them lets the large fact table stay lean (just keys + measures) while
+  descriptive attributes live once in the dimension and are joined in at
+  query time (or denormalized into a wide table at serving time — Section
+  10) — this separation is precisely what "star schema" refers to
+  structurally (Section 8).
+
+================================================================================
+5. FACT TABLE TYPES AND GRAIN — THE SINGLE MOST-TESTED CONCEPT
+================================================================================
+
+GRAIN — DEFINE THIS FIRST, ALWAYS
+  The grain of a fact table is the precise definition of what one row
+  represents — "one row per order" and "one row per order line item" are
+  completely different grains with different row counts, different
+  measures, and different join behavior. Stating the grain explicitly,
+  before designing any columns, is the single habit that most reliably
+  signals seniority in a data modeling interview — do this out loud even
+  when not explicitly asked.
+
+TRANSACTION FACT TABLE
+  One row per discrete business event, at the moment it occurs (one row
+  per order line item, one row per page view, one row per payment). Most
+  common fact table type; additive measures (quantity, amount) sum
+  correctly across any dimension.
+
+PERIODIC SNAPSHOT FACT TABLE
+  One row per entity per fixed time period (e.g., one row per account per
+  day showing end-of-day balance) — used when you need to track a
+  state/level over time, not just discrete events. Measures here are often
+  semi-additive (balance can be summed across accounts at a point in time,
+  but summing balance across days for a single account is meaningless).
+
+ACCUMULATING SNAPSHOT FACT TABLE
+  One row per process/entity instance that gets UPDATED in place as the
+  process moves through stages (e.g., one row per order tracking
+  order_date, ship_date, delivery_date, each filled in as that stage
+  happens) — used for pipeline/funnel processes with a well-defined
+  sequence of milestones. Unlike the other two types, rows are mutated
+  after initial insert, which has real implications for how you'd
+  implement this in an append-oriented lakehouse (MERGE/upsert required,
+  not simple append — same SCD2-adjacent mechanics as Section 7).
+
+FACTLESS FACT TABLE
+  A fact table with no numeric measures at all — just foreign keys,
+  recording that an event/association occurred (e.g., "student attended
+  class on date X" — the fact itself is the occurrence; you COUNT rows
+  to get a measure). Used for coverage/eligibility tracking and
+  many-to-many event association.
+
+WHY GRAIN MISTAKES BREAK EVERYTHING DOWNSTREAM
+  If you don't fix the grain explicitly, adding a new dimension (e.g.,
+  promotion applied) can silently change the grain (order -> order line
+  with a specific promotion applied), causing measures like order total to
+  fan out and double-count if joined carelessly — this exact failure mode
+  ("why does my revenue number look 3x too high after adding a promotions
+  join") is a very common real interview follow-up.
+
+================================================================================
+6. DIMENSION TABLE PATTERNS
+================================================================================
+
+SURROGATE KEYS vs. NATURAL/BUSINESS KEYS
+  Surrogate key: a system-generated, meaningless integer/UUID primary key
+  for the dimension row, independent of any source-system identifier.
+  Natural/business key: the identifier the source system uses (e.g.,
+  customer_id from the CRM).
+  WHY SURROGATE KEYS: they let you have MULTIPLE dimension rows for the
+  same business entity over time (required for SCD Type 2 — Section 7),
+  they insulate the warehouse from source-system key changes/reuse, and
+  they let you cleanly integrate the same business entity from multiple
+  source systems (each with its own natural key format) under one
+  surrogate key scheme.
+
+CONFORMED DIMENSIONS
+  A dimension (e.g., date_dim, customer_dim) shared consistently across
+  MULTIPLE fact tables/subject areas with the same structure and meaning
+  — this is what lets you compare/combine metrics across different fact
+  tables (sales_fact and returns_fact both joining to the same
+  product_dim) without inconsistency. Building conformed dimensions
+  deliberately, rather than letting each team build its own version of
+  "customer," is core Kimball methodology and a strong thing to mention
+  when asked about scaling a warehouse across multiple teams/domains.
+
+ROLE-PLAYING DIMENSIONS
+  The same physical dimension used multiple times in one fact table with
+  different meanings, via multiple foreign keys (e.g., order_date_key AND
+  ship_date_key AND delivery_date_key all referencing the same date_dim,
+  typically exposed to BI tools via views/aliases so each role has a
+  distinct, clearly-named join). Common follow-up: "how do you model a
+  fact with three different dates" — this is the answer.
+
+JUNK DIMENSION
+  A single dimension table combining several low-cardinality flags/
+  indicators (e.g., is_gift_wrapped, payment_method, order_channel) that
+  don't warrant their own separate dimension tables, avoiding a
+  proliferation of tiny dimension tables and keeping the fact table's
+  foreign key count manageable.
+
+DEGENERATE DIMENSION
+  A dimension-like attribute (typically an identifier, like order_number
+  or invoice_number) that lives directly in the fact table rather than in
+  its own dimension table, because it has no additional descriptive
+  attributes of its own — it's essentially a transaction identifier kept
+  for traceability/grouping, not a true dimension with its own attribute
+  set.
+
+================================================================================
+7. SLOWLY CHANGING DIMENSIONS (SCD) — ALL TYPES, WITH SQL
+================================================================================
+
+This is the most concretely testable topic in the entire handbook — expect
+to be asked to write the actual MERGE, not just describe the concept.
+
+SCD TYPE 0 — Retain Original
+  The attribute never changes once set (e.g., original_signup_date) —
+  simplest case, no special handling; just never update that column after
+  initial insert.
+
+SCD TYPE 1 — Overwrite
+  The old value is simply overwritten with the new value; no history
+  retained. Used when historical accuracy of that specific attribute
+  doesn't matter for reporting (e.g., correcting a typo in a customer's
+  name).
+  SQL pattern:
+    MERGE INTO customer_dim AS target
+    USING customer_updates AS source
+    ON target.customer_id = source.customer_id
+    WHEN MATCHED THEN UPDATE SET target.customer_name = source.customer_name,
+                                  target.email = source.email
+    WHEN NOT MATCHED THEN INSERT (customer_id, customer_name, email)
+      VALUES (source.customer_id, source.customer_name, source.email);
+
+SCD TYPE 2 — Add New Row (full history, the most commonly tested type)
+  Every change creates a NEW row with its own surrogate key, with
+  effective_date/end_date (or effective_date + is_current flag) columns
+  marking the validity period — existing fact rows continue pointing to
+  the OLD surrogate key (preserving the historically-accurate
+  relationship: "this order was placed when the customer lived at their
+  old address"), while new fact rows get the NEW surrogate key.
+  SQL pattern (the two-step MERGE approach — know this precisely):
+    -- Step 1: expire the current row for any customer with a real change
+    MERGE INTO customer_dim AS target
+    USING customer_updates AS source
+    ON target.customer_id = source.customer_id AND target.is_current = true
+    WHEN MATCHED AND (target.address <> source.address
+                       OR target.segment <> source.segment) THEN
+      UPDATE SET target.end_date = current_date(),
+                 target.is_current = false;
+
+    -- Step 2: insert the new current row for changed OR new customers
+    INSERT INTO customer_dim
+      (customer_sk, customer_id, address, segment,
+       effective_date, end_date, is_current)
+    SELECT
+      <generate new surrogate key>, source.customer_id, source.address,
+      source.segment, current_date(), NULL, true
+    FROM customer_updates source
+    LEFT JOIN customer_dim target
+      ON source.customer_id = target.customer_id
+      AND target.is_current = true
+      AND target.address = source.address
+      AND target.segment = source.segment
+    WHERE target.customer_id IS NULL;   -- no unchanged current match found
+
+  In Databricks/Delta this is very often implemented directly as a single
+  MERGE INTO ... WHEN MATCHED ... WHEN NOT MATCHED using a pre-computed
+  "change" flag from a staging query, or via the built-in
+  MERGE ... WHEN MATCHED AND ... THEN UPDATE + WHEN NOT MATCHED THEN INSERT
+  pattern you've already implemented for Coca-Cola sales data — reuse that
+  concrete project example when this comes up.
+
+SCD TYPE 3 — Add New Column
+  Keep both the current AND immediately-previous value in separate columns
+  on the SAME row (e.g., current_region, previous_region) — limited
+  history (only one prior value), no new rows. Used rarely, mainly when a
+  specific "before vs. after" comparison is needed for exactly one
+  transition (e.g., "sales rep's previous vs. current territory") without
+  the overhead of full Type 2 history.
+
+SCD TYPE 4 — Mini-Dimension / History Table
+  Split a dimension into a "current" table (Type 1 style, always
+  overwritten, fast to join) and a separate, append-only "history" table
+  capturing every change with timestamps — used when the dimension changes
+  VERY frequently (e.g., rapidly changing customer risk score) and Type 2's
+  row-per-change approach would bloat the primary dimension table and slow
+  down the common case of "just give me the current value" joins.
+
+SCD TYPE 6 — Hybrid (1 + 2 + 3)
+  Combines Type 2's full history rows with a Type 1-style
+  always-current-value column ALSO present on every historical row (so you
+  can query "what was the customer's segment at order time" via the Type 2
+  columns, OR "what is the customer's segment right now" via the Type
+  1-style column, from a single historical row without a self-join back to
+  the current record) — a real, if less commonly needed, pattern worth
+  naming if an interviewer pushes on "what if you need both historical AND
+  current context on the same analytical row."
+
+WHICH TYPE TO USE — DECISION GUIDANCE
+  Attribute never changes                       -> Type 0
+  History doesn't matter, just want current      -> Type 1
+  Full history matters, moderate change frequency -> Type 2 (default choice
+                                                       for most "customer
+                                                       address/segment"
+                                                       style attributes)
+  Only need one prior value for comparison        -> Type 3
+  Extremely high change frequency, need current
+    fast + history separately                     -> Type 4
+  Need both full history AND current value inline
+    on every historical row                        -> Type 6
+
+================================================================================
+8. STAR SCHEMA vs. SNOWFLAKE SCHEMA
+================================================================================
+
+STAR SCHEMA
+  Fact table joins DIRECTLY to fully denormalized dimension tables (no
+  further normalization within dimensions — e.g., product_dim contains
+  category_name and brand_name directly, not foreign keys to separate
+  category/brand tables). Fewer joins at query time, simpler for BI tools
+  and analysts, the default recommended pattern for gold-layer/serving
+  tables.
+
+SNOWFLAKE SCHEMA
+  Dimension tables are further normalized into sub-dimensions (e.g.,
+  product_dim -> category_dim -> department_dim, each a separate table) —
+  reduces storage redundancy in the dimensions themselves, at the cost of
+  more joins at query time. Occasionally justified for very large,
+  frequently-changing dimensions where the storage/update savings from
+  normalizing outweigh the extra join cost, but generally NOT the default
+  recommendation for analytics in 2026 given cheap columnar storage — star
+  schema (or even wider OBT patterns, Section 10) is favored for query
+  simplicity and performance.
+
+INTERVIEW FRAMING
+  "I'd default to star schema for the gold layer — dimension storage is
+  cheap relative to the query-time cost of extra joins, and BI tools/
+  analysts work much more naturally against a flat dimension. I'd only
+  reach for snowflaking a specific dimension if it were extremely large
+  and high-cardinality with genuinely redundant sub-attributes causing a
+  real storage or update-maintenance problem — that's a narrow case, not
+  the default."
+
+================================================================================
+9. DATA VAULT MODELING
+================================================================================
+
+Data Vault is built for enterprise-scale, multi-source, highly auditable
+integration — worth understanding conceptually even if you'd rarely
+default to it in a typical DE interview answer.
+
+HUBS
+  Store the list of unique business keys for a core business entity
+  (customer_hub: just the business key + load metadata) — deliberately
+  minimal, no descriptive attributes.
+
+LINKS
+  Record relationships/transactions BETWEEN hubs (order_link: connects
+  customer_hub, product_hub, store_hub for a given transaction) —
+  represents the associations, again with minimal attributes beyond the
+  keys and metadata.
+
+SATELLITES
+  Store the actual descriptive attributes and their history, attached to a
+  hub or link (customer_sat: address, segment, etc., with load timestamps
+  — inherently Type-2-like, since satellites are append-only and track
+  every change over time by design).
+
+WHY DATA VAULT
+  - Highly resilient to source system changes and multi-source integration
+    — adding a new source system for "customer" just means adding a new
+    satellite, without restructuring existing hubs/links.
+  - Strong audit trail / full history by construction (every satellite
+    row is timestamped and immutable).
+  - Loads are highly parallelizable (hubs/links/satellites can load
+    independently) — good fit for very high-volume, multi-source ingestion.
+  TRADEOFF: significantly more joins and more tables than a star schema,
+  making it a poor fit for direct BI consumption — Data Vault is typically
+  used as a STAGING/INTEGRATION layer, with a Kimball star schema built ON
+  TOP of it as the actual presentation/BI layer. Mention this two-layer
+  pattern explicitly if Data Vault comes up — "Data Vault for integration,
+  Kimball star schema for presentation" is the concise, correct answer.
+
+================================================================================
+10. ONE BIG TABLE (OBT) / WIDE TABLE PATTERN FOR THE LAKEHOUSE ERA
+================================================================================
+
+A genuinely 2026-relevant pattern: instead of a fact table joined to
+several dimension tables at query time, pre-join (denormalize) everything
+into a single wide table at ETL time, so BI queries and ML feature
+pipelines read from one table with zero joins.
+
+WHY THIS HAS BECOME MORE COMMON
+  - Columnar storage + column pruning (Parquet/Delta) means a very wide
+    table costs little extra at query time if most queries only touch a
+    handful of columns — the "wasted" columns are never even read.
+  - Self-serve BI tools and less SQL-savvy business users struggle with
+    multi-table joins; a single flat table dramatically lowers the barrier
+    to correct self-serve analysis (no risk of a wrong join key silently
+    fanning out row counts).
+  - ML feature pipelines often want exactly this shape already (one row
+    per entity/event with all relevant features as columns) — building OBT
+    once and serving both BI and ML from it avoids maintaining two
+    separate denormalization pipelines.
+
+TRADEOFFS TO STATE EXPLICITLY
+  - Storage duplication is real (the same dimension attribute repeated
+    across every fact row it's joined to) — acceptable given the cost of
+    columnar storage, but not free, and should be a stated tradeoff not an
+    unconsidered default.
+  - Harder to maintain a SINGLE SOURCE OF TRUTH for a shared dimension
+    across multiple OBTs (if customer_segment logic changes, every OBT
+    that denormalized it needs reprocessing, vs. a star schema where
+    fixing the one dimension table fixes every fact join automatically) —
+    this is the concrete cost side of the OBT tradeoff to mention.
+  - Best used for a specific, well-defined domain/consumption pattern
+    (e.g., "the ML training table for churn prediction," "the self-serve
+    sales OBT") rather than as a wholesale replacement for a governed star
+    schema serving many different downstream needs.
+
+INTERVIEW FRAMING
+  "I'd build OBT as a derived, purpose-built serving table ON TOP of a
+  well-modeled star schema gold layer, not instead of it — the star schema
+  stays the governed source of truth with single-point-of-maintenance
+  dimensions, and specific OBTs get materialized from it for the
+  consumption patterns (self-serve BI, ML training sets) that genuinely
+  benefit from zero-join flat access."
+
+================================================================================
+11. MODELING FOR THE MEDALLION ARCHITECTURE
+================================================================================
+
+Mapping modeling concepts explicitly onto bronze/silver/gold (reusing your
+Databricks handbook's medallion framing, made concrete here):
+
+BRONZE
+  Schema mirrors the source as closely as possible — minimal modeling,
+  append-only, full fidelity/history preserved even if messy. No
+  normalization/denormalization decisions made here; the goal is
+  faithful, replayable raw capture.
+
+SILVER
+  Conformed, deduplicated, business-key-resolved — this is typically
+  where you'd apply something close to a normalized or lightly-denormalized
+  structure per source entity (one silver table roughly per source
+  entity/domain), with SCD2 already applied to slowly-changing entities at
+  this layer if silver is meant to be a reusable, general-purpose
+  "clean" layer for multiple downstream gold marts.
+
+GOLD
+  Where full dimensional modeling (star schema) or OBT patterns are
+  applied, purpose-built for specific consumption (a sales mart, a churn
+  ML training table, a finance reporting mart) — this is the layer where
+  the Section 4-10 modeling decisions concretely materialize as physical
+  tables, and where the modeling approach should be chosen based on the
+  SPECIFIC gold table's consumption pattern, not applied uniformly across
+  every gold table in the platform.
+
+KEY INSIGHT FOR INTERVIEWS
+  "Medallion architecture and dimensional modeling aren't competing
+  approaches — medallion describes the DATA QUALITY/LIFECYCLE progression
+  (raw -> clean -> curated), while star schema/OBT/Data Vault describe the
+  STRUCTURAL modeling approach applied within a layer, most commonly at
+  gold. You can and often should combine them: bronze/silver structured
+  loosely around source entities, gold structured as a proper star schema
+  or OBT per consumption domain."
+
+================================================================================
+12. MODELING FOR STREAMING / SEMI-STRUCTURED DATA
+================================================================================
+
+SCHEMA-ON-READ FOR BRONZE
+  Streaming/semi-structured sources (JSON events, nested API payloads)
+  are typically landed in bronze with a permissive schema — often a raw
+  string/binary payload column plus a parsed struct/map column using
+  Delta's support for nested/semi-structured types, deferring strict
+  schema enforcement to silver where a validated, flattened structure is
+  applied (ties directly to the Auto Loader schema evolution + rescued-
+  data-column pattern from the System Design handbook).
+
+FLATTENING NESTED STRUCTURES
+  Silver-layer transformation typically flattens nested JSON/struct
+  columns into a more traditional tabular shape (exploding arrays into
+  separate rows where the grain requires it — e.g., an order with a
+  nested array of line items becomes one row per line item, which is
+  itself a grain decision per Section 5) — explicit array-explosion is a
+  concrete, common interview follow-up: "how do you model an event with a
+  variable-length nested list."
+
+MODELING EVENT STREAMS AS FACT TABLES
+  A clickstream/event topic maps naturally onto a transaction fact table
+  concept even before it's fully "modeled" — each event IS a fact row at
+  event grain; the modeling work is primarily about which dimensional
+  context (user, session, page, device) to denormalize onto each event
+  row at silver/gold time versus join at query time, applying the same
+  star-schema-vs-OBT tradeoff from Sections 8/10 to streaming-sourced data
+  specifically.
+
+================================================================================
+13. MODELING FOR ML FEATURE PIPELINES
+================================================================================
+
+FEATURE TABLE GRAIN
+  Nearly always entity-grain (one row per user, per item, per
+  user-item pair) with point-in-time versioned features — this is
+  structurally closest to a periodic snapshot fact table (Section 5)
+  or, for streaming features, closest to an SCD Type 2-like versioned
+  structure (since a feature's value at training-label time must be
+  reconstructable, not just its current value).
+
+POINT-IN-TIME CORRECTNESS (the critical modeling requirement, expanded
+from the System Design handbook's recommendation system problem)
+  Training data generation must join each label row to feature values AS
+  OF the label's timestamp, not the feature's current value — this is
+  structurally identical to an SCD Type 2 "as of" join (Section 7):
+  features need effective_date/end_date-style versioning (or a full
+  event-sourced history) so a training pipeline can correctly answer
+  "what did this feature look like at the moment this historical label
+  was generated," preventing data leakage where a model is trained on
+  information that wouldn't have been available at prediction time in
+  production.
+
+ONLINE vs. OFFLINE FEATURE STORE MODELING
+  Offline (batch, for training): typically a Delta/warehouse table with
+  full history, modeled with point-in-time versioning as above.
+  Online (low-latency serving, for real-time inference): typically a
+  key-value structure (Redis/DynamoDB) holding only the LATEST feature
+  value per entity — structurally a Type 1-style "current value only"
+  model, since inference-time serving doesn't need history, only the
+  freshest value, fast. The two paths deliberately use different modeling
+  strategies (versioned vs. current-only) for the same logical feature,
+  which is itself a good interview point about why feature stores need an
+  abstraction layer reconciling the two (System Design handbook, Problem
+  5).
+
+================================================================================
+14. CHOOSING A MODELING APPROACH — DECISION FRAMEWORK
+================================================================================
+
+Is this an OLTP system (frequent single-row read/write)?
+  YES -> Normalize (3NF)
+  NO (analytics) -> continue below
+
+Is this a staging/integration layer ingesting from many source systems
+with strong audit/history requirements?
+  YES -> Consider Data Vault (hubs/links/satellites), with a star schema
+         built on top for presentation
+  NO -> continue below
+
+Will this table be queried directly by BI tools / self-serve analysts, or
+used as an ML training table for one specific domain?
+  YES, and simplicity/zero-joins matters most -> OBT / wide table
+  YES, and it needs to serve MANY different fact tables / stay a governed,
+       reusable, single-source-of-truth layer -> Star schema (Kimball)
+  NO, it's an ML online-serving feature -> Key-value, current-value-only
+       model (Type 1-style)
+  NO, it's an ML offline-training feature -> Versioned, point-in-time
+       correct table (Type 2-style / event-sourced)
+
+Does the entity have attributes that change over time and historical
+accuracy of those attributes matters for reporting?
+  YES, need full history -> SCD Type 2
+  YES, but only care about current value -> SCD Type 1
+  YES, but only need immediate prior value for one comparison -> SCD Type 3
+  YES, changes EXTREMELY frequently and current-value lookups must stay
+       fast -> SCD Type 4 (mini-dimension + history table)
+
+================================================================================
+15. COMMON DESIGN PROBLEMS (WORKED EXAMPLES)
+================================================================================
+
+--------------------------------------------------------------------------------
+PROBLEM A: Model sales data for GlobalMart (ties to your existing project)
+--------------------------------------------------------------------------------
+  Grain: one row per order line item (explicit statement first).
+  fact_sales(order_line_sk, order_date_key, ship_date_key, customer_sk,
+    product_sk, store_sk, promotion_sk, quantity, unit_price,
+    discount_amount, net_amount)
+  dim_customer: SCD Type 2 (address/segment changes matter historically —
+    a sale should reflect the customer's segment AT THE TIME of purchase)
+  dim_product: SCD Type 2 for category/price-tier reclassification, Type 1
+    for typo corrections to product_name
+  dim_date, dim_store: standard, mostly static conformed dimensions
+  role-playing dimension: date_dim joined twice (order_date_key,
+    ship_date_key) for order vs. ship date
+  This is exactly your existing Coca-Cola/GlobalMart Bronze/Silver/Gold +
+  SCD2 project — reuse it as your concrete, defensible example whenever an
+  interviewer asks "tell me about a data model you've built."
+
+--------------------------------------------------------------------------------
+PROBLEM B: Model a subscription business's revenue for MRR reporting
+--------------------------------------------------------------------------------
+  This requires an ACCUMULATING SNAPSHOT or PERIODIC SNAPSHOT pattern, not
+  a simple transaction fact — MRR is a state (current recurring revenue
+  level), not a discrete event.
+  fact_subscription_snapshot: one row per subscription per month
+  (periodic snapshot grain), with mrr_amount, status (active/churned/
+  upgraded), giving semi-additive measures you can sum across subscriptions
+  within a month but not across months for one subscription.
+  Explicitly call out why a transaction-fact-only model would fail here:
+  "if I only modeled subscription CHANGE events, computing 'MRR as of
+  March 15' would require replaying every event up to that date for every
+  subscription — a periodic snapshot avoids that by materializing the
+  state directly, at the cost of some storage redundancy across months
+  with no change."
+
+--------------------------------------------------------------------------------
+PROBLEM C: Model a hiring pipeline for a recruiting analytics dashboard
+(applied -> screened -> interviewed -> offered -> hired)
+--------------------------------------------------------------------------------
+  ACCUMULATING SNAPSHOT fact table: one row per candidate application,
+  with a column per pipeline stage timestamp (applied_date, screened_date,
+  interviewed_date, offered_date, hired_date), UPDATED IN PLACE as the
+  candidate progresses — directly the canonical accumulating-snapshot use
+  case (funnel/process tracking). In a lakehouse, implement via MERGE
+  keyed on application_id, updating only the newly-reached stage's date
+  column, never re-inserting a new row per stage (which would be the
+  wrong pattern here — contrast explicitly with SCD Type 2's new-row-per-
+  change approach to show you understand WHY this scenario calls for
+  update-in-place rather than history-preserving new rows: the business
+  question is "how long does each stage take for this ONE application,"
+  not "what did this application's status look like as of any past date").
+
+================================================================================
+16. INTERVIEW QUESTION BANK WITH MODEL ANSWERS
+================================================================================
+
+Q: "What's the grain of a fact table, and why does it matter?"
+A: "Grain is the precise definition of what one row represents — for
+   example, one row per order line item versus one row per order. It
+   matters because every measure's correctness and every dimension you
+   can attach depends on getting it right first; adding a dimension at a
+   finer grain than your stated grain — like a promotion applied per line
+   item when your fact is at the order level — silently fans out rows and
+   double-counts measures on join. I always state the grain explicitly
+   before designing any columns."
+
+Q: "Walk me through how you'd implement SCD Type 2 in a lakehouse."
+A: "Two-step MERGE: first, expire the current row for any business key
+   whose tracked attributes actually changed — set end_date to now and
+   is_current to false. Second, insert a new row with a new surrogate key
+   for anything that changed or is new, with effective_date set to now,
+   end_date null, is_current true. Existing fact rows keep pointing at
+   the old surrogate key, so historical facts still join to the dimension
+   values that were true at the time — that's what preserves historically
+   accurate reporting."
+
+Q: "When would you use an accumulating snapshot instead of a transaction
+   fact table?"
+A: "When I'm tracking a process or funnel with well-defined milestones —
+   an order fulfillment pipeline, a hiring pipeline — where the business
+   question is about how long each stage takes for a given instance, and
+   I want one row per instance that gets updated in place as it
+   progresses through stages, rather than a new row per stage event."
+
+Q: "Star schema or OBT — which do you default to?"
+A: "Star schema as the governed source of truth in gold, because it keeps
+   dimensions as a single point of maintenance across every fact table
+   that joins to them. I'd build OBT as a derived, purpose-built table on
+   top of that star schema for specific consumption patterns — self-serve
+   BI or an ML training set — where zero-join flat access is worth the
+   storage duplication and the loss of single-source-of-truth maintenance
+   for that specific denormalized copy."
+
+Q: "How do you avoid data leakage when building ML training features from
+   a data warehouse?"
+A: "Point-in-time correctness — join each label row to feature values as
+   of the label's timestamp, not the feature's current value. That
+   requires the feature table itself to be versioned, structurally similar
+   to an SCD Type 2 dimension, so 'what did this feature look like on this
+   past date' is actually answerable rather than only 'what is it now.'"
+
+================================================================================
+17. QUICK-REFERENCE CHEAT SHEET
+================================================================================
+
+NORMALIZE vs. DENORMALIZE
+  OLTP (write-heavy, point lookups)     -> Normalize (3NF)
+  Analytics (read-heavy, batch-loaded)   -> Denormalize (star/OBT)
+
+FACT TABLE TYPES
+  Transaction        -> one row per discrete event
+  Periodic snapshot   -> one row per entity per fixed period (state over
+                         time, semi-additive measures)
+  Accumulating snapshot -> one row per process instance, updated in place
+                         across milestones
+  Factless            -> no measures, just occurrence/association (COUNT
+                         rows for a measure)
+
+SCD TYPES, ONE-LINE EACH
+  Type 0 -> never changes
+  Type 1 -> overwrite, no history
+  Type 2 -> new row per change, full history (the default for "matters
+            historically")
+  Type 3 -> new column, only prior value retained
+  Type 4 -> current table + separate history table (very high change
+            frequency)
+  Type 6 -> Type 2 rows + a Type 1-style always-current column (hybrid)
+
+DIMENSION PATTERNS
+  Surrogate key       -> system-generated PK, enables multiple historical
+                         versions per business entity
+  Conformed dimension -> shared, consistent structure across many facts
+  Role-playing dim    -> same physical dim joined multiple times
+                         (order_date vs. ship_date)
+  Junk dimension       -> bundles small low-cardinality flags
+  Degenerate dimension -> identifier kept in the fact table itself, no
+                         separate dim table
+
+SCHEMA CHOICE
+  Star     -> denormalized dims, direct fact-to-dim joins (default)
+  Snowflake -> normalized sub-dimensions, more joins (narrow use case)
+  Data Vault -> hubs/links/satellites, multi-source integration/audit
+              layer, with star schema built on top for presentation
+  OBT      -> fully pre-joined wide table, zero joins at query time,
+              purpose-built derivative of a star schema
+
+FEATURE STORE MODELING
+  Offline/training -> versioned, point-in-time correct (Type 2-like)
+  Online/serving    -> current-value-only, key-value (Type 1-like)
+
+================================================================================
+END OF HANDBOOK
+================================================================================
