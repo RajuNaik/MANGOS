@@ -1,0 +1,839 @@
+================================================================================
+SPARK INTERNALS DEEP DIVE — COMPLETE HANDBOOK (2026)
+MAANG / Top-Tier Tech Interview Preparation
+================================================================================
+Companion to: Databricks_COMPLETE_HANDBOOK_2026, System_Design_for_Data_Engineers,
+Advanced_SQL_Scenarios_COMPLETE_HANDBOOK, Python_for_Data_Engineers_COMPLETE_HANDBOOK
+
+This handbook is standalone. No external references required. It goes beneath
+the PySpark API surface into how Spark actually executes — the layer MAANG
+interviewers probe once they know you can already write correct PySpark.
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+ 1. Why Interviewers Go Here (and how this differs from "PySpark syntax")
+ 2. Cluster Architecture: Driver, Executors, Cluster Manager
+ 3. Jobs, Stages, Tasks — The Execution Hierarchy
+ 4. The Catalyst Optimizer (Logical -> Physical Plan)
+ 5. Tungsten Execution Engine (Memory & Codegen)
+ 6. Shuffle Deep Dive — The #1 Interview Topic
+ 7. Partitioning, Skew, and Salting
+ 8. Joins: Strategies and When Spark Picks Which One
+ 9. Adaptive Query Execution (AQE)
+10. Memory Management Deep Dive
+11. Caching & Persistence
+12. Reading Explain Plans (with worked examples)
+13. Common Performance Problems & Diagnosis Playbook
+14. Structured Streaming Internals
+15. Delta Lake Internals (transaction log, OPTIMIZE, Z-ORDER)
+16. Interview Question Bank with Model Answers
+17. Quick-Reference Cheat Sheet
+
+================================================================================
+1. WHY INTERVIEWERS GO HERE
+================================================================================
+
+Anyone can write `df.groupBy("x").agg(sum("y"))`. What separates a senior hire
+is being able to answer: "Why did this job take 40 minutes when it should take
+4?" That requires reasoning about the execution model underneath the DataFrame
+API. This handbook assumes you already know PySpark syntax (covered in your
+Databricks handbook) and goes one layer deeper — the layer that shows up as:
+
+  - "Walk me through what happens when you call .collect() on a DataFrame
+    with a join and a groupBy."
+  - "Why is my job spending 80% of its time in one task?"
+  - "Explain shuffle. Why is it expensive? How do you minimize it?"
+  - "What does AQE actually do differently at runtime vs. static planning?"
+
+================================================================================
+2. CLUSTER ARCHITECTURE: DRIVER, EXECUTORS, CLUSTER MANAGER
+================================================================================
+
+DRIVER
+  - Runs your main() / notebook code. Builds the DAG of transformations.
+  - Hosts the SparkContext/SparkSession, the DAGScheduler, TaskScheduler,
+    and SchedulerBackend.
+  - Collects results for actions like .collect()/.show() — a driver OOM from
+    collecting too much data back is one of the most common real-world bugs.
+  - Single point of coordination; if the driver dies, the whole application
+    dies (no HA for the driver process itself in standard deployments).
+
+EXECUTORS
+  - JVM processes on worker nodes that actually run tasks.
+  - Each executor has a fixed number of cores (task slots) and a memory
+    budget, split between execution memory (shuffles, joins, aggregations)
+    and storage memory (cached data) — unified in modern Spark's
+    UnifiedMemoryManager, with a configurable soft boundary between the two.
+  - Executors are long-lived for the duration of the application (unless
+    dynamic allocation is enabled) — task scheduling reuses the same JVMs
+    across many tasks to avoid JVM startup overhead per task.
+
+CLUSTER MANAGER
+  - Allocates resources (containers/executors) to the Spark application.
+  - Options: Standalone, YARN, Kubernetes, Mesos (largely deprecated). On
+    Databricks, this is abstracted — the Databricks cluster manager sits on
+    top of the cloud provider (EC2/Azure VMs/GCE) and handles executor
+    provisioning, including cluster autoscaling and spot-instance handling.
+
+EXECUTION FLOW (end-to-end)
+  1. Driver builds a logical plan from your DataFrame transformations
+     (lazy — nothing runs yet).
+  2. An action (.collect(), .write(), .count()) triggers the DAGScheduler to
+     convert the logical plan into a physical plan, then into stages split
+     at shuffle boundaries.
+  3. TaskScheduler assigns tasks (one task per partition per stage) to
+     executor core "slots."
+  4. Executors run tasks, report status back to the driver; failed tasks are
+     retried (up to spark.task.maxFailures, default 4) on other executors.
+  5. Results are either written to storage or, for .collect()-style actions,
+     serialized back to the driver.
+
+================================================================================
+3. JOBS, STAGES, TASKS — THE EXECUTION HIERARCHY
+================================================================================
+
+JOB
+  - Triggered by one action (.collect(), .write(), .count(), etc.). One
+    Spark application can run many jobs sequentially or concurrently.
+
+STAGE
+  - A job is split into stages at shuffle boundaries. Each stage contains a
+    sequence of transformations that can be pipelined without moving data
+    across the network (narrow transformations chained together).
+  - Stages run in order determined by the DAG; stages with no interdependency
+    can in principle run concurrently if the cluster has capacity (rare in
+    practice for a single linear DAG, common when multiple output actions
+    share upstream stages).
+
+TASK
+  - The smallest unit of work: one task processes one partition of data
+    within a stage. Number of tasks in a stage = number of partitions of the
+    RDD/DataFrame at that point.
+  - Task count directly determines parallelism — too few tasks underutilizes
+    the cluster (some cores idle), too many tasks adds scheduling overhead
+    and can produce too many small output files.
+
+NARROW vs. WIDE TRANSFORMATIONS
+  Narrow: each input partition contributes to at most one output partition —
+    no data movement across the network. Examples: map, filter, select,
+    union (mostly), mapPartitions. These stay within a single stage.
+  Wide (shuffle): each output partition may depend on data from multiple
+    input partitions across the cluster — requires a shuffle. Examples:
+    groupBy, join (non-broadcast), distinct, repartition, orderBy/sort,
+    reduceByKey-style aggregations. These create a new stage boundary.
+
+WORKED EXAMPLE
+  df.filter(...).select(...).groupBy("key").agg(sum("val")).join(other_df,
+  "key").write.parquet(path)
+    Stage 1: filter + select + the map-side (partial) aggregation of groupBy
+             (narrow, pipelined) -> shuffle write
+    Stage 2: reads shuffled data, completes groupBy aggregation -> possibly
+             another shuffle for the join (unless broadcast join applies)
+    Stage 3: join + write (narrow from the join's build side onward)
+  Interviewers want you to identify the shuffle boundaries and explain WHY
+  each one exists.
+
+================================================================================
+4. THE CATALYST OPTIMIZER (LOGICAL -> PHYSICAL PLAN)
+================================================================================
+
+Catalyst is Spark SQL's query optimizer (also used by the DataFrame API,
+since DataFrame ops compile down to the same plan representation). Pipeline:
+
+  1. PARSE: SQL string or DataFrame API calls -> Unresolved Logical Plan
+     (references to columns/tables not yet validated against the catalog).
+  2. ANALYZE: resolve column/table references against the catalog (Unity
+     Catalog / Hive Metastore) -> Resolved Logical Plan. This is where
+     "column not found" / "table not found" errors surface.
+  3. LOGICAL OPTIMIZATION: rule-based rewrites on the logical plan —
+     predicate pushdown, constant folding, projection pruning, boolean
+     simplification, null propagation. Produces an Optimized Logical Plan.
+  4. PHYSICAL PLANNING: generate one or more Physical Plans (e.g., which
+     join algorithm to use) using a cost model, pick the cheapest ->
+     Selected Physical Plan.
+  5. CODE GENERATION: Tungsten's whole-stage code generation compiles the
+     physical plan into optimized JVM bytecode, collapsing multiple
+     operators into a single generated function to avoid virtual function
+     call / iterator overhead per row.
+
+KEY LOGICAL OPTIMIZATIONS TO NAME IN AN INTERVIEW
+  - Predicate pushdown: filters pushed as close to the data source as
+    possible (e.g., into the Parquet reader, or into a JDBC WHERE clause)
+    so fewer rows are read/deserialized at all.
+  - Projection pruning (column pruning): only columns actually referenced
+    downstream are read from columnar storage — this is why Parquet's
+    columnar layout pairs so well with Spark.
+  - Constant folding: expressions with constant inputs evaluated once at
+    plan time, not per row.
+  - Partition pruning: for partitioned tables, partitions that can't match
+    the filter predicate are skipped entirely at the file-listing stage
+    (never even scheduled as tasks).
+
+WHY THIS MATTERS PRACTICALLY
+  If you filter AFTER a wide select or after a join in your code, Catalyst
+  usually reorders this for you (predicate pushdown past a projection or
+  even past certain joins) — but not always (e.g., filters that reference
+  columns produced by a UDF can't be pushed past the UDF, since Spark can't
+  reason about UDF internals). This is a genuinely good interview point:
+  "UDFs are optimization barriers for Catalyst" — prefer built-in functions
+  over UDFs whenever possible for this reason, in addition to the
+  serialization cost of Python UDFs (see Section 6).
+
+================================================================================
+5. TUNGSTEN EXECUTION ENGINE (MEMORY & CODEGEN)
+================================================================================
+
+Tungsten is the physical execution layer focused on CPU and memory
+efficiency, introduced to move Spark's bottleneck from I/O to CPU-bound
+processing efficiency. Three pillars:
+
+  1. OFF-HEAP BINARY MEMORY MANAGEMENT: Spark represents rows in a compact
+     binary format (UnsafeRow) instead of JVM objects, avoiding JVM object
+     overhead (headers, boxing) and reducing garbage collection pressure —
+     this is why Spark's memory tuning conversation is different from a
+     "just give it more heap" answer; the binary format itself reduces GC.
+  2. CACHE-FRIENDLY, CPU-EFFICIENT ALGORITHMS: operates directly on the
+     binary format where possible, exploiting CPU cache locality.
+  3. WHOLE-STAGE CODE GENERATION: instead of the classic "Volcano" iterator
+     model (each operator pulls one row at a time through a chain of
+     virtual function calls), Catalyst's code generator fuses a chain of
+     operators (filter -> project -> another filter) into a single
+     generated Java function, eliminating per-row virtual dispatch
+     overhead. You can see this in an explain plan as a "WholeStageCodegen"
+     node wrapping several operators.
+
+WHAT BREAKS WHOLE-STAGE CODEGEN
+  Python UDFs are the classic example: a Python UDF requires serializing
+  each row out of the JVM, sending it to a Python worker process, executing
+  arbitrary Python, and deserializing the result back — this cannot be
+  fused into generated JVM bytecode, forcing a codegen boundary and the
+  cross-process serialization cost on every row. Pandas UDFs (vectorized
+  UDFs using Apache Arrow) mitigate this substantially by batching rows into
+  Arrow record batches instead of row-by-row serialization, but a native
+  Spark SQL function is still faster because it stays fully in JVM codegen.
+
+================================================================================
+6. SHUFFLE DEEP DIVE — THE #1 INTERVIEW TOPIC
+================================================================================
+
+WHAT A SHUFFLE ACTUALLY DOES
+  A shuffle redistributes data across the cluster so that all records with
+  the same key end up on the same partition/executor (needed for groupBy,
+  join, distinct, repartition, sort). It involves:
+    1. Map (shuffle write) side: each task writes its output records to
+       disk, partitioned (bucketed) by the target partitioning function
+       (usually a hash of the key, or range-based for sort operations),
+       producing shuffle files plus an index file.
+    2. Shuffle service / block manager tracks where each shuffle block
+       lives.
+    3. Reduce (shuffle read) side: each downstream task fetches (over the
+       network) the specific shuffle blocks relevant to its partition from
+       every map task's output.
+
+WHY SHUFFLE IS EXPENSIVE
+  - Disk I/O: map-side output is written to local disk (not just memory) so
+    it survives task failure/re-fetch.
+  - Network I/O: reduce-side tasks fetch data across the network from
+    potentially every other node in the cluster (all-to-all communication
+    pattern) — this is the dominant cost at scale.
+  - Serialization/deserialization overhead on both sides.
+  - Can spill further to disk again on the reduce side if the aggregation/
+    sort doesn't fit in the reduce task's allotted execution memory.
+
+SHUFFLE PARTITIONS CONFIG
+  spark.sql.shuffle.partitions (default 200, often wrong for your data
+  size) controls the number of partitions AFTER a shuffle. Too low ->
+  each reduce task handles too much data, spills to disk, slow / OOM risk.
+  Too high -> many tiny tasks, scheduling overhead dominates, and you get
+  a "small files" problem on write. AQE (Section 9) now auto-tunes this at
+  runtime in modern Spark, which is the answer to "how do you pick shuffle
+  partitions in 2026" — you mostly don't have to hand-tune it anymore, AQE
+  coalesces small post-shuffle partitions automatically.
+
+MINIMIZING SHUFFLE — THE ANSWER INTERVIEWERS WANT
+  - Filter and select (project) BEFORE any wide operation to shrink the
+    volume of data that has to be shuffled.
+  - Use broadcast joins instead of shuffle joins when one side is small
+    enough to fit in executor memory (see Section 8) — this eliminates the
+    shuffle entirely for that join.
+  - Pre-partition/bucket data by the join/groupBy key at write time (e.g.,
+    bucketed tables) so that repeated joins/aggregations on that key don't
+    re-shuffle every time (shuffle happened once, at write time).
+  - Use reduceByKey-style map-side pre-aggregation semantics (DataFrame
+    .groupBy().agg() already does map-side partial aggregation
+    automatically, unlike the old RDD groupByKey which shuffles all raw
+    records — always prefer DataFrame/Dataset aggregation APIs over RDD
+    groupByKey for this reason).
+  - Avoid unnecessary repartition() calls; use coalesce() when reducing
+    partition count without needing a full shuffle (coalesce avoids shuffle
+    by combining existing partitions, at the cost of potentially uneven
+    partition sizes — know this tradeoff explicitly).
+
+================================================================================
+7. PARTITIONING, SKEW, AND SALTING
+================================================================================
+
+DATA SKEW
+  When one or a few partition keys have disproportionately more data than
+  others (e.g., one customer_id with 40% of all transactions), the tasks
+  handling those keys take dramatically longer than the rest — the stage's
+  wall-clock time is bounded by its slowest task, so 199 fast tasks finishing
+  in 30 seconds and 1 task taking 25 minutes means the STAGE takes 25 minutes.
+  This is the single most common real-world Spark performance problem and a
+  very common interview question ("your job has 199 tasks finish instantly
+  and 1 task hangs — what do you do?").
+
+DIAGNOSING SKEW
+  - Spark UI: look at the stage's task duration distribution — a huge gap
+    between median and max task duration is the signature.
+  - AQE's skew join handling (Section 9) detects this automatically for
+    sort-merge joins in modern Spark and splits the oversized partition.
+
+MANUAL SALTING TECHNIQUE (when AQE isn't sufficient or applicable, e.g. a
+skewed groupBy rather than a join)
+  1. Add a random "salt" suffix (e.g., 0-9) to the skewed key on one side:
+     salted_key = concat(key, '_', (rand() * N).cast("int"))
+  2. Explode the OTHER side (or the small side) to match all N salt values
+     for that key, so every salted variant has a matching row to join
+     against.
+  3. Join/aggregate on the salted key, which spreads the previously-hot key
+     across N partitions instead of 1.
+  4. Strip the salt suffix and do a final aggregation to combine the
+     partial results back into the true per-key result, if aggregating.
+
+WHEN TO USE BROADCAST INSTEAD
+  If the skew is on a JOIN and one side is small, broadcasting the small
+  side sidesteps the skew problem entirely (see Section 8) — always mention
+  this as the first, simpler option before reaching for salting.
+
+PARTITIONING FOR STORAGE (physical layout, distinct from shuffle
+partitions)
+  - Partition by low-cardinality columns frequently used in filters
+    (date, region, category) so partition pruning can skip irrelevant data
+    at scan time.
+  - Avoid over-partitioning: partitioning by high-cardinality columns
+    (user_id) creates millions of tiny partitions/files — kills both
+    listing performance and file I/O efficiency ("small file problem").
+  - Delta Lake's Z-ORDER / liquid clustering is the modern answer for
+    secondary access patterns beyond the primary partition column, since
+    you can only physically partition by one (or a small composite of)
+    column(s) before over-partitioning becomes a problem — covered in
+    Section 15.
+
+================================================================================
+8. JOINS: STRATEGIES AND WHEN SPARK PICKS WHICH ONE
+================================================================================
+
+BROADCAST HASH JOIN
+  - The smaller side is collected to the driver and broadcast (sent whole)
+    to every executor; the larger side is then joined locally on each
+    executor with no shuffle of the large side at all.
+  - Spark auto-selects this when the smaller table's estimated size is
+    below spark.sql.autoBroadcastJoinThreshold (default 10MB — usually
+    worth raising explicitly for known-small dimension tables, e.g. to
+    100MB-a few hundred MB depending on executor memory).
+  - Can be forced with broadcast(df) hint. Fastest join strategy when
+    applicable — always the first thing to check for when a join is slow
+    and one side is small ("dimension table").
+  - Risk: broadcasting a table that's actually too large causes driver/
+    executor OOM — know the failure mode, not just the happy path.
+
+SHUFFLE HASH JOIN
+  - Both sides shuffled (partitioned) by the join key, then a hash table is
+    built from the smaller side's partition and probed by the larger side's
+    partition, per-partition, on the executor.
+  - Requires the smaller side's partition to fit in memory per-task; less
+    commonly the default choice vs. sort-merge in modern Spark, but still
+    selectable, and relevant to explain conceptually.
+
+SORT-MERGE JOIN (SMJ) — the default for large-large joins
+  - Both sides shuffled and sorted by the join key, then merged in a single
+    linear pass (like the classic merge step of merge-sort).
+  - Doesn't require either side to fit fully in memory (spills gracefully),
+    which is why it's the safe default for large x large joins where
+    broadcast isn't an option.
+  - More expensive than broadcast (shuffle + sort cost on both sides) but
+    scales to arbitrarily large tables on both sides.
+
+BROADCAST NESTED LOOP JOIN / CARTESIAN
+  - Used for non-equi joins (e.g., range joins, joins with inequality
+    conditions) where hash-based join keys don't apply. Expensive —
+    O(n*m) — avoid at scale; mention this as a red flag to catch in a
+    query plan review ("if you see a join condition with '<' or 'BETWEEN'
+    and no equi-join component, expect this and budget accordingly, or
+    consider a range-partitioning/bucketing trick to bound it").
+
+HOW TO TELL WHICH JOIN WAS CHOSEN
+  Look at .explain() output for "BroadcastHashJoin," "SortMergeJoin," or
+  "ShuffleHashJoin" node names in the physical plan (worked examples in
+  Section 12).
+
+================================================================================
+9. ADAPTIVE QUERY EXECUTION (AQE)
+================================================================================
+
+AQE (on by default in modern Spark) re-optimizes the physical plan at RUNTIME
+using actual statistics gathered after earlier stages complete, rather than
+relying solely on static, pre-execution estimates (which are often wrong,
+especially after complex filters/UDFs where Catalyst's cost model can't
+predict output size accurately). Three main capabilities:
+
+  1. DYNAMICALLY COALESCING SHUFFLE PARTITIONS: after a shuffle, if many
+     resulting partitions are small, AQE merges them into fewer, larger
+     partitions automatically — this is why manually tuning
+     spark.sql.shuffle.partitions matters far less than it used to.
+  2. DYNAMICALLY SWITCHING JOIN STRATEGIES: if a table turns out to be
+     smaller than initially estimated (e.g., after an upstream filter
+     removed most rows), AQE can switch a planned sort-merge join to a
+     broadcast join at runtime, even though the static plan didn't
+     originally choose broadcast.
+  3. DYNAMICALLY OPTIMIZING SKEWED JOINS: AQE detects oversized shuffle
+     partitions (skew) in a sort-merge join at runtime and automatically
+     splits them into smaller sub-partitions (replicating the
+     corresponding partition on the other side as needed), avoiding manual
+     salting for the common case.
+
+WHEN AQE ISN'T ENOUGH
+  - Skew in operations AQE doesn't cover as directly (some groupBy skew
+    scenarios) — manual salting still has a place.
+  - Extreme broadcast candidates that are borderline in size — sometimes
+    still worth an explicit broadcast() hint rather than relying on AQE/
+    cost-based switching, for determinism in production pipelines.
+
+INTERVIEW TALKING POINT
+  Framing AQE correctly shows depth: "Static Catalyst optimization plans
+  once, before any data is read, based on estimates/statistics that can be
+  wrong. AQE re-plans between stages using real, measured statistics from
+  completed stages, closing the gap between estimated and actual
+  cardinality." This is a strong one-sentence answer for "what is AQE."
+
+================================================================================
+10. MEMORY MANAGEMENT DEEP DIVE
+================================================================================
+
+PER-EXECUTOR MEMORY REGIONS (Unified Memory Manager)
+  - Reserved memory: fixed, small (~300MB), off-limits, prevents OOM from
+    Spark's own bookkeeping.
+  - User memory: (1 - spark.memory.fraction) of the remaining heap —
+    for user data structures, UDFs' internal objects, RDD metadata. Not
+    managed by Spark.
+  - Spark memory (spark.memory.fraction, default 0.6): split further into
+      - Execution memory: shuffles, joins, sorts, aggregations — memory
+        needed for the actual computation.
+      - Storage memory: cached/persisted DataFrames and broadcast
+        variables.
+    These two share a unified pool with a movable boundary
+    (spark.memory.storageFraction sets the minimum guaranteed storage
+    region): execution can evict cached storage blocks under pressure (LRU),
+    but a minimum storage region is protected so execution can't fully
+    starve out all cached data. This unified model (vs. the old static
+    split pre-Spark 1.6) is worth naming explicitly if asked "how does
+    Spark decide between space for a join and space for a cached table."
+
+SPILLING
+  When execution memory for a given task (sort, aggregation, shuffle) is
+  insufficient, Spark spills intermediate data to local disk rather than
+  OOMing, and merges spilled data back in during the final pass. You can
+  see spill in the Spark UI (task metrics show "Spill (Memory)" / "Spill
+  (Disk)") — visible spill is a strong signal that either the task is
+  under-partitioned (too much data per partition) or the executor is
+  under-provisioned for the workload; this is a genuinely good diagnostic
+  answer for "how would you know if your job needs more memory vs. more
+  partitions."
+
+GARBAGE COLLECTION
+  Since Tungsten stores most row data off-heap in binary format, GC
+  pressure mostly comes from JVM objects your code/UDFs create (Python UDFs
+  don't even hit JVM heap for their own execution, since they run in a
+  separate Python process — but there IS serialization object overhead on
+  the JVM side to package rows for the Python worker). Long, frequent GC
+  pauses visible in the Spark UI's executor tab point to excessive object
+  creation, usually from UDF logic or very large broadcast variables, and
+  are addressed by reducing object churn, tuning executor JVM heap size, or
+  moving logic to native Spark SQL functions.
+
+================================================================================
+11. CACHING & PERSISTENCE
+================================================================================
+
+  - .cache() is shorthand for .persist(StorageLevel.MEMORY_AND_DISK) (in
+    modern Spark's default), which spills to disk if it doesn't fit in
+    memory rather than failing or silently recomputing.
+  - Caching is lazy: the actual caching happens the first time an action
+    materializes the DataFrame, not at the .cache() call itself.
+  - Only cache a DataFrame that will be reused multiple times downstream
+    (multiple actions, or multiple branches reading the same intermediate
+    result) — caching something used exactly once just adds overhead with
+    no payoff, a common interview trick question.
+  - Always .unpersist() when done, especially in long-running notebooks/
+    jobs with iterative logic, to free storage memory for other stages.
+  - Choosing a StorageLevel: MEMORY_ONLY (fast, but recomputes lost
+    partitions from lineage if evicted — expensive if lineage is long),
+    MEMORY_AND_DISK (safer default, spills instead of dropping), and
+    the _SER variants (serialized storage — more compact, less GC
+    pressure, small CPU cost to deserialize on read) for very large cached
+    datasets where memory is tight.
+  - Delta Lake caching (disk cache / IO cache on Databricks) is a separate,
+    lower-level mechanism from DataFrame .cache() — it caches remote Parquet
+    file bytes on local SSD, transparent to the query, distinct from
+    caching a specific DataFrame's computed result in executor memory. Know
+    the difference if asked.
+
+================================================================================
+12. READING EXPLAIN PLANS (WORKED EXAMPLES)
+================================================================================
+
+Calling df.explain() (or df.explain("formatted") / df.explain(True) for
+extended/all-plans output) shows the Catalyst plan stages. Reading bottom-up
+(physical operators execute in a tree, data flows from leaves/scans upward):
+
+EXAMPLE 1 — Simple filter + select
+  == Physical Plan ==
+  *(1) Project [id#10, name#11]
+  +- *(1) Filter (amount#12 > 100)
+     +- *(1) FileScan parquet [id#10,name#11,amount#12] ...
+             PushedFilters: [GreaterThan(amount,100)]
+
+  Reading this: the FileScan node shows PushedFilters — confirming the
+  amount > 100 predicate was pushed all the way into the Parquet reader
+  (predicate pushdown, Section 4), not applied only after a full read. The
+  "*(1)" prefix marks operators fused into WholeStageCodegen stage 1
+  (Section 5) — Project and Filter run as one generated function with no
+  intermediate materialization.
+
+EXAMPLE 2 — Join strategy identification
+  == Physical Plan ==
+  *(3) SortMergeJoin [cust_id#1], [cust_id#20], Inner
+  :- *(1) Sort [cust_id#1 ASC], false, 0
+  :  +- Exchange hashpartitioning(cust_id#1, 200)
+  :     +- *(1) FileScan parquet fact_orders ...
+  +- *(2) Sort [cust_id#20 ASC], false, 0
+     +- Exchange hashpartitioning(cust_id#20, 200)
+        +- *(2) FileScan parquet dim_customer ...
+
+  Reading this: two "Exchange" nodes (shuffles) — one per side — feed into
+  Sort nodes, then a SortMergeJoin. This confirms neither side was small
+  enough to broadcast (no BroadcastHashJoin / BroadcastExchange node
+  present). If dim_customer were expected to be small, seeing a
+  SortMergeJoin here instead of a BroadcastHashJoin is the signal to
+  investigate why broadcast didn't kick in (table stats stale? size
+  estimate wrong? threshold too low?) — a great "what would you check
+  next" interview answer.
+
+EXAMPLE 3 — Broadcast join confirmed
+  == Physical Plan ==
+  *(2) BroadcastHashJoin [cust_id#1], [cust_id#20], Inner, BuildRight
+  :- *(2) FileScan parquet fact_orders ...
+  +- BroadcastExchange HashedRelationBroadcastMode
+     +- *(1) FileScan parquet dim_customer ...
+
+  Reading this: BuildRight tells you dim_customer (the right side) was the
+  smaller table, materialized into a hash table and broadcast to every
+  executor via BroadcastExchange — no shuffle of fact_orders at all. This
+  is the fast path.
+
+WHAT TO PRACTICE
+  Given an explain plan, be able to say out loud: (1) which operators are
+  narrow vs. wide, (2) where the shuffle boundaries/stage splits are,
+  (3) which join strategy was picked and why, (4) whether pushdown/pruning
+  is actually happening based on the scan node's PushedFilters/
+  ReadSchema, and (5) one concrete optimization you'd try next.
+
+================================================================================
+13. COMMON PERFORMANCE PROBLEMS & DIAGNOSIS PLAYBOOK
+================================================================================
+
+SYMPTOM: One task takes far longer than the rest in a stage
+  DIAGNOSIS: data skew.
+  FIX: check if it's a join (try broadcast or AQE skew join handling first),
+  else salting for groupBy-style skew.
+
+SYMPTOM: Job has thousands of tiny output files
+  DIAGNOSIS: over-partitioned output, often from a high shuffle-partitions
+  setting combined with a small final result, or writing without
+  coalesce/repartition before the final write.
+  FIX: coalesce(N) before write, or enable AQE (auto-coalesces), or use
+  Delta's OPTIMIZE (compaction) as a post-write remediation.
+
+SYMPTOM: Job spends most of its time in GC (visible in Spark UI executor
+  tab as high "GC Time" relative to task duration)
+  DIAGNOSIS: excessive object creation, often from Python UDFs, very large
+  broadcast variables, or undersized executor heap for the workload.
+  FIX: replace UDFs with native functions/Pandas UDFs where possible,
+  increase executor memory, review broadcast variable size.
+
+SYMPTOM: Driver OOM
+  DIAGNOSIS: an action (.collect(), .toPandas()) pulled too much data back
+  to the driver, or a broadcast join is broadcasting a larger-than-expected
+  table (broadcast build happens partly on the driver).
+  FIX: avoid unnecessary .collect() on large DataFrames (write to storage
+  instead and read a sample if needed for inspection), verify broadcast
+  threshold/table size assumptions.
+
+SYMPTOM: Job is slow despite a small dataset
+  DIAGNOSIS: too many small tasks (partition count far exceeds core count,
+  scheduling overhead dominates), or a Cartesian/nested-loop join, or an
+  expensive Python UDF applied row-by-row on a dataset that should be
+  handled with vectorized Pandas UDFs or native functions.
+  FIX: repartition down to a sane task count for the data size (rule of
+  thumb: aim for 2-4 tasks per core, and partitions in the 100MB-a-few-
+  hundred-MB range each), check explain plan for accidental Cartesian
+  joins, replace UDFs with vectorized alternatives.
+
+SYMPTOM: Repeated identical computation across multiple downstream actions
+  DIAGNOSIS: missing .cache() on a DataFrame reused by multiple branches
+  (Spark's lazy evaluation recomputes the full lineage for each action
+  unless the intermediate result is cached).
+  FIX: .cache() (or .persist() with an appropriate StorageLevel) after the
+  expensive shared computation, before branching; .unpersist() when done.
+
+================================================================================
+14. STRUCTURED STREAMING INTERNALS
+================================================================================
+
+MICRO-BATCH EXECUTION MODEL (default trigger mode)
+  Structured Streaming treats a stream as an unbounded table, continuously
+  appended to. Internally, at each trigger interval it runs a normal batch
+  Spark job over the new data since the last checkpoint, using the exact
+  same Catalyst/Tungsten execution engine covered above — this is why
+  everything in Sections 4-10 applies directly to streaming jobs too; a
+  streaming job is just a batch job run repeatedly on new increments.
+
+CHECKPOINTING
+  Stores (a) the offsets/progress of what's been processed from each
+  source (e.g., Kafka offsets) and (b) any stateful operator state
+  (aggregation state for windowed operations, join state for
+  stream-stream joins) to durable storage (e.g., S3/DBFS). On restart
+  after failure, Spark resumes exactly from the last committed offset,
+  which combined with idempotent sinks (Delta MERGE) gives effectively-
+  exactly-once end-to-end semantics.
+
+STATEFUL OPERATIONS & STATE STORE
+  Windowed aggregations and stream-stream joins maintain state across
+  micro-batches in a State Store (versioned, checkpointed key-value store,
+  backed by RocksDB in modern Spark for large state — RocksDB state store
+  is the answer when asked "how do you handle state that's too large to
+  fit in executor memory," since it spills state to local disk with a
+  compact on-disk format rather than keeping it all as JVM objects in
+  memory).
+
+WATERMARKING (mechanism, building on the concept from System Design
+  handbook Section 4)
+  withWatermark("event_time", "10 minutes") tells Spark it can safely drop
+  state for any window whose end time is more than 10 minutes behind the
+  maximum event_time seen so far — this bounds state store growth (without
+  a watermark, state for every window/key accumulates forever, eventually
+  causing unbounded memory/disk growth) and determines how late-arriving
+  data is handled (dropped once its window's watermark has passed).
+
+OUTPUT MODES
+  Append: only new rows since the last trigger are output — required for
+    most sinks, doesn't support updates to previously-emitted aggregate
+    rows.
+  Update: only rows that changed since the last trigger are output — needs
+    a sink that supports upserts (e.g., a KV store, or Delta via foreachBatch
+    + MERGE).
+  Complete: the entire result table is output every trigger — only
+    practical for small aggregated results (e.g., a dashboard-sized summary
+    table), since it rewrites everything each time.
+
+TRIGGER TYPES
+  Fixed interval (default, e.g. trigger(processingTime="10 seconds")):
+    micro-batch every N seconds regardless of how long the previous batch
+    took (if the previous batch overruns the interval, the next one starts
+    immediately after it finishes rather than overlapping).
+  Trigger.Once / Trigger.AvailableNow: process all currently available data
+    as a single (or a few chunked) batch(es) then stop — this is the
+    pattern for running "streaming" logic on a schedule (e.g., hourly Job)
+    instead of a continuously running cluster, a genuinely important 2026
+    cost-optimization talking point (you get exactly-once/checkpoint-based
+    correctness with batch-like cost economics).
+  Continuous Processing (experimental, limited operator support): true
+    low-latency (~1ms) record-at-a-time processing rather than micro-batch
+    — mention it exists and its narrow applicability, but micro-batch
+    (AvailableNow especially) is the practical 2026 default answer.
+
+================================================================================
+15. DELTA LAKE INTERNALS
+================================================================================
+
+TRANSACTION LOG (_delta_log)
+  Every write to a Delta table produces a new JSON commit file in
+  _delta_log recording the exact set of Parquet files added/removed by
+  that transaction (not the data itself — just file-level metadata). Reads
+  reconstruct the current table state by replaying the log (with periodic
+  Parquet "checkpoint" files summarizing the log so far, so readers don't
+  have to replay every commit from table creation). This log is what gives
+  Delta ACID transactions on top of plain object storage: a write is only
+  "visible" once its commit JSON is atomically written (via an atomic
+  put-if-absent style operation on the underlying store), giving
+  serializable isolation for concurrent writers via optimistic concurrency
+  control (a writer reads the log version it started from, and if another
+  writer committed first, it retries by re-validating against the new log
+  state rather than blindly overwriting).
+
+TIME TRAVEL
+  Because every historical file-set is recoverable from the log (until
+  VACUUM removes old files), you can query a table as of a prior version
+  or timestamp — this is also the mechanism enabling safe experimentation/
+  rollback, and audit/compliance use cases.
+
+OPTIMIZE (compaction)
+  Rewrites many small Parquet files into fewer, larger, right-sized files
+  (target ~1GB by default, tunable) — directly addresses the small-file
+  problem from over-partitioned writes or frequent small streaming
+  micro-batch commits. Necessary because many small files hurt both scan
+  performance (per-file overhead: open, read footer, etc.) and driver-side
+  file-listing time at query planning.
+
+Z-ORDER / LIQUID CLUSTERING
+  Z-ORDER colocates related data for multiple columns within files using a
+  space-filling curve, so that filtering on ANY of the Z-ordered columns
+  (not just the primary partition column) benefits from data skipping via
+  file-level min/max statistics — this is the answer to "how do I get
+  partition-pruning-like benefits on a column I can't physically partition
+  by without over-partitioning." Liquid Clustering (2026 default direction
+  in Databricks) replaces manual partitioning + Z-ORDER with a single
+  clustering key that Databricks automatically maintains/rebalances over
+  time as data is written, avoiding the need to choose a fixed partition
+  scheme upfront and avoiding costly full-table OPTIMIZE ZORDER reruns.
+
+DATA SKIPPING
+  Delta stores min/max statistics per column per file in the transaction
+  log; at query time, files whose stats can't possibly satisfy the query's
+  filter are skipped without even opening them — this is a major reason
+  Delta tables outperform plain Parquet-on-S3 for selective queries, and
+  works hand-in-hand with Z-ORDER/clustering (clustering increases the
+  chance that a file's min/max range is narrow and therefore skippable).
+
+CHANGE DATA FEED (CDF)
+  Delta can record row-level change events (insert/update/delete with
+  before/after images) as a queryable stream/table alongside the main
+  table, enabling incremental downstream processing (e.g., propagating
+  only changed rows to a silver/gold table via MERGE, instead of
+  reprocessing the full table) — the mechanism referenced as a "Kappa-
+  style log" option in the System Design handbook, Section 4.
+
+================================================================================
+16. INTERVIEW QUESTION BANK WITH MODEL ANSWERS
+================================================================================
+
+Q: "Walk me through what happens when you call .collect() on a DataFrame
+   with a filter, a join, and a groupBy."
+A: "Nothing executes until .collect() — everything before it just builds a
+   logical plan lazily. On .collect(), Catalyst analyzes and optimizes the
+   logical plan (predicate/projection pushdown), generates a physical plan
+   choosing join and aggregation strategies, and the DAGScheduler splits it
+   into stages at shuffle boundaries — likely one stage for the pre-join
+   narrow work, a shuffle for the join (or a broadcast if one side is
+   small), and a stage for the groupBy's shuffle and final aggregation.
+   Tasks run per-partition on executors, and finally results are serialized
+   back to the driver, which is worth flagging as a potential OOM risk
+   if the result set is large."
+
+Q: "Your join is slow. What do you check first?"
+A: "First, .explain() to see which join strategy was picked. If it's a
+   sort-merge join and one side is actually small, I'd check why broadcast
+   didn't kick in — maybe table statistics are stale or the size estimate
+   is wrong, or the threshold needs raising. If both sides are genuinely
+   large, I'd check the Spark UI for skew in the shuffle stage (one task
+   dominating duration) and consider AQE's skew join handling, or manual
+   salting if that's insufficient."
+
+Q: "Why is groupByKey discouraged in favor of reduceByKey/DataFrame agg?"
+A: "groupByKey shuffles ALL raw records for a key across the network before
+   aggregating, because it doesn't know your aggregation is combinable.
+   reduceByKey and the DataFrame/Dataset aggregation APIs do a map-side
+   partial aggregation first — combining values locally on each executor
+   before shuffling — so only the partial (already-reduced) results move
+   across the network, which is dramatically less data for most
+   aggregations like sum/count/max."
+
+Q: "What's the difference between coalesce and repartition?"
+A: "repartition does a full shuffle to redistribute data into exactly N
+   partitions of roughly even size, and can increase or decrease partition
+   count. coalesce avoids a full shuffle by combining existing adjacent
+   partitions, so it's cheaper, but it can only decrease partition count
+   and can result in uneven partition sizes since it's just merging what's
+   already there rather than rebalancing."
+
+Q: "How does AQE change the cost-based optimization story?"
+A: "Static Catalyst optimization commits to a physical plan before any
+   data is read, using estimates that get less reliable after filters,
+   joins, or UDFs Catalyst can't see through. AQE re-optimizes BETWEEN
+   stages using actual measured statistics from completed stages — so it
+   can switch a sort-merge join to broadcast if a table turned out smaller
+   than estimated, coalesce small shuffle partitions automatically, and
+   split skewed partitions at runtime. It closes the gap between estimated
+   and actual cardinality that static planning can't."
+
+Q: "How would you debug a job that suddenly got 10x slower after a code
+   change, with the same data volume?"
+A: "I'd diff the explain plan before/after to see if a join strategy
+   changed (e.g., broadcast threshold no longer met because a new filter
+   was added after the join instead of before it, or a UDF was introduced
+   that creates a Catalyst optimization barrier blocking pushdown). I'd
+   also check the Spark UI for new skew, new shuffle stages that weren't
+   there before, or spill metrics indicating a stage is now memory-
+   constrained."
+
+================================================================================
+17. QUICK-REFERENCE CHEAT SHEET
+================================================================================
+
+EXECUTION HIERARCHY
+  Application -> Job (1 per action) -> Stage (split at shuffle boundaries)
+  -> Task (1 per partition)
+
+NARROW vs WIDE
+  Narrow (no shuffle): map, filter, select, mapPartitions, union
+  Wide (shuffle): groupBy, join (non-broadcast), distinct, repartition,
+  orderBy/sort
+
+JOIN STRATEGY QUICK PICK
+  One side small (< ~10MB-hundreds of MB)  -> Broadcast Hash Join (fastest)
+  Both sides large                          -> Sort-Merge Join (default)
+  Non-equi join condition                   -> Nested Loop / Cartesian
+                                                (expensive — avoid at scale)
+
+TOP 5 SHUFFLE-REDUCTION TACTICS
+  1. Filter/select before wide operations
+  2. Broadcast small dimension tables explicitly
+  3. Pre-bucket tables by frequent join/groupBy keys at write time
+  4. Prefer DataFrame agg (map-side partial agg) over RDD groupByKey
+  5. coalesce() instead of repartition() when only reducing partition count
+
+MEMORY REGIONS (per executor)
+  Reserved (~300MB fixed) | User memory | Spark memory (fraction, default
+  0.6) split into Execution + Storage (unified, movable boundary, execution
+  can evict cached storage under pressure)
+
+AQE, THREE THINGS IT DOES AT RUNTIME
+  1. Coalesce small post-shuffle partitions
+  2. Switch join strategy (e.g., to broadcast) based on actual sizes
+  3. Split skewed partitions in sort-merge joins automatically
+
+DELTA LAKE, FIVE CORE MECHANISMS
+  1. _delta_log JSON commits = ACID transactions on object storage
+  2. Time travel = query any historical log version
+  3. OPTIMIZE = compact small files into right-sized files
+  4. Z-ORDER / Liquid Clustering = multi-column data skipping
+  5. Change Data Feed = row-level change stream for incremental downstream
+     processing
+
+DIAGNOSTIC SIGNAL -> LIKELY CAUSE
+  One task much slower than others       -> skew
+  Thousands of tiny output files          -> over-partitioned write
+  High GC time in Spark UI                -> UDFs / object churn / broadcast
+                                              too large
+  Driver OOM                              -> .collect() on large data, or
+                                              broadcast build too big
+  Visible spill (memory/disk) in task     -> under-partitioned / under-
+  metrics                                    provisioned executor memory
+  Sort-merge join where broadcast was     -> stale stats, threshold too
+  expected                                   low, or size estimate wrong
+
+================================================================================
+END OF HANDBOOK
+================================================================================
