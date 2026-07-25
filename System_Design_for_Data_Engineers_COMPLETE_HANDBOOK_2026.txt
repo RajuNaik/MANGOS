@@ -1,0 +1,829 @@
+================================================================================
+SYSTEM DESIGN FOR DATA ENGINEERS — COMPLETE HANDBOOK (2026)
+MAANG / Top-Tier Tech Interview Preparation
+================================================================================
+Companion to: Databricks_COMPLETE_HANDBOOK_2026, Snowflake_COMPLETE_HANDBOOK_2026,
+Advanced_SQL_Scenarios_COMPLETE_HANDBOOK, Python_for_Data_Engineers_COMPLETE_HANDBOOK
+
+This handbook is standalone. No external references required.
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+ 1. How Data Engineering System Design Interviews Differ From SWE System Design
+ 2. The Interview Framework (RADIO-DE)
+ 3. Core Building Blocks Reference
+ 4. Foundational Concepts You Must Know Cold
+ 5. Capacity Estimation Cheat Sheet
+ 6. Data Modeling in System Design Context
+ 7. Nine Fully Worked Design Problems
+ 8. Common Follow-Up Questions & How to Handle Them
+ 9. Anti-Patterns / Red Flags Interviewers Watch For
+10. Company-Specific Patterns (Amazon, Google, Meta, Netflix, Databricks, Snowflake)
+11. Quick-Reference Cheat Sheet (numbers, tables, decision trees)
+
+================================================================================
+1. HOW DE SYSTEM DESIGN DIFFERS FROM SWE SYSTEM DESIGN
+================================================================================
+
+Traditional SWE system design (design Twitter, design a URL shortener) optimizes
+for read/write APIs serving user-facing traffic. DE system design optimizes for:
+
+- Data VOLUME, VELOCITY, VARIETY over request latency (usually — except real-time
+  pipelines where latency matters a lot)
+- Correctness and idempotency of data movement over raw QPS
+- Schema evolution and backward compatibility over API versioning
+- Cost of storage/compute at scale (this is a first-class design constraint,
+  not an afterthought)
+- Data quality, lineage, and observability as design requirements, not bolt-ons
+- Batch vs. streaming tradeoffs as the central architectural decision
+- Idempotent, replayable pipelines (a stream/job can and will fail and rerun)
+
+Interviewers are evaluating:
+  1. Can you clarify ambiguous requirements before designing?
+  2. Do you reason about volume/velocity/variety explicitly?
+  3. Do you pick the right ingestion pattern (batch/micro-batch/streaming)?
+  4. Do you handle late data, duplicates, schema drift, backfills?
+  5. Do you know the tradeoffs between storage/compute engines (not just names)?
+  6. Can you estimate cost and justify choices?
+  7. Do you talk about monitoring, data quality, and failure recovery?
+
+================================================================================
+2. THE INTERVIEW FRAMEWORK — "RADIO-DE"
+================================================================================
+
+Use this structure for every design question. Spend roughly the time budget shown
+for a 45-minute interview.
+
+R — Requirements gathering                                  (5-7 min)
+    Functional: what data sources, what consumers, what SLAs?
+    Non-functional: volume (GB/TB/PB per day), velocity (batch/near-real-time/
+    real-time), variety (structured/semi/unstructured), latency requirements,
+    consistency requirements, retention/compliance (GDPR, PII), cost sensitivity.
+
+A — Architecture / high-level design                        (10-12 min)
+    Draw source -> ingestion -> storage -> processing -> serving -> consumption.
+    Name the layer pattern (medallion: bronze/silver/gold, lambda, kappa).
+    Pick batch vs. streaming vs. hybrid explicitly and justify.
+
+D — Data model                                               (8-10 min)
+    Schema design (star/snowflake/wide table/data vault), partitioning strategy,
+    file format choice (Parquet/Delta/Iceberg/Avro), SCD handling if dimensional.
+
+I — Interfaces & integration                                 (5-7 min)
+    How do producers write? (API, CDC, file drop, Kafka). How do consumers read?
+    (SQL warehouse, API, dashboard, ML feature store). Contract/schema registry.
+
+O — Optimizations, scale, failure handling                   (10-12 min)
+    Partitioning/bucketing for skew, caching, compaction, backpressure, exactly-
+    once vs. at-least-once, idempotency keys, dead-letter queues, monitoring/
+    alerting, cost optimization (tiered storage, spot/serverless compute),
+    disaster recovery, schema evolution strategy.
+
+Always state assumptions out loud and ask 1-2 clarifying questions before
+committing to an architecture. Never jump straight into a diagram.
+
+================================================================================
+3. CORE BUILDING BLOCKS REFERENCE
+================================================================================
+
+INGESTION LAYER
+  - Batch file drop: S3/ADLS/GCS + Auto Loader / Lakeflow Connect / Fivetran
+  - CDC: Debezium, Fivetran, AWS DMS, Snowflake Snowpipe Streaming, Delta CDF
+  - Streaming: Kafka, Kinesis, Pub/Sub, Event Hubs
+  - API pull: scheduled jobs hitting REST/GraphQL APIs, pagination + backoff
+
+STORAGE LAYER
+  - Object storage (data lake): S3, ADLS Gen2, GCS — cheap, durable, decoupled
+    from compute
+  - Table format (lakehouse): Delta Lake, Apache Iceberg, Apache Hudi — bring
+    ACID transactions, schema evolution, time travel to object storage
+  - Data warehouse: Snowflake, BigQuery, Redshift — managed, strong SQL engine,
+    higher cost per TB than raw object storage
+  - OLTP: Postgres/MySQL/DynamoDB — source systems, not analytics targets
+
+PROCESSING LAYER
+  - Batch: Spark (Databricks), dbt, BigQuery SQL, EMR
+  - Stream processing: Spark Structured Streaming, Flink, Kafka Streams,
+    Kinesis Data Analytics
+  - Orchestration: Airflow, Dagster, Databricks Workflows/Lakeflow Jobs, Step
+    Functions
+
+SERVING LAYER
+  - BI/analytics: warehouse tables queried by Tableau/PowerBI/Looker
+  - ML: feature stores (Databricks Feature Store, Feast, SageMaker Feature Store)
+  - Real-time apps: low-latency KV stores (DynamoDB, Redis, Cassandra, Lakebase)
+  - Reverse ETL: pushing warehouse data back into SaaS tools (Salesforce, etc.)
+
+GOVERNANCE / METADATA
+  - Catalogs: Unity Catalog, Glue Catalog, Polaris (Iceberg), Snowflake Horizon
+  - Schema registry: Confluent Schema Registry, AWS Glue Schema Registry
+  - Lineage & quality: Unity Catalog lineage, Great Expectations, DLT
+    expectations, Monte Carlo
+
+================================================================================
+4. FOUNDATIONAL CONCEPTS YOU MUST KNOW COLD
+================================================================================
+
+BATCH vs. MICRO-BATCH vs. STREAMING
+  Batch: scheduled, high throughput, minutes-to-hours latency, simplest to
+    reason about, cheapest per byte processed.
+  Micro-batch: Spark Structured Streaming default mode — processes small
+    batches every N seconds; good middle ground (seconds-to-minutes latency).
+  True streaming: Flink/Kafka Streams — event-at-a-time, sub-second latency,
+    higher operational complexity, stateful operators need careful tuning.
+  Rule of thumb in interviews: default to batch/micro-batch unless the
+  requirement explicitly calls for sub-second or single-digit-second latency
+  (fraud detection, real-time bidding, live dashboards).
+
+LAMBDA vs. KAPPA ARCHITECTURE
+  Lambda: separate batch layer (accurate, replayable) + speed layer (fast,
+    approximate) merged at serving time. Pro: batch layer corrects speed-layer
+    errors. Con: two codebases to maintain.
+  Kappa: everything is a stream; batch is just "replay the stream from the
+    beginning." Simplifies to one codebase but requires a durable, replayable
+    log (Kafka with long retention, or a lakehouse table as the log).
+  2026 trend: lakehouse table formats (Delta/Iceberg) with CDF (Change Data
+  Feed) let you treat table history like a Kappa log, blurring the line —
+  mention this as a modern alternative.
+
+MEDALLION ARCHITECTURE (bronze/silver/gold)
+  Bronze: raw, as-landed, append-only, schema-on-read tolerant, full history.
+  Silver: cleaned, deduplicated, conformed types, business keys resolved,
+    still fairly granular (one row per event/transaction).
+  Gold: aggregated, denormalized, business-level tables ready for BI/ML —
+    star schemas, KPI marts.
+  This maps directly to your Databricks handbook content — reuse it explicitly
+  when the interviewer says "design a lakehouse."
+
+CAP THEOREM (for any distributed storage component you mention)
+  Consistency, Availability, Partition tolerance — pick 2 under a network
+  partition. Most DE storage (S3, Delta, Kafka) is AP-leaning with tunable
+  consistency (Delta gives you serializable ACID via the transaction log
+  despite the underlying store being eventually consistent object storage).
+
+CONSISTENCY / DELIVERY SEMANTICS
+  At-most-once: may lose data, never duplicates. Rarely acceptable.
+  At-least-once: never loses data, may duplicate — requires idempotent sinks
+    or downstream dedup (merge/upsert on a natural key).
+  Exactly-once: achieved via idempotent writes + checkpointing (Spark
+    Structured Streaming checkpoints + Delta MERGE, or Kafka transactional
+    producer + consumer offsets committed atomically with output).
+  Interview tip: say "exactly-once processing" is really "at-least-once
+  delivery + idempotent consumer" in almost every real system — this shows
+  depth.
+
+IDEMPOTENCY
+  Design every write to be safely repeatable: use MERGE/upsert keyed on a
+  natural or surrogate key + event timestamp, not blind INSERT/append, for
+  any pipeline that might retry or reprocess.
+
+LATE DATA & WATERMARKING
+  Streaming systems must decide how long to wait for late-arriving events
+  before finalizing a window. Watermark = event_time_max_seen - allowed_lateness.
+  Data arriving after the watermark passes is either dropped or routed to a
+  correction/backfill path. Always mention watermarking when discussing
+  windowed streaming aggregations.
+
+PARTITIONING & SKEW
+  Partition storage by low-cardinality, frequently-filtered columns (date,
+  region) — avoid over-partitioning (too many small files) and under-
+  partitioning (partitions too large to prune). For Spark shuffle skew, use
+  salting (append random suffix to skewed keys, explode on the join side) or
+  Adaptive Query Execution (AQE) skew join handling.
+
+SCHEMA EVOLUTION
+  Additive changes (new nullable column) should never break pipelines. Use a
+  schema registry with backward/forward compatibility rules for streaming;
+  use MERGE SCHEMA / schema evolution features in Delta/Iceberg for batch.
+  Always design a dead-letter path for records that fail schema validation.
+
+FILE FORMATS
+  Parquet: columnar, compressed, splittable — the default for analytics.
+  Avro: row-based, schema embedded — good for streaming/Kafka payloads with
+    frequent schema evolution.
+  ORC: columnar, Hive ecosystem — largely superseded by Parquet in new builds.
+  Delta/Iceberg/Hudi: not file formats per se — transactional metadata layers
+    on top of Parquet giving ACID, time travel, schema evolution, upserts.
+
+COMPUTE: SERVERLESS vs. PROVISIONED
+  Serverless (BigQuery, Snowflake serverless, Databricks Serverless SQL/Jobs):
+    pay-per-query/per-second, zero ops, good for spiky/unpredictable workloads.
+  Provisioned clusters: cheaper at sustained high utilization, more control
+    over tuning, needed for custom libraries or long-running streaming jobs.
+
+================================================================================
+5. CAPACITY ESTIMATION CHEAT SHEET
+================================================================================
+
+Always do a back-of-envelope estimate out loud — interviewers reward this even
+if the exact numbers are approximate.
+
+DAILY VOLUME EXAMPLE WALKTHROUGH
+  "500M events/day, avg 1KB/event"
+    -> 500,000,000 * 1KB = ~500 GB/day raw
+    -> ~15 TB/month, ~180 TB/year raw (before compression)
+    -> Parquet/Delta compression typically 3-5x -> ~35-60 TB/year stored
+
+THROUGHPUT
+  500M events/day / 86,400 sec = ~5,800 events/sec average
+  Peak is usually 3-10x average -> design for ~20,000-50,000 events/sec peak
+  for a consumer-scale clickstream system.
+
+USEFUL LATENCY NUMBERS (order of magnitude, memorize the shape not the exact ms)
+  Kafka produce/consume round trip:            ~5-20 ms
+  Spark Structured Streaming micro-batch:       1-30 sec (config-dependent)
+  Flink event-time processing:                  sub-second to a few sec
+  Batch Spark job (TB scale):                   minutes to low tens of minutes
+  Data warehouse query (well-modeled gold table): sub-second to a few seconds
+  S3/ADLS GET latency:                          tens of ms
+
+STORAGE COST INTUITION (rough, for reasoning not memorization)
+  Object storage (S3 standard): cheapest per GB, use for bronze/raw + cold data
+  Warehouse native storage (Snowflake/BigQuery): more expensive per GB but
+    optimized for query performance — use for gold/serving layer
+  Tiered/lifecycle policies: move bronze data to infrequent-access/glacier
+    tiers after N days; this is a real, expected talking point.
+
+RULE OF THUMB FOR CHOOSING BATCH vs STREAMING BY LATENCY SLA
+  SLA > 1 hour            -> batch (scheduled, e.g. hourly/daily Spark job)
+  SLA 1-15 min            -> micro-batch (Spark Structured Streaming trigger
+                              interval, or frequent Airflow batch)
+  SLA < 1 min / near-real-time -> Kafka + Flink/Spark Streaming, or Kinesis
+                              Data Analytics
+  SLA sub-second           -> in-memory stream processing + KV store serving
+                              (rare in pure DE interviews, more common at the
+                              app/infra boundary)
+
+================================================================================
+6. DATA MODELING IN SYSTEM DESIGN CONTEXT
+================================================================================
+
+Bring your existing SQL/Databricks modeling knowledge into the design but
+frame it at a systems level:
+
+STAR SCHEMA (gold layer default)
+  Fact table: one row per business event (order_line, page_view, transaction),
+  numeric measures, foreign keys to dimensions. Grain must be stated explicitly
+  ("one row per order line item," not "per order") — interviewers probe this.
+  Dimension tables: descriptive attributes, SCD Type 1/2 as needed.
+
+WIDE/DENORMALIZED TABLES
+  Common in modern lakehouse gold layers to avoid joins at BI-query time —
+  tradeoff is storage duplication vs. query simplicity/speed. Mention this as
+  a deliberate choice for BI-heavy consumption patterns.
+
+DATA VAULT (mention only if asked about highly regulated / audit-heavy /
+multi-source enterprise integration — hubs/links/satellites give full history
+and traceability at the cost of query complexity; usually paired with a star
+schema "presentation" layer on top).
+
+ONE BIG TABLE (OBT) pattern
+  Increasingly common for ML feature pipelines and self-serve BI in 2026 —
+  flatten fact + dimensions into one wide table per domain to minimize joins
+  for both analysts and feature pipelines. Tradeoff: storage cost, harder to
+  maintain single source of truth for shared dimensions.
+
+SCD HANDLING AT SCALE
+  SCD Type 2 via MERGE INTO with effective/expiry timestamps and a current-
+  flag column — you've implemented this already for Coca-Cola sales data, so
+  reuse that concrete example when asked "how would you track changing
+  customer/product attributes over time?"
+
+================================================================================
+7. NINE FULLY WORKED DESIGN PROBLEMS
+================================================================================
+
+--------------------------------------------------------------------------------
+PROBLEM 1: Design a Lakehouse Platform for a Global Retailer (e.g. GlobalMart)
+--------------------------------------------------------------------------------
+CLARIFYING QUESTIONS
+  - Data sources? (POS transactions, e-commerce clickstream, inventory, CRM)
+  - Consumers? (BI analysts, data scientists, finance reporting)
+  - Freshness SLA for each domain?
+  - Regulatory constraints (PCI for payment data, GDPR for EU customers)?
+
+REQUIREMENTS (assumed)
+  - 50 stores + e-commerce, ~10M transactions/day, ~200M clickstream events/day
+  - BI needs data within 1 hour; ML feature pipelines need near-real-time
+    inventory signals; finance needs daily reconciled gold tables.
+
+ARCHITECTURE
+  Sources -> Auto Loader/Kafka -> Bronze (raw, append-only, partitioned by
+  ingestion_date) -> Silver (deduped, conformed schema, SCD2 for dimensions,
+  partitioned by event_date + region) -> Gold (star schema marts: sales_fact,
+  inventory_fact, customer_dim with SCD2) -> Unity Catalog governs all layers
+  -> BI tools query gold via SQL warehouse; ML reads silver/gold via Feature
+  Store.
+  Streaming clickstream goes through Kafka -> Structured Streaming -> bronze
+  (continuous) while POS batch files land hourly via Auto Loader.
+
+DATA MODEL
+  sales_fact (grain: one row per order line), customer_dim (SCD2),
+  product_dim (SCD2), store_dim, date_dim. Partition sales_fact by
+  transaction_date, Z-order/cluster by store_id for point lookups.
+
+KEY DECISIONS & JUSTIFICATION
+  - Delta Lake for ACID MERGE support (needed for SCD2 and CDC-based updates)
+  - Medallion layering to isolate raw fidelity from business logic — enables
+    reprocessing silver/gold without re-ingesting bronze
+  - Unity Catalog for centralized governance/lineage across all domains
+
+OPTIMIZATIONS & FAILURE HANDLING
+  - Auto Loader schema evolution + rescued data column for malformed records
+  - OPTIMIZE + Z-ORDER on gold tables nightly; VACUUM with 7-day retention
+  - DLT expectations (or Great Expectations) enforce data quality gates
+    bronze->silver; failed records to a quarantine table, not dropped silently
+  - Idempotent MERGE keyed on transaction_id for exactly-once semantics on
+    reprocessing/backfill
+
+FOLLOW-UPS AN INTERVIEWER MIGHT ASK
+  - "How do you backfill 6 months of historical data without breaking the
+    live pipeline?" -> separate backfill job writing to same silver/gold
+    tables via MERGE, throttled compute, run during off-peak.
+  - "How do you handle a schema change in the POS source system?" -> schema
+    registry / Auto Loader schema evolution + silver-layer contract tests.
+
+--------------------------------------------------------------------------------
+PROBLEM 2: Design a Real-Time Clickstream Analytics Pipeline
+--------------------------------------------------------------------------------
+REQUIREMENTS
+  - 200M events/day, need page-view/session metrics visible on a live
+    dashboard within 10-30 seconds.
+
+ARCHITECTURE
+  Web/app SDK -> Kafka (partitioned by user_id/session_id) -> Spark Structured
+  Streaming (or Flink) with watermarking for session windows -> aggregated
+  metrics written to a low-latency serving store (Delta table optimized for
+  streaming reads, or Redis/DynamoDB for the "last 5 minutes" hot path) ->
+  dashboard polls/subscribes.
+  Raw events also land in bronze Delta table (via the same Kafka topic, a
+  parallel sink) for historical analysis/ML — this is the Kappa-style "single
+  log, two consumers" pattern.
+
+DATA MODEL
+  Event schema: event_id, user_id, session_id, event_type, event_time,
+  page_url, metadata (semi-structured JSON/map column). Sessionization via
+  session_window(event_time, gap_duration="30 minutes") in Structured
+  Streaming.
+
+KEY DECISIONS
+  - Kafka partitioned by session_id ensures ordered processing per session on
+    a single consumer, critical for correct sessionization
+  - Watermark of ~2 minutes balances latency vs. handling late mobile events
+  - Two sinks from one stream (hot serving store + bronze lake table) avoids
+    dual-write inconsistency by having a single source of truth (the topic)
+
+OPTIMIZATIONS & FAILURE HANDLING
+  - Checkpointing to durable storage (S3) for exactly-once restart semantics
+  - Dead-letter topic for malformed events (schema registry rejects on
+    produce, or a try/catch sink for parse failures)
+  - Backpressure handled via Kafka consumer lag monitoring + autoscaling
+    Spark/Flink task managers
+
+FOLLOW-UPS
+  - "What if a user's events arrive out of order across two devices?" ->
+    session-level watermarking tolerates bounded disorder; document the
+    allowed-lateness tradeoff explicitly.
+  - "How do you handle a Kafka partition hot-spotting on a viral session?" ->
+    consider a composite partition key or a secondary micro-batching path
+    for anomalous keys.
+
+--------------------------------------------------------------------------------
+PROBLEM 3: Design a CDC Pipeline Replicating an OLTP Database to the Lakehouse
+--------------------------------------------------------------------------------
+REQUIREMENTS
+  - Postgres OLTP (orders, customers) -> near-real-time replica in Delta Lake
+    for analytics, without impacting OLTP performance.
+
+ARCHITECTURE
+  Postgres WAL -> Debezium (Kafka Connect source connector) -> Kafka topics
+  (one per table) -> Spark Structured Streaming or Delta CDF consumer ->
+  Delta MERGE into silver tables mirroring OLTP schema, with SCD2 optionally
+  applied for dimension-like tables (customers).
+
+DATA MODEL
+  Mirror source schema in bronze (raw CDC events: before/after images, op
+  type insert/update/delete, LSN/offset). Silver applies MERGE logic:
+  insert -> new row; update -> MERGE on primary key; delete -> soft-delete
+  flag (is_deleted) rather than physical delete, to preserve history for
+  SCD2 and auditability.
+
+KEY DECISIONS
+  - Log-based CDC (WAL tailing) instead of query-based polling: no load on
+    the source DB, captures deletes, preserves ordering
+  - Kafka as durable buffer decouples source availability from downstream
+    processing speed
+  - Soft deletes in the lakehouse preserve analytical history even though
+    the source system hard-deletes
+
+OPTIMIZATIONS & FAILURE HANDLING
+  - Exactly-once via Kafka offsets + Delta MERGE idempotency (MERGE keyed on
+    primary key + LSN ensures replays don't double-apply)
+  - Snapshot + incremental: initial full snapshot via Debezium snapshot mode,
+    then continuous incremental CDC
+  - Monitor replication lag (LSN behind) as the primary SLA metric, alert if
+    lag exceeds threshold
+
+FOLLOW-UPS
+  - "Source DB does a schema migration (ALTER TABLE ADD COLUMN) — what
+    happens?" -> Debezium emits new schema version to schema registry;
+    downstream MERGE with mergeSchema=true handles additive changes
+    automatically; breaking changes need a coordinated rollout.
+  - "How do you validate the replica is correct?" -> periodic row-count/
+    checksum reconciliation jobs comparing source vs. replica.
+
+--------------------------------------------------------------------------------
+PROBLEM 4: Design a Log Aggregation & Monitoring Data Pipeline
+--------------------------------------------------------------------------------
+REQUIREMENTS
+  - Collect logs/metrics from thousands of microservices, support both
+    real-time alerting (seconds) and long-term analytics (queryable for 1 yr).
+
+ARCHITECTURE
+  Services -> lightweight agent (Fluentd/Fluent Bit/Vector) -> Kafka (or
+  cloud-native equivalent: Kinesis Firehose) -> two parallel consumers:
+    (a) Stream processor (Flink) computing rolling error-rate/latency
+        aggregates -> alerting system (PagerDuty via rules engine) — SLA:
+        seconds.
+    (b) Batch/micro-batch sink to lakehouse (Delta, partitioned by
+        service/date) for long-term analytics and ad-hoc querying — SLA:
+        minutes.
+
+DATA MODEL
+  Log event: timestamp, service, severity, trace_id, message, structured
+  fields (map/JSON column for flexible schema-on-read). Partition by
+  date + service to bound partition size and support pruning on both
+  dimensions.
+
+KEY DECISIONS
+  - Fan-out from Kafka to both a fast stream processor and a batch lake sink
+    avoids duplicating agent-side complexity
+  - Structured logging (JSON) enforced at the agent/SDK level to avoid
+    expensive regex parsing downstream
+  - Tiered retention: hot (7 days, fast query) -> warm (90 days) -> cold
+    (1 year, infrequent access/glacier) to control cost
+
+OPTIMIZATIONS & FAILURE HANDLING
+  - Sampling for extremely high-volume debug-level logs to control cost,
+    with full retention for error/warn severity
+  - Circuit breaker on the agent side to avoid cascading failure if Kafka
+    is unavailable (local disk buffering)
+  - Compaction jobs to merge small files produced by high-frequency writes
+
+FOLLOW-UPS
+  - "How do you avoid the monitoring pipeline itself causing an outage
+    during a traffic spike (e.g. an incident generates a log storm)?" ->
+    rate limiting at the agent, priority queues (errors > info), autoscaling
+    consumers, backpressure-aware producers.
+
+--------------------------------------------------------------------------------
+PROBLEM 5: Design the Data Pipeline Behind a Recommendation System
+--------------------------------------------------------------------------------
+REQUIREMENTS
+  - Feed a recommendation model with fresh user behavior features; support
+    both offline training (batch, large history) and online inference
+    (low-latency feature lookup).
+
+ARCHITECTURE
+  Clickstream/purchase events -> Kafka -> (a) batch aggregation (Spark, daily)
+  computing historical features (30/60/90-day purchase counts, category
+  affinities) written to an offline feature store table (Delta/gold), and
+  (b) streaming aggregation (Structured Streaming) computing short-window
+  features (last-hour clicks) written to an online low-latency store
+  (DynamoDB/Redis/Lakebase) for real-time model serving.
+  A Feature Store (Databricks Feature Store/Feast) unifies both paths behind
+  consistent feature definitions to avoid train/serve skew.
+
+DATA MODEL
+  Feature table keyed by user_id (and item_id for item features), with
+  point-in-time correctness for training (join features as of the label
+  timestamp, not "as of now") to prevent data leakage.
+
+KEY DECISIONS
+  - Dual-path (batch + streaming) feature computation is the standard
+    pattern; the feature store abstraction is what prevents inconsistency
+    between the two paths
+  - Point-in-time joins for training data generation are non-negotiable —
+    this is the #1 thing interviewers probe for in ML-adjacent DE design
+
+OPTIMIZATIONS & FAILURE HANDLING
+  - Feature freshness monitoring (staleness alarms if streaming path lags)
+  - Backfill capability to recompute historical features when feature
+    logic changes (versioned feature definitions)
+
+FOLLOW-UPS
+  - "How do you prevent training/serving skew?" -> shared feature
+    transformation code (not reimplemented per path), feature store as
+    single source of truth, integration tests comparing batch vs. streaming
+    outputs on overlapping windows.
+
+--------------------------------------------------------------------------------
+PROBLEM 6: Design a Real-Time Fraud Detection Pipeline
+--------------------------------------------------------------------------------
+REQUIREMENTS
+  - Score every transaction for fraud risk within ~200ms-1s of occurrence;
+    must not add unacceptable latency to checkout; false negatives costly.
+
+ARCHITECTURE
+  Transaction event -> Kafka -> Flink (stateful stream processing) enriching
+  with recent user history (velocity checks: transactions in last 5 min,
+  geo-distance from last transaction) pulled from a low-latency KV store
+  (Redis) that's kept warm by a parallel streaming aggregation job -> ML
+  model inference (embedded in Flink or via a low-latency model-serving
+  endpoint) -> risk score -> decision service (allow/hold/block) -> outcome
+  event published back to Kafka for downstream audit/analytics in the
+  lakehouse.
+
+DATA MODEL
+  Feature vector per transaction assembled from: static account features
+  (from batch-computed profile table), real-time velocity features (from
+  Redis, updated by the streaming job), and transaction attributes.
+
+KEY DECISIONS
+  - Sub-second SLA rules out pure batch/micro-batch — true stream processing
+    (Flink) with in-memory state is required
+  - Separation of "scoring path" (must be fast) from "audit/analytics path"
+    (can be eventually consistent, lands in lakehouse via Kafka fan-out)
+  - Redis (or similar) as the online feature cache because Delta/warehouse
+    read latency (tens-hundreds of ms+) is too slow for this SLA
+
+OPTIMIZATIONS & FAILURE HANDLING
+  - Fail-open vs. fail-closed decision: if the scoring service times out,
+    define explicit fallback behavior (usually fail-open with a flag for
+    manual review, to avoid blocking legitimate transactions)
+  - Model versioning + shadow deployment (score in parallel, don't act) to
+    validate new fraud models before cutover
+  - Circuit breakers around the feature store and model endpoint
+
+FOLLOW-UPS
+  - "How would you evaluate a new fraud model without risking false
+    declines?" -> shadow mode scoring + offline replay against historical
+    labeled transactions in the lakehouse.
+
+--------------------------------------------------------------------------------
+PROBLEM 7: Design a Data Warehouse for E-Commerce Analytics (Batch, Star Schema)
+--------------------------------------------------------------------------------
+REQUIREMENTS
+  - Daily refreshed warehouse for finance/BI reporting: revenue, returns,
+    customer LTV, product performance. No real-time requirement.
+
+ARCHITECTURE
+  Source systems (order DB, CRM, ad-spend APIs) -> nightly batch extract
+  (Fivetran/custom API pulls) -> raw/staging schema in Snowflake or BigQuery
+  -> dbt transformations (staging -> intermediate -> marts) -> gold star
+  schema (fact_orders, fact_returns, dim_customer SCD2, dim_product,
+  dim_date) -> BI tool connects directly to marts.
+
+DATA MODEL
+  fact_orders grain: one row per order line item. dim_customer SCD2 tracks
+  address/segment changes over time so historical orders join to the
+  customer attributes valid AT THE TIME of the order (critical correctness
+  point to state explicitly).
+
+KEY DECISIONS
+  - Pure batch is appropriate given no real-time requirement — avoids
+    unnecessary streaming infrastructure cost/complexity
+  - dbt for transformation gives version-controlled, tested, documented SQL
+    transformations with built-in lineage
+  - ELT (load raw first, transform in-warehouse) over ETL, leveraging
+    warehouse compute elasticity — standard 2026 pattern
+
+OPTIMIZATIONS & FAILURE HANDLING
+  - Incremental dbt models (only process new/changed data) instead of full
+    rebuilds for large fact tables
+  - dbt tests (not_null, unique, referential integrity, custom business
+    rules) as automated data quality gates in CI
+  - Clustering/partitioning fact tables by order_date for pruning
+
+FOLLOW-UPS
+  - "Finance says yesterday's revenue number doesn't match the source
+    system — how do you debug?" -> lineage graph (dbt docs/Unity Catalog)
+    to trace the failing transformation, reconciliation query comparing
+    source vs. mart aggregates, check for late-arriving/backfilled orders.
+
+--------------------------------------------------------------------------------
+PROBLEM 8: Design a Notification/Alerting Data Pipeline
+--------------------------------------------------------------------------------
+REQUIREMENTS
+  - Trigger notifications (push/email/SMS) based on business rules over
+    streaming events (e.g., "price drop on wishlisted item," "cart
+    abandoned for 1 hour"), at scale, without duplicate/spam notifications.
+
+ARCHITECTURE
+  Event stream (Kafka) -> rule evaluation engine (Flink CEP - Complex Event
+  Processing, or Structured Streaming with stateful aggregation) matches
+  patterns (e.g., session window with no "purchase" event within 1 hour of
+  "add_to_cart") -> emits notification-trigger events -> deduplication layer
+  (keyed on user_id + rule_id + time bucket, using a state store or
+  idempotency table) -> notification service (external, out of DE scope) ->
+  delivery outcome logged back to lakehouse for analytics (open rates, etc.)
+
+DATA MODEL
+  Notification trigger event: user_id, rule_id, trigger_time, payload,
+  dedup_key. Dedup table/state keyed by dedup_key with TTL matching the
+  business rule's cooldown period (e.g., don't re-notify same user/rule
+  within 24 hours).
+
+KEY DECISIONS
+  - CEP-style pattern matching (Flink) is the right tool for "absence of an
+    event within a time window" patterns, which simple aggregation can't
+    express cleanly
+  - Explicit dedup/cooldown state store is required — this is the detail
+    that separates a working design from a spammy one; call it out
+    proactively
+
+OPTIMIZATIONS & FAILURE HANDLING
+  - At-least-once trigger delivery + idempotent notification service (or
+    dedup layer) to avoid double-sends on reprocessing
+  - Rate limiting per user (global cap on notifications/day) as a safety net
+
+FOLLOW-UPS
+  - "How would you A/B test different notification rules?" -> rule
+    versioning with a rule_id + experiment_id on trigger events, outcome
+    analytics joined back by experiment cohort in the gold layer.
+
+--------------------------------------------------------------------------------
+PROBLEM 9: Design a Multi-Tenant Analytics Platform (SaaS Data Product)
+--------------------------------------------------------------------------------
+REQUIREMENTS
+  - Hundreds of customer tenants, each needs isolated, secure analytics on
+    their own data with per-tenant dashboards; platform team owns shared
+    infra; tenants must not see each other's data.
+
+ARCHITECTURE
+  Per-tenant ingestion (API/webhook/file) -> shared Kafka with tenant_id as
+  part of the partition key or topic-per-large-tenant for isolation -> bronze
+  lake tables partitioned by tenant_id + date -> silver/gold marts computed
+  per-tenant (or as tenant-partitioned shared tables with strict row-level
+  security) -> tenant-scoped SQL warehouse access (Snowflake/Databricks row-
+  level security or per-tenant schema) -> embedded BI dashboards.
+
+DATA MODEL
+  All fact/dim tables carry tenant_id as a leading partition/cluster key.
+  Row-level security policies enforce tenant_id = current_tenant() on every
+  query at the warehouse/catalog level, not just application level.
+
+KEY DECISIONS
+  - Isolation strategy choice is the central tradeoff to discuss explicitly:
+    (a) silo model — separate schema/database per tenant, strongest
+        isolation, highest operational overhead at hundreds of tenants
+    (b) pool model — shared tables with tenant_id + RLS, most efficient,
+        requires airtight security policy enforcement
+    (c) bridge model — shared infra with tenant-dedicated storage for
+        large/enterprise tenants, pooled for long-tail smaller tenants
+  - For hundreds of tenants with a long-tail size distribution, the bridge
+    model is usually the right answer — say so and justify it
+
+OPTIMIZATIONS & FAILURE HANDLING
+  - Noisy-neighbor protection: per-tenant resource quotas/workload isolation
+    (separate warehouses/clusters for largest tenants)
+  - Tenant onboarding/offboarding as a first-class pipeline operation
+    (schema provisioning, data deletion for GDPR "right to be forgotten")
+
+FOLLOW-UPS
+  - "A large tenant's nightly batch job is starving smaller tenants of
+    compute — what do you do?" -> workload management/resource groups,
+    dedicated warehouse for large tenants, or moving large tenant to the
+    silo model.
+
+================================================================================
+8. COMMON FOLLOW-UP QUESTIONS & HOW TO HANDLE THEM
+================================================================================
+
+"How would you handle a 10x traffic spike?"
+  -> Autoscaling compute (serverless or cluster autoscaling), Kafka
+     partition count sized for peak not average, backpressure-aware
+     consumers, decouple ingestion (durable buffer) from processing speed.
+
+"How do you backfill historical data without disrupting the live pipeline?"
+  -> Idempotent MERGE-based writes mean backfill jobs are just another
+     writer; run on separate compute, throttle to avoid contention, validate
+     with row counts/checksums before and after.
+
+"How do you ensure data quality?"
+  -> Schema validation at ingestion, DLT expectations / Great Expectations
+     checks between layers, dbt tests, quarantine tables for failures
+     (never silently drop), alerting on quality metric degradation, data
+     contracts with upstream producers.
+
+"How do you handle schema drift from an upstream source you don't control?"
+  -> Schema registry with compatibility rules, Auto Loader schema evolution
+     + rescued-data column, alerting on unexpected new/missing fields,
+     contract tests in CI against a sample of real payloads.
+
+"What's your disaster recovery plan?"
+  -> Multi-region replication for critical data, point-in-time recovery via
+     Delta/Iceberg time travel or warehouse Fail-safe/Time Travel, documented
+     RPO/RTO targets, regular restore drills.
+
+"How do you control cost at scale?"
+  -> Right-size compute (serverless for spiky, reserved/provisioned for
+     steady), tiered storage lifecycle policies, partition pruning /
+     clustering to reduce scan bytes, incremental processing over full
+     rebuilds, query result caching, monitoring cost-per-query/table owners.
+
+================================================================================
+9. ANTI-PATTERNS / RED FLAGS INTERVIEWERS WATCH FOR
+================================================================================
+
+  - Jumping straight to a diagram without clarifying requirements or stating
+    volume/velocity assumptions
+  - Defaulting to streaming/Kafka for everything regardless of actual latency
+    SLA ("streaming" is not automatically the "advanced" answer)
+  - No mention of idempotency/exactly-once handling when discussing retries
+  - Ignoring schema evolution and treating source schemas as static forever
+  - No data quality or monitoring story — treating the pipeline as "done"
+    once data lands
+  - Not stating the grain of fact tables explicitly
+  - No cost discussion — designing as if compute/storage were free
+  - Physical deletes in an analytical store with no history preservation
+    strategy
+  - Single point of failure with no mention of durability of the buffer
+    layer (e.g. writing straight from source to processing engine with
+    nothing durable in between)
+  - Not addressing multi-tenant / security / PII handling when the domain
+    implies it (payment data, customer PII, healthcare)
+
+================================================================================
+10. COMPANY-SPECIFIC PATTERNS
+================================================================================
+
+AMAZON
+  - Expect Leadership Principles woven into design discussion ("Ownership,"
+    "Dive Deep," "Frugality" — cost-consciousness genuinely matters here).
+  - Common domains: fulfillment/logistics event pipelines, retail catalog,
+    AWS-native stack assumed (Kinesis, DynamoDB, S3, Redshift, Glue, EMR).
+  - Be ready to justify cost tradeoffs explicitly and quantitatively.
+
+GOOGLE
+  - BigQuery-centric, heavy emphasis on SQL-first ELT and serverless
+    scaling. Dataflow (Apache Beam) is the expected streaming answer.
+  - Strong focus on correctness under distributed systems failure modes —
+    know exactly-once semantics deeply.
+
+META (Meta/Facebook)
+  - Massive scale clickstream/experimentation pipelines; expect A/B testing
+    data infrastructure questions (assignment logging, exposure logging,
+    metric computation at billions of events/day).
+  - Presto/Trino + Hive-style lake, custom internal tooling references OK
+    conceptually even without exact internal tool names.
+
+NETFLIX
+  - Streaming media telemetry, personalization data pipelines, strong
+    microservices + event-driven culture (Kafka-heavy).
+  - Emphasis on chaos-engineering mindset: "what happens when this
+    component fails in production?" is asked explicitly and often.
+
+DATABRICKS (as an employer, or as the assumed tech stack elsewhere)
+  - Assume lakehouse-first answers: Delta Lake, Unity Catalog, DLT/Lakeflow,
+    medallion architecture are the default vocabulary — reuse your existing
+    Databricks handbook content directly here.
+  - 2026-specific: mention Lakeflow Declarative Pipelines, Agent Bricks for
+    AI-driven pipeline authoring, Unity AI Gateway for governing model
+    access, and Lakebase for operational/serving workloads when relevant.
+
+SNOWFLAKE (as an employer, or as the assumed tech stack elsewhere)
+  - Assume warehouse-first, ELT-with-dbt answers, Snowpipe/Snowpipe
+    Streaming for ingestion, Snowflake Horizon for governance, Cortex for
+    embedded AI/ML — reuse your Snowflake handbook content directly here.
+
+================================================================================
+11. QUICK-REFERENCE CHEAT SHEET
+================================================================================
+
+DECISION TREE: BATCH vs STREAMING
+  Does the SLA require < 1 minute freshness?
+    NO  -> Batch or micro-batch. Simpler, cheaper, easier to debug.
+    YES -> Does it require sub-second, stateful, complex event processing?
+           NO  -> Micro-batch (Spark Structured Streaming) usually enough.
+           YES -> True streaming (Flink/Kafka Streams).
+
+DECISION TREE: STORAGE CHOICE
+  Is it a transactional source system (needs row-level ACID OLTP)?
+    YES -> Postgres/MySQL/DynamoDB, not a warehouse/lake.
+    NO  -> Is it primarily consumed by SQL/BI at high concurrency?
+           YES -> Warehouse (Snowflake/BigQuery) or lakehouse gold layer.
+           NO (ML/flexible schema/cheap raw storage) -> Data lake (bronze/
+           silver, object storage + Delta/Iceberg).
+
+DECISION TREE: ISOLATION MODEL (multi-tenant)
+  Few large enterprise tenants -> Silo (dedicated schema/warehouse per tenant)
+  Many small tenants -> Pool (shared tables + row-level security)
+  Mixed -> Bridge (silo for large accounts, pool for the long tail)
+
+MUST-MENTION CHECKLIST FOR ANY DESIGN
+  [ ] Volume/velocity/variety estimate stated explicitly
+  [ ] Batch vs streaming choice justified against the actual latency SLA
+  [ ] Fact table grain stated explicitly (if dimensional modeling involved)
+  [ ] Idempotency / exactly-once strategy named
+  [ ] Schema evolution / late data handling addressed
+  [ ] Data quality checks / quarantine path mentioned
+  [ ] Partitioning/clustering strategy for the storage layer
+  [ ] Monitoring, alerting, and failure recovery called out
+  [ ] Cost tradeoffs mentioned at least once
+  [ ] Security/PII/governance addressed if the domain implies it
+
+================================================================================
+END OF HANDBOOK
+================================================================================
