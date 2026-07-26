@@ -1,0 +1,960 @@
+================================================================================
+CODING & DSA FOR DATA ENGINEERS — COMPLETE HANDBOOK (2026)
+MAANG / Top-Tier Tech Interview Preparation
+================================================================================
+Companion to: Python_for_Data_Engineers_COMPLETE_HANDBOOK,
+Advanced_SQL_Scenarios_COMPLETE_HANDBOOK, Spark_Internals_Deep_Dive_COMPLETE_HANDBOOK_2026,
+System_Design_for_Data_Engineers_COMPLETE_HANDBOOK_2026
+
+This handbook is standalone. No external references required. It covers the
+coding round format MAANG runs specifically for Data Engineers — a distinct
+flavor from generic SWE LeetCode grinding and distinct from the SQL-scenario
+practice in your Advanced SQL handbook: DE coding rounds skew toward
+string/array/hash-map fundamentals applied to DATA-shaped problems (parsing,
+deduplication, log processing, windowing), complexity analysis under DE-scale
+assumptions, and PySpark-specific coding questions that test whether you can
+translate an algorithmic idea into a distributed-safe implementation.
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+ 1. How DE Coding Rounds Differ From Generic SWE Coding Rounds
+ 2. Big-O Refresher, With DE-Scale Framing
+ 3. Core Data Structures Every DE Candidate Must Be Fluent In
+ 4. Pattern 1 — Hash Maps for Counting, Grouping, Deduplication
+ 5. Pattern 2 — Two Pointers and Sliding Window
+ 6. Pattern 3 — Sorting and Merge-Based Problems
+ 7. Pattern 4 — Stacks and Queues for Parsing/Validation
+ 8. Pattern 5 — Trees and Graphs (the DE-relevant subset)
+ 9. Pattern 6 — Heaps for Top-K and Streaming Problems
+10. String & Log Parsing Problems (the DE-signature category)
+11. PySpark-Specific Coding Questions
+12. SQL-as-Algorithm Problems (bridging to the SQL handbook)
+13. Worked Problems With Full Solutions (12 problems, DE-flavored)
+14. How to Structure Your Answer in the Interview
+15. Common Mistakes That Cost Offers
+16. Quick-Reference Cheat Sheet
+
+================================================================================
+1. HOW DE CODING ROUNDS DIFFER FROM GENERIC SWE CODING ROUNDS
+================================================================================
+
+A generic SWE coding round leans toward algorithmic puzzles (dynamic
+programming, tree balancing, graph shortest-path) chosen for their
+elegance as a signal of general algorithmic maturity. A DE coding round,
+while it CAN include any of that, disproportionately favors problems that
+look like miniature versions of real pipeline work:
+
+  - Parsing/cleaning malformed log lines or CSV records
+  - Deduplicating records by some key, keeping the "latest" or "best" one
+  - Grouping/aggregating a list of records (the in-memory equivalent of a
+    groupBy)
+  - Merging/reconciling two datasets (the in-memory equivalent of a join)
+  - Finding top-K frequent items (the in-memory equivalent of a
+    percentile/ranking query)
+  - Detecting overlapping time intervals (session/window logic)
+  - Implementing a rate limiter or sliding-window counter (streaming-
+    adjacent)
+  - A PySpark-flavored version of any of the above, testing whether you
+    reach for the right distributed-safe primitive (avoid collect(),
+    avoid Python UDFs when a native function exists, reason about
+    partitioning)
+
+Interviewers use these specifically to check whether a candidate who
+knows Spark/SQL syntax can ALSO reason about algorithmic complexity and
+write clean, correct, testable code without a DataFrame API doing the
+heavy lifting for them — a skill gap that shows up often enough in
+practice to be explicitly tested for.
+
+================================================================================
+2. BIG-O REFRESHER, WITH DE-SCALE FRAMING
+================================================================================
+
+COMPLEXITY CLASSES, ORDERED (BEST TO WORST, KNOW THE SHAPE COLD)
+  O(1) constant, O(log n) logarithmic, O(n) linear, O(n log n)
+  linearithmic, O(n^2) quadratic, O(2^n) exponential.
+
+WHY THIS MATTERS MORE, NOT LESS, IN A DE CONTEXT
+  A O(n^2) solution that's "fine" on a LeetCode-sized input becomes a
+  genuine production incident at DE scale — an O(n^2) deduplication
+  routine applied naively to a million-row batch (rather than as a
+  hash-map O(n) pass) is exactly the kind of bug that turns a 4-minute
+  Spark job into a 4-hour one, or a driver-side Python post-processing
+  step into an OOM. State the complexity of your solution OUT LOUD,
+  unprompted, as part of every answer — this is one of the single
+  highest-leverage habits for a DE-specific coding round, since it
+  signals you're thinking about scale by default, not just correctness.
+
+SPACE COMPLEXITY MATTERS EQUALLY
+  A DE interviewer cares about memory footprint at least as much as time
+  complexity, because DE code frequently runs against inputs too large to
+  fit comfortably in memory — always state both time AND space
+  complexity, and flag when a solution assumes data fits in memory versus
+  when it would need to be adapted for out-of-core / distributed
+  processing (a genuinely strong answer: "this is O(n) time, O(n) space
+  assuming the whole dataset fits in memory — at real scale I'd implement
+  this as a Spark groupBy/aggregation instead, which handles data larger
+  than any single machine's memory via shuffle and spill").
+
+AMORTIZED COMPLEXITY
+  Know that operations like Python list append or dict insertion are
+  amortized O(1), not always exactly O(1) per call (due to occasional
+  resizing) — a small but real detail interviewers sometimes probe when
+  you claim a loop with repeated appends is "O(n) overall."
+
+================================================================================
+3. CORE DATA STRUCTURES EVERY DE CANDIDATE MUST BE FLUENT IN
+================================================================================
+
+PYTHON DICT / HASH MAP
+  O(1) average-case lookup/insert/delete — the single most-used
+  structure in DE coding problems, since counting, grouping,
+  deduplication, and existence-checking are constant themes. Know
+  collections.defaultdict (avoids explicit key-existence checks when
+  building up groups/counts) and collections.Counter (purpose-built for
+  frequency counting, with useful methods like most_common(k)) cold —
+  using these idiomatically rather than hand-rolling the equivalent logic
+  is itself a positive signal of Python fluency.
+
+SETS
+  O(1) average-case membership testing — the right structure whenever a
+  problem reduces to "have I seen this before" or "what's the
+  intersection/difference between these two collections of keys" (the
+  in-memory equivalent of an anti-join or semi-join).
+
+LISTS / ARRAYS
+  O(1) indexed access, O(n) insertion/deletion at arbitrary positions
+  (O(1) amortized at the end) — know when a problem's access pattern
+  actually calls for a list versus when a deque (below) is the correct
+  choice because of frequent front-insertion/removal.
+
+COLLECTIONS.DEQUE
+  O(1) append/pop from BOTH ends (unlike a list, which is O(n) for
+  front operations) — the correct structure for sliding-window problems,
+  queue-based BFS, and anything needing efficient FIFO/rotating-buffer
+  behavior; a common, concrete interview signal is reaching for deque
+  instead of a list when a problem's access pattern calls for it.
+
+HEAPS (heapq module)
+  O(log n) insertion, O(log n) removal of the minimum (Python's heapq is
+  min-heap only — for a max-heap, negate values on insert) — the correct
+  structure for top-K problems and streaming median/percentile-style
+  problems (Section 9).
+
+TUPLES AS COMPOSITE/DICT KEYS
+  A common, idiomatic DE-Python pattern: using a tuple of multiple fields
+  as a composite dict key (e.g., (customer_id, order_date) as the key
+  for a grouping operation) — worth using naturally rather than
+  concatenating fields into a string key, which is less efficient and
+  more error-prone (delimiter collisions).
+
+================================================================================
+4. PATTERN 1 — HASH MAPS FOR COUNTING, GROUPING, DEDUPLICATION
+================================================================================
+
+THE CORE INSIGHT
+  Nearly any problem phrased as "find duplicates," "count occurrences,"
+  "group by X," or "find the first/only unique element" reduces to a
+  single O(n) pass building a hash map, rather than the naive O(n^2)
+  nested-loop comparison — this single insight resolves a large fraction
+  of DE coding round problems, and correctly recognizing "this is a hash
+  map problem" quickly is a strong, checkable interview signal.
+
+DEDUPLICATION KEEPING THE "BEST" RECORD (the DE-signature version of
+this pattern, directly mirroring SCD/CDC MERGE logic from your Data
+Modeling handbook)
+  Given a list of records with a business key and a version/timestamp
+  field, keep only the LATEST record per key — the pure-Python
+  equivalent of a Delta MERGE's "keep latest" logic:
+
+    def dedupe_latest(records):
+        # records: list of dicts with 'key' and 'updated_at'
+        latest = {}
+        for r in records:
+            k = r['key']
+            if k not in latest or r['updated_at'] > latest[k]['updated_at']:
+                latest[k] = r
+        return list(latest.values())
+    # O(n) time, O(n) space (n = number of input records, output <= n)
+
+GROUPING/AGGREGATION (the in-memory equivalent of groupBy().agg())
+    from collections import defaultdict
+    def group_sum(records, key_field, value_field):
+        totals = defaultdict(float)
+        for r in records:
+            totals[r[key_field]] += r[value_field]
+        return dict(totals)
+    # O(n) time, O(k) space where k = number of distinct groups
+
+================================================================================
+5. PATTERN 2 — TWO POINTERS AND SLIDING WINDOW
+================================================================================
+
+TWO POINTERS
+  Two indices moving through a (typically sorted) sequence, converging
+  or moving in tandem, to avoid an O(n^2) nested loop — classic use
+  case: given two SORTED lists, find matching/overlapping elements in
+  O(n + m) instead of O(n*m), which is directly the in-memory analogue
+  of a SORT-MERGE JOIN (Spark Internals handbook, Section 8) — worth
+  explicitly naming that connection: "this two-pointer merge is
+  literally what a sort-merge join does at the executor level, just
+  without the shuffle."
+
+SLIDING WINDOW (fixed size)
+  Maintain a running aggregate over a fixed-size window as it slides
+  across a sequence, updating in O(1) per step (adding the new element,
+  removing the element leaving the window) rather than recomputing the
+  full window aggregate from scratch each time (which would be O(n*k)
+  for window size k) — directly the in-memory analogue of a Spark
+  tumbling/sliding window aggregation (Streaming & Kafka handbook,
+  Section 10), and a very common DE coding round problem framed as
+  "compute the moving average of the last N transactions" or "find the
+  maximum sum of any K consecutive elements."
+
+    def max_sum_window(nums, k):
+        window_sum = sum(nums[:k])
+        max_sum = window_sum
+        for i in range(k, len(nums)):
+            window_sum += nums[i] - nums[i - k]
+            max_sum = max(max_sum, window_sum)
+        return max_sum
+    # O(n) time, O(1) extra space
+
+SLIDING WINDOW (variable size, e.g. "longest substring/subsequence
+satisfying a condition")
+  Expand a right pointer to grow the window, contract a left pointer
+  when a constraint is violated, tracking the best window seen — the
+  general pattern behind "longest session with no gap greater than X,"
+  a directly DE-relevant framing (sessionization logic, Streaming &
+  Kafka handbook's session window concept, implemented in pure Python
+  rather than Spark).
+
+================================================================================
+6. PATTERN 3 — SORTING AND MERGE-BASED PROBLEMS
+================================================================================
+
+WHEN SORTING FIRST IS THE RIGHT MOVE
+  Many problems that look O(n^2) at first collapse to O(n log n) by
+  sorting first, then doing a single linear pass — e.g., "find if any
+  two elements sum to a target" (sort, then two-pointer converge, O(n
+  log n) versus O(n^2) brute force, or O(n) with a hash set trading
+  space for time — know BOTH approaches and their tradeoff, since
+  interviewers often ask for the follow-up: "can you do it without
+  sorting / in less space").
+
+MERGE-BASED PROBLEMS (interval merging — a genuinely common DE framing)
+  Given a list of (start, end) intervals (e.g., session windows, time
+  ranges of server downtime, promotional date ranges), merge all
+  overlapping intervals into their minimal covering set — sort by start
+  time first (O(n log n)), then a single linear pass merging any
+  interval that overlaps the current merged interval:
+
+    def merge_intervals(intervals):
+        if not intervals:
+            return []
+        intervals.sort(key=lambda x: x[0])
+        merged = [intervals[0]]
+        for start, end in intervals[1:]:
+            last_start, last_end = merged[-1]
+            if start <= last_end:               # overlap
+                merged[-1] = (last_start, max(last_end, end))
+            else:
+                merged.append((start, end))
+        return merged
+    # O(n log n) time (dominated by the sort), O(n) space
+
+  This exact pattern underlies real DE problems: merging overlapping
+  user sessions, consolidating overlapping data-quality alert windows,
+  or computing effective_date/end_date ranges for an SCD2 dimension
+  from a stream of raw change events — worth naming that direct tie to
+  the Data Modeling handbook explicitly when this problem comes up.
+
+MERGE SORT ITSELF
+  Worth being able to implement from scratch (O(n log n) time, O(n)
+  space) since it's occasionally asked directly, and because
+  understanding merge sort's divide-and-conquer merge step is exactly
+  what generalizes to "merge K sorted lists" (a legitimate, somewhat
+  harder follow-up using a heap to track the current minimum across K
+  lists in O(n log k) rather than O(n*k)).
+
+================================================================================
+7. PATTERN 4 — STACKS AND QUEUES FOR PARSING/VALIDATION
+================================================================================
+
+STACKS FOR NESTED/BALANCED STRUCTURE VALIDATION
+  The classic use case (validating balanced parentheses/brackets)
+  generalizes directly to a real DE problem: validating well-formed
+  nested structures in semi-structured data (e.g., verifying nested
+  JSON/XML braces balance before attempting to parse, or validating a
+  nested nested nested aggregation expression in a nested SQL-like
+  DSL) — push on an opening symbol, pop and check match on a closing
+  symbol, valid if the stack is empty at the end.
+
+    def is_balanced(s):
+        pairs = {')': '(', ']': '[', '}': '{'}
+        stack = []
+        for ch in s:
+            if ch in '([{':
+                stack.append(ch)
+            elif ch in ')]}':
+                if not stack or stack.pop() != pairs[ch]:
+                    return False
+        return not stack
+    # O(n) time, O(n) space
+
+QUEUES (deque as a FIFO) FOR STREAMING/BFS-STYLE PROBLEMS
+  Any "process in the order received, expire after N items/seconds"
+  problem is a queue problem — directly relevant to implementing a
+  simple in-memory rate limiter or a bounded moving-window log buffer,
+  a common DE-flavored coding question ("design a data structure that
+  tracks the count of requests in the last 60 seconds").
+
+    from collections import deque
+    class RateWindow:
+        def __init__(self, window_seconds):
+            self.window = window_seconds
+            self.events = deque()
+        def add_and_count(self, timestamp):
+            self.events.append(timestamp)
+            while self.events and self.events[0] <= timestamp - self.window:
+                self.events.popleft()
+            return len(self.events)
+    # O(1) amortized per call (each event pushed and popped at most once)
+
+================================================================================
+8. PATTERN 5 — TREES AND GRAPHS (THE DE-RELEVANT SUBSET)
+================================================================================
+
+WHY THIS APPEARS LESS OFTEN, BUT STILL APPEARS
+  Pure tree-balancing/graph-shortest-path algorithmic puzzles are less
+  central to DE coding rounds than to generic SWE rounds, but two
+  specific applications show up regularly enough to require fluency:
+
+DEPENDENCY GRAPHS / TOPOLOGICAL SORT
+  Directly relevant to orchestration/pipeline design (a DAG of task
+  dependencies, exactly the structure underlying Airflow/Lakeflow Jobs)
+  — given a set of tasks with dependency edges, produce a valid
+  execution order (or detect a cycle, which would make the DAG invalid)
+  via topological sort (Kahn's algorithm using in-degree counting and a
+  queue, or DFS-based with a visited/in-progress/done coloring scheme to
+  detect cycles).
+
+    from collections import deque, defaultdict
+    def topological_sort(tasks, dependencies):
+        # dependencies: list of (a, b) meaning a must run before b
+        graph = defaultdict(list)
+        in_degree = {t: 0 for t in tasks}
+        for a, b in dependencies:
+            graph[a].append(b)
+            in_degree[b] += 1
+        queue = deque([t for t in tasks if in_degree[t] == 0])
+        order = []
+        while queue:
+            node = queue.popleft()
+            order.append(node)
+            for neighbor in graph[node]:
+                in_degree[neighbor] -= 1
+                if in_degree[neighbor] == 0:
+                    queue.append(neighbor)
+        if len(order) != len(tasks):
+            raise ValueError("cycle detected — invalid DAG")
+        return order
+    # O(V + E) time, O(V + E) space
+
+  This is one of the single highest-value problems to have fully
+  internalized for a DE interview — it's the concrete algorithmic core
+  behind "how would you determine a valid job execution order given
+  pipeline dependencies," a very natural, very likely follow-up in an
+  orchestration-flavored system design or coding question.
+
+TREES FOR HIERARCHICAL DATA (org charts, category trees, nested BOMs)
+  Standard traversal (DFS/BFS) applied to a genuinely common DE data
+  shape — e.g., "given a product category hierarchy, compute the total
+  sales rolled up to each category level" is a tree-aggregation problem
+  (post-order DFS, summing children into parents) worth recognizing
+  quickly rather than over-engineering.
+
+================================================================================
+9. PATTERN 6 — HEAPS FOR TOP-K AND STREAMING PROBLEMS
+================================================================================
+
+TOP-K FREQUENT ELEMENTS (a very common DE-flavored framing: "find the
+top 10 most-visited pages from a log")
+  Naive: sort all items by frequency, O(n log n). Better: maintain a
+  min-heap of size K as you scan, O(n log k) — meaningfully better than
+  full sort when K is small relative to n, which is the realistic DE
+  scenario (top 10 out of millions of records).
+
+    import heapq
+    from collections import Counter
+    def top_k_frequent(items, k):
+        counts = Counter(items)               # O(n)
+        return heapq.nlargest(k, counts.items(), key=lambda x: x[1])
+    # O(n) for counting + O(n log k) for heap selection
+
+  Python's heapq.nlargest is itself heap-based internally — worth
+  knowing it exists and using it idiomatically rather than hand-rolling
+  a full sort when only the top K matters, a small but real Python-
+  fluency signal.
+
+STREAMING MEDIAN (two-heap technique)
+  Maintaining a running median over a stream of incoming values (a
+  classic, legitimately hard, and legitimately DE-relevant problem —
+  directly connects to a real streaming aggregation use case) using a
+  max-heap for the lower half of seen values and a min-heap for the
+  upper half, keeping the two balanced in size so the median is always
+  at the top of one (or the average of both tops) — O(log n) per
+  insertion, O(1) to query the current median. Worth knowing the
+  TECHNIQUE exists and its complexity even if not memorized verbatim, as
+  it's a common "have you seen this before" gate question.
+
+================================================================================
+10. STRING & LOG PARSING PROBLEMS (THE DE-SIGNATURE CATEGORY)
+================================================================================
+
+WHY THIS CATEGORY IS DISPROPORTIONATELY COMMON IN DE INTERVIEWS
+  Real DE work spends a lot of time parsing messy, semi-structured text
+  (log lines, malformed CSVs, nested delimited fields) — interviewers
+  use string-parsing problems specifically because they're a direct,
+  low-abstraction proxy for exactly that work, and because they reveal
+  whether a candidate handles EDGE CASES carefully (empty fields,
+  extra whitespace, inconsistent delimiters, quoted fields containing
+  the delimiter character) rather than just the happy path.
+
+PARSING A DELIMITED LOG LINE WITH QUOTED FIELDS (the CSV-parsing-by-hand
+problem — a genuinely common ask, specifically because "just use a
+library" isn't the point of the exercise)
+  Key edge cases to handle explicitly and name out loud: a delimiter
+  character appearing INSIDE a quoted field should not be treated as a
+  field separator; escaped quotes within a quoted field; trailing/
+  leading whitespace; empty fields between two consecutive delimiters.
+
+    def parse_csv_line(line, delimiter=','):
+        fields = []
+        current = []
+        in_quotes = False
+        i = 0
+        while i < len(line):
+            ch = line[i]
+            if ch == '"':
+                if in_quotes and i + 1 < len(line) and line[i+1] == '"':
+                    current.append('"')       # escaped quote
+                    i += 1
+                else:
+                    in_quotes = not in_quotes
+            elif ch == delimiter and not in_quotes:
+                fields.append(''.join(current))
+                current = []
+            else:
+                current.append(ch)
+            i += 1
+        fields.append(''.join(current))
+        return fields
+    # O(n) time where n = length of the line, O(n) space
+
+LOG LINE PARSING WITH REGEX vs. MANUAL PARSING
+  Know when to reach for regex (fixed, well-defined format — e.g., a
+  standard Apache/Nginx access log line format) versus manual
+  character-by-character parsing (variable/ambiguous format needing
+  stateful handling, like the quoted-CSV case above) — a strong answer
+  explicitly justifies the choice: "this log format is fixed and
+  well-specified, so a compiled regex is both clearer and faster than
+  hand-parsing; the CSV-with-quoted-fields case needs manual state
+  tracking because a single regex can't cleanly express 'delimiter,
+  unless inside quotes.'"
+
+ANAGRAM / PATTERN-MATCHING GROUPING (frequency-signature technique)
+  A common building-block pattern: grouping strings by some
+  canonical signature (e.g., sorted character tuple for anagrams, or a
+  normalized/canonicalized form of a messy field value for fuzzy
+  deduplication) using a hash map keyed by that signature — directly
+  useful for a real DE task like "group near-duplicate product names
+  that differ only in casing/whitespace/punctuation" before a
+  dedup/merge step.
+
+================================================================================
+11. PYSPARK-SPECIFIC CODING QUESTIONS
+================================================================================
+
+WHAT MAKES A PYSPARK CODING QUESTION DIFFERENT FROM A PURE-PYTHON ONE
+  The interviewer isn't just checking correctness — they're checking
+  whether you default to DISTRIBUTED-SAFE idioms rather than
+  accidentally writing code that would only work (or would work
+  correctly but catastrophically slowly) on a single machine. The
+  single most common trap: using .collect() to pull data to the driver
+  and then processing it in plain Python, defeating the entire purpose
+  of using Spark — always flag this explicitly if you find yourself
+  reaching for it, and justify any genuinely necessary use (e.g.,
+  collecting a small, already-aggregated summary result to drive
+  further logic) rather than doing it silently.
+
+TOP-K PER GROUP (a very common PySpark coding question — the
+distributed version of Section 9's top-K pattern)
+    from pyspark.sql import Window
+    from pyspark.sql import functions as F
+
+    window_spec = Window.partitionBy("category").orderBy(F.desc("sales"))
+    result = (df
+        .withColumn("rank", F.row_number().over(window_spec))
+        .filter(F.col("rank") <= 3)
+        .drop("rank"))
+  Correctly reaching for a Window function here (rather than a
+  groupBy + a Python UDF, or worse, a collect() + Python sort) is
+  exactly the signal being tested — mention explicitly that
+  row_number() (strict distinct ranks), rank() (ties share rank, gaps
+  after), and dense_rank() (ties share rank, no gaps) are meaningfully
+  different and the choice should be deliberate based on how ties should
+  be handled.
+
+DEDUPLICATION KEEPING LATEST RECORD (the PySpark version of Section 4's
+pattern — directly reusable, real interview answer)
+    window_spec = Window.partitionBy("business_key").orderBy(F.desc("updated_at"))
+    deduped = (df
+        .withColumn("rn", F.row_number().over(window_spec))
+        .filter(F.col("rn") == 1)
+        .drop("rn"))
+  Worth explicitly contrasting this with dropDuplicates(), which keeps
+  an ARBITRARY row per duplicate key rather than deterministically the
+  latest — a genuinely important, concrete correctness distinction to
+  state out loud, since silently using dropDuplicates() when
+  "keep-latest" semantics were actually required is exactly the kind of
+  subtle bug a real production pipeline could ship with.
+
+WORD COUNT / TOKEN FREQUENCY (the "hello world" of distributed
+computing, still occasionally asked to check basic fluency)
+    from pyspark.sql import functions as F
+    word_counts = (df
+        .select(F.explode(F.split(F.col("line"), r"\s+")).alias("word"))
+        .groupBy("word")
+        .count()
+        .orderBy(F.desc("count")))
+
+AVOIDING THE UDF TRAP
+  If a coding question can be solved with built-in Spark SQL functions
+  (F.when, F.regexp_extract, F.split, window functions) versus a Python
+  UDF, ALWAYS prefer the built-in — state explicitly why: "I'd avoid a
+  UDF here since it breaks Catalyst's whole-stage codegen and requires
+  row-by-row serialization to a Python process, per what we covered in
+  Spark internals — a native function keeps this fully optimized."
+  Reusing this exact justification, tied back to your Spark Internals
+  handbook, is a strong, concrete way to connect coding-round fluency to
+  systems-level understanding in the same answer.
+
+================================================================================
+12. SQL-AS-ALGORITHM PROBLEMS (BRIDGING TO THE SQL HANDBOOK)
+================================================================================
+
+A small but real category worth flagging: some DE coding rounds ask you
+to solve an algorithmic problem IN SQL specifically (not Python/PySpark),
+testing whether you can express iterative/algorithmic logic declaratively
+— these overlap with your Advanced SQL Scenarios handbook but are worth
+naming here as a category to expect:
+
+  - Running totals / cumulative sums -> window functions (SUM() OVER
+    (ORDER BY ... ROWS UNBOUNDED PRECEDING))
+  - Gaps-and-islands problems (find consecutive runs of a condition,
+    e.g., consecutive days a user was active) -> the row_number()
+    difference trick (subtracting a row_number() from a date column to
+    get a constant "island group" identifier for consecutive rows)
+  - Top-N per group in SQL -> exactly the same row_number()/rank()
+    windowed pattern as the PySpark version in Section 11, just
+    expressed in pure SQL
+  - Recursive hierarchy traversal -> recursive CTEs (WITH RECURSIVE),
+    the SQL equivalent of the tree/graph traversal patterns in Section 8
+  Refer to your Advanced SQL Scenarios handbook for the full worked
+  examples of each of these — this handbook exists to flag them as part
+  of the broader "coding round" category, not to duplicate that content.
+
+================================================================================
+13. WORKED PROBLEMS WITH FULL SOLUTIONS (12 PROBLEMS, DE-FLAVORED)
+================================================================================
+
+--------------------------------------------------------------------------------
+PROBLEM 1: Given a list of login events (user_id, timestamp), find the
+longest streak of consecutive days any single user was active.
+--------------------------------------------------------------------------------
+  Approach: group timestamps by user (hash map), convert to a set of
+  distinct dates per user, then for each user's date set, walk forward
+  from any date that has no "date - 1" in the set (a streak start),
+  counting consecutive days present in the set.
+    def longest_streak(events):
+        from collections import defaultdict
+        user_dates = defaultdict(set)
+        for user_id, ts in events:
+            user_dates[user_id].add(ts.date())
+        best = 0
+        for user_id, dates in user_dates.items():
+            for d in dates:
+                if d - timedelta(days=1) not in dates:   # streak start
+                    length = 1
+                    cur = d
+                    while cur + timedelta(days=1) in dates:
+                        cur += timedelta(days=1)
+                        length += 1
+                    best = max(best, length)
+        return best
+  Complexity: O(n) overall — each date is visited as a "streak start"
+  candidate exactly once across the whole algorithm despite the nested
+  loop, because the inner while loop only ever advances through each
+  date once total (a classic amortized-O(n) pattern worth explaining
+  explicitly, since naively it looks like it might be O(n^2)).
+
+--------------------------------------------------------------------------------
+PROBLEM 2: Given two lists of records representing "before" and "after"
+snapshots of a table, produce the CDC-style diff (inserts, updates, deletes).
+--------------------------------------------------------------------------------
+    def compute_cdc(before, after, key_field):
+        before_map = {r[key_field]: r for r in before}
+        after_map = {r[key_field]: r for r in after}
+        inserts = [r for k, r in after_map.items() if k not in before_map]
+        deletes = [r for k, r in before_map.items() if k not in after_map]
+        updates = [after_map[k] for k in after_map
+                   if k in before_map and after_map[k] != before_map[k]]
+        return {"inserts": inserts, "updates": updates, "deletes": deletes}
+  Complexity: O(n + m) time and space. Explicitly connect this to
+  Section 12 of the System Design handbook's CDC pipeline problem — "this
+  is the same before/after image diffing logic Debezium does at the
+  database WAL level, just applied to two in-memory snapshots directly."
+
+--------------------------------------------------------------------------------
+PROBLEM 3: Given a stream of (timestamp, value) readings, implement a
+class supporting add(timestamp, value) and average_last_n_minutes(n).
+--------------------------------------------------------------------------------
+    from collections import deque
+    class MovingAverage:
+        def __init__(self):
+            self.window = deque()   # (timestamp, value)
+            self.running_sum = 0.0
+        def add(self, timestamp, value):
+            self.window.append((timestamp, value))
+            self.running_sum += value
+        def average_last_n_minutes(self, n, now):
+            cutoff = now - timedelta(minutes=n)
+            while self.window and self.window[0][0] < cutoff:
+                _, v = self.window.popleft()
+                self.running_sum -= v
+            if not self.window:
+                return 0.0
+            return self.running_sum / len(self.window)
+  Complexity: O(1) amortized per add/query (each reading pushed and
+  popped at most once total). This is the pure-Python skeleton of
+  exactly what a Structured Streaming sliding-window aggregation with a
+  watermark does conceptually (Streaming & Kafka handbook, Section 10) —
+  name that connection explicitly.
+
+--------------------------------------------------------------------------------
+PROBLEM 4: Given a list of (start_date, end_date, value) SCD2-style
+dimension rows for a single business key, and a specific as-of date, find
+the value that was current on that date.
+--------------------------------------------------------------------------------
+    def value_as_of(scd_rows, as_of_date):
+        for start, end, value in scd_rows:
+            if start <= as_of_date and (end is None or as_of_date < end):
+                return value
+        return None
+  Naive is O(n) per lookup; if doing MANY as-of lookups against the same
+  dimension, sort rows by start_date once (O(n log n)) and binary-search
+  for each lookup (O(log n) each) — a genuinely good follow-up
+  optimization to volunteer proactively: "if I'm doing this lookup
+  repeatedly — which is exactly the point-in-time join scenario from the
+  MLOps and Data Modeling handbooks — I'd sort once and binary search
+  per query rather than re-scanning linearly every time."
+
+--------------------------------------------------------------------------------
+PROBLEM 5: Merge K sorted lists of log entries (already sorted by
+timestamp per source) into one globally sorted list.
+--------------------------------------------------------------------------------
+    import heapq
+    def merge_k_sorted(lists):
+        heap = []
+        for i, lst in enumerate(lists):
+            if lst:
+                heapq.heappush(heap, (lst[0][0], i, 0))  # (timestamp, list_idx, elem_idx)
+        result = []
+        while heap:
+            ts, list_idx, elem_idx = heapq.heappop(heap)
+            result.append(lists[list_idx][elem_idx])
+            if elem_idx + 1 < len(lists[list_idx]):
+                next_ts = lists[list_idx][elem_idx + 1][0]
+                heapq.heappush(heap, (next_ts, list_idx, elem_idx + 1))
+        return result
+  Complexity: O(n log k) where n = total elements across all lists, k =
+  number of lists — meaningfully better than concatenating and sorting
+  everything (O(n log n)) when k is small relative to n, which maps
+  directly to a real scenario: merging per-partition sorted output
+  (exactly what a distributed external merge sort / Spark's sort-based
+  shuffle read does internally).
+
+--------------------------------------------------------------------------------
+PROBLEM 6: Given a list of (user_id, event_type, timestamp) events, find
+all "funnel completions" — users who did step A, then B, then C, each
+after the previous, within a session (30-minute inactivity gap ends a
+session).
+--------------------------------------------------------------------------------
+  Approach: group events per user (hash map), sort each user's events by
+  timestamp, sessionize (Section 5's variable window pattern — split
+  into sessions on any gap > 30 min), then within each session check for
+  the funnel sequence A -> B -> C in order using a simple state-machine
+  scan (track which funnel step you're currently looking for next, only
+  ever advancing forward).
+    def find_funnel_completions(events, funnel=("view", "cart", "purchase")):
+        from collections import defaultdict
+        by_user = defaultdict(list)
+        for user_id, event_type, ts in events:
+            by_user[user_id].append((ts, event_type))
+        completions = []
+        for user_id, user_events in by_user.items():
+            user_events.sort()
+            step = 0
+            for ts, event_type in user_events:
+                if event_type == funnel[step]:
+                    step += 1
+                    if step == len(funnel):
+                        completions.append(user_id)
+                        break
+        return completions
+  Complexity: O(n log n) overall, dominated by the per-user sort.
+  (Session-gap-splitting omitted above for brevity but is a direct
+  extension of the merge_intervals-style gap check from Section 6 — worth
+  mentioning explicitly that you'd add it for full session-boundary
+  correctness.)
+
+--------------------------------------------------------------------------------
+PROBLEM 7: Implement a basic LRU (Least Recently Used) cache — a common,
+legitimately-asked structure question relevant to any caching layer
+(query result caching, feature store online cache) discussed elsewhere
+in this library.
+--------------------------------------------------------------------------------
+    from collections import OrderedDict
+    class LRUCache:
+        def __init__(self, capacity):
+            self.capacity = capacity
+            self.cache = OrderedDict()
+        def get(self, key):
+            if key not in self.cache:
+                return -1
+            self.cache.move_to_end(key)
+            return self.cache[key]
+        def put(self, key, value):
+            if key in self.cache:
+                self.cache.move_to_end(key)
+            self.cache[key] = value
+            if len(self.cache) > self.capacity:
+                self.cache.popitem(last=False)   # evict least recently used
+  Complexity: O(1) for both get and put, using OrderedDict's ability to
+  move a key to the end (most-recently-used position) and pop from the
+  front (least-recently-used) in O(1) — worth knowing OrderedDict
+  supports this directly rather than hand-rolling a doubly-linked-list +
+  hash-map combination unless explicitly asked to avoid using
+  OrderedDict.
+
+--------------------------------------------------------------------------------
+PROBLEM 8: Given a large file too big to fit in memory, find the top-K
+most frequent words. (An explicit "assume it doesn't fit in memory"
+constraint — a common, deliberate DE-scale twist on Section 9's pattern.)
+--------------------------------------------------------------------------------
+  Approach: this is precisely the MapReduce/external-sort pattern —
+  (1) stream the file in chunks, maintaining partial counts per chunk,
+  spilling each chunk's counts to disk once a memory threshold is hit
+  (mirrors Spark's shuffle spill behavior, Spark Internals handbook
+  Section 10); (2) merge the spilled partial-count files using a
+  k-way merge (Section 5's problem, generalized) combining counts for
+  the same word across files; (3) maintain a size-K min-heap over the
+  final merged counts (Section 9's top-K pattern) rather than sorting
+  everything. Explicitly state the complexity and memory bound: O(n)
+  time overall, O(memory_threshold) space at any point in time — the
+  answer that shows real understanding is explicitly narrating "this is
+  the same shape as a distributed word count — partial aggregation, spill
+  to disk when memory is exceeded, merge, then a bounded top-K pass" and
+  connecting it back to exactly how Spark itself would execute this at
+  scale, rather than treating it as a totally separate problem.
+
+--------------------------------------------------------------------------------
+PROBLEM 9: Validate that a nested aggregation expression string (e.g.,
+"SUM(price * (1 - discount))") has balanced parentheses AND balanced
+operators (no two operators adjacent without an operand between them).
+--------------------------------------------------------------------------------
+  Extends Section 7's stack-based balance check with an additional
+  state-machine pass tracking "expecting operand" vs. "expecting
+  operator" as you scan token by token — worth explicitly separating the
+  two concerns (structural balance via stack, token-sequence validity via
+  a simple state flag) rather than trying to conflate them into one pass,
+  which is both a correctness risk and harder to explain clearly under
+  interview pressure.
+
+--------------------------------------------------------------------------------
+PROBLEM 10: Given a list of (region, store_id, sales) tuples, and a
+budget of TOP 3 stores per region, but stores tied on sales should all be
+included even if that exceeds 3 — implement this without a full sort.
+--------------------------------------------------------------------------------
+  A genuinely good "know your window function semantics" test even in
+  pure Python: this is a RANK()-not-ROW_NUMBER() problem (ties share
+  rank, all tied top-3 should be included) — implement per-region using
+  a heap or sort, but explicitly handle the tie-inclusion logic (find the
+  3rd-highest DISTINCT sales value per region, include every store with
+  sales >= that threshold) rather than naively slicing the first 3 rows
+  after sorting, which would arbitrarily drop tied stores — this maps
+  directly to choosing RANK() over ROW_NUMBER() in the PySpark/SQL
+  version of the same problem (Section 11), worth stating that
+  equivalence explicitly.
+
+--------------------------------------------------------------------------------
+PROBLEM 11: Given a list of (task, [dependencies]) pairs, determine the
+minimum number of "waves" (parallel execution rounds) needed to complete
+all tasks if independent tasks can run simultaneously.
+--------------------------------------------------------------------------------
+  A direct, natural extension of Section 8's topological sort: instead of
+  producing a single linear order, process the queue LEVEL BY LEVEL (a
+  BFS-style topological sort) — each iteration of the outer loop
+  processes every currently-zero-in-degree node as one "wave," which
+  maps directly to how a real orchestrator (Airflow, Lakeflow Jobs) would
+  schedule maximally-parallel task execution across available workers.
+    def min_waves(tasks, dependencies):
+        from collections import deque, defaultdict
+        graph = defaultdict(list)
+        in_degree = {t: 0 for t in tasks}
+        for a, b in dependencies:
+            graph[a].append(b)
+            in_degree[b] += 1
+        queue = deque([t for t in tasks if in_degree[t] == 0])
+        waves = 0
+        processed = 0
+        while queue:
+            waves += 1
+            for _ in range(len(queue)):
+                node = queue.popleft()
+                processed += 1
+                for neighbor in graph[node]:
+                    in_degree[neighbor] -= 1
+                    if in_degree[neighbor] == 0:
+                        queue.append(neighbor)
+        if processed != len(tasks):
+            raise ValueError("cycle detected")
+        return waves
+  Complexity: O(V + E), same as standard topological sort — the "wave"
+  framing is just a bookkeeping change on top of the identical algorithm.
+
+--------------------------------------------------------------------------------
+PROBLEM 12: Given two large sorted files of user IDs (too big to load
+fully into memory), find the IDs present in both (the out-of-core
+equivalent of an inner join on sorted keys).
+--------------------------------------------------------------------------------
+  The two-pointer / sort-merge pattern (Section 5), but streamed from
+  disk rather than held in memory — read one line at a time from each
+  file, advancing whichever pointer has the smaller current ID, emitting
+  a match when both current IDs are equal and advancing both. O(n + m)
+  time, O(1) extra space (beyond the two current lines being compared) —
+  explicitly the reason sort-merge join is the safe default for large x
+  large joins in Spark (Spark Internals handbook, Section 8): it doesn't
+  require either side to fit in memory, exactly like this streamed
+  version doesn't require either file to fit in memory.
+
+================================================================================
+14. HOW TO STRUCTURE YOUR ANSWER IN THE INTERVIEW
+================================================================================
+
+  1. Restate the problem in your own words and confirm constraints
+     (input size, whether data fits in memory, whether it's sorted,
+     duplicate handling expectations) — DE-scale problems almost always
+     have a meaningful "does this fit in memory" or "is this sorted"
+     question worth asking explicitly, unlike many generic LeetCode
+     problems where the input is implicitly small.
+  2. State a brute-force approach and its complexity FIRST, even
+     briefly — this establishes a correctness baseline and often reveals
+     the optimization opportunity naturally ("this is O(n^2) because of
+     the nested loop — I can get this to O(n) with a hash map by...").
+  3. Propose the optimized approach, state its time AND space complexity
+     before writing code.
+  4. Write clean code — meaningful variable names, no unnecessary
+     cleverness, exactly the code you'd want to review in a PR.
+  5. Trace through a small example (including at least one edge case:
+     empty input, single element, all-duplicate input, already-sorted
+     input) out loud after writing the code, before declaring it done.
+  6. Proactively connect the solution to the DISTRIBUTED/PRODUCTION
+     version of the same problem when relevant ("at real scale I'd
+     implement this as a Spark window function instead of a Python
+     dict, for exactly the reasons in Section 11") — this is the single
+     highest-leverage habit specifically for a DE-flavored coding round,
+     since it demonstrates the connection between algorithmic
+     fundamentals and production systems that the round is actually
+     trying to test.
+
+================================================================================
+15. COMMON MISTAKES THAT COST OFFERS
+================================================================================
+
+  - Jumping straight to code without stating a brute-force baseline or
+    complexity — reads as "pattern-matched a memorized solution" rather
+    than genuine reasoning, even when the code is correct.
+  - Never mentioning complexity unprompted — a DE interviewer specifically
+    wants to hear you reason about scale without being asked.
+  - Using dropDuplicates() in PySpark when "keep latest/best record"
+    semantics were actually required — a subtle, real correctness bug,
+    not just a style nitpick.
+  - Reaching for a Python UDF in PySpark when a native function/window
+    function would work — a concrete, checkable anti-pattern given your
+    Spark Internals handbook content.
+  - Not handling edge cases explicitly (empty input, single-element
+    input, all-ties, malformed/missing fields) — DE interviewers weight
+    this heavily because production data is messy by default, unlike a
+    clean LeetCode test case.
+  - Silently assuming data fits in memory without stating that
+    assumption, when the problem framing (large file, log stream,
+    "at scale") signals it might not — always state the assumption
+    explicitly and name what would change if it didn't hold.
+  - Over-indexing on cleverness/brevity at the expense of readability —
+    DE interviewers are also implicitly evaluating "would I want to
+    maintain this code in a production pipeline," not just "is it
+    correct and fast."
+
+================================================================================
+16. QUICK-REFERENCE CHEAT SHEET
+================================================================================
+
+PATTERN -> SIGNAL PHRASE IN THE PROBLEM
+  "count/group/find duplicates"          -> hash map, O(n)
+  "sorted lists, find matches/merge"      -> two pointers, O(n+m)
+  "moving average / max sum of K
+   consecutive elements"                  -> sliding window, O(n)
+  "longest substring/session satisfying
+   a condition"                           -> variable sliding window
+  "merge overlapping ranges/sessions"     -> sort + linear merge,
+                                              O(n log n)
+  "balanced/nested structure validation"  -> stack, O(n)
+  "process in order received, expire
+   after N"                               -> deque as queue, O(1) amortized
+  "task dependencies / valid execution
+   order"                                 -> topological sort, O(V+E)
+  "top K frequent/largest"                -> heap, O(n log k)
+  "running median over a stream"          -> two heaps, O(log n) per op
+  "K sorted lists, merge into one"        -> heap-based k-way merge,
+                                              O(n log k)
+  "cache with eviction"                   -> OrderedDict / LRU, O(1)
+
+DE-SPECIFIC CROSS-REFERENCES TO NAME OUT LOUD
+  Two-pointer merge on sorted data  <-> Sort-Merge Join (Spark Internals)
+  Sliding window aggregate          <-> Streaming windowed aggregation
+                                         (Streaming & Kafka handbook)
+  Keep-latest dedup via hash map    <-> SCD2/CDC MERGE logic
+                                         (Data Modeling handbook)
+  Topological sort                  <-> DAG task scheduling
+                                         (Orchestration / pipeline design)
+  Out-of-core k-way merge           <-> Spark shuffle spill + external
+                                         merge sort (Spark Internals)
+  Point-in-time as-of lookup        <-> Feature store point-in-time join
+                                         (MLOps handbook)
+
+PYSPARK CODING CHECKLIST
+  [ ] Did I avoid .collect() unless genuinely justified?
+  [ ] Did I use a Window function instead of a UDF where possible?
+  [ ] Did I choose row_number() vs rank() vs dense_rank() deliberately?
+  [ ] Did I use dropDuplicates() only when "arbitrary row" semantics are
+      actually correct, not when "latest/best row" was required?
+
+ALWAYS STATE, EVERY PROBLEM, UNPROMPTED
+  Time complexity, space complexity, and whether the solution assumes
+  data fits in memory (and what you'd change if it didn't).
+
+================================================================================
+END OF HANDBOOK
+================================================================================
