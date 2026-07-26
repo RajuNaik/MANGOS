@@ -1,0 +1,1109 @@
+================================================================================
+GENAI / LLM ENGINEERING — COMPLETE HANDBOOK (2026)
+MAANG / Top-Tier Tech Interview Preparation — Data & AI Engineer Track
+================================================================================
+Companion to: Databricks_COMPLETE_HANDBOOK_2026, AI_on_Databricks_COMPLETE_HANDBOOK,
+AI_on_Snowflake_COMPLETE_HANDBOOK, System_Design_for_Data_Engineers_COMPLETE_HANDBOOK,
+Data_Modeling_COMPLETE_HANDBOOK, Python_for_AI_Engineers_COMPLETE_HANDBOOK
+
+This handbook is standalone. No external references required. It covers the
+"AI" half of the Data & AI Engineer title: how LLM applications are actually
+built, deployed, and evaluated in production — RAG architecture, vector
+search, embeddings, agents, fine-tuning, and the operational/eval concerns
+that separate a working demo from a production system.
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+ 1. Where GenAI Engineering Sits Relative to Data Engineering
+ 2. LLM Fundamentals You Need for Systems Reasoning (not model internals)
+ 3. Embeddings Deep Dive
+ 4. Vector Databases and Vector Search
+ 5. RAG (Retrieval-Augmented Generation) Architecture
+ 6. Chunking Strategies
+ 7. Retrieval Quality: Hybrid Search, Reranking, Query Transformation
+ 8. Prompt Engineering for Production Systems
+ 9. Fine-Tuning vs. RAG vs. Prompting — Decision Framework
+10. Agents and Agentic Pipelines
+11. Tool Use / Function Calling
+12. LLM Evaluation — The Hardest and Most-Tested Topic
+13. LLMOps: Deployment, Monitoring, Cost, Caching
+14. Guardrails, Safety, and Governance
+15. Data Engineering's Role in GenAI Systems (your specific angle)
+16. Databricks & Snowflake AI Platform Features (2026)
+17. Common Design Problems (worked examples)
+18. Interview Question Bank with Model Answers
+19. Quick-Reference Cheat Sheet
+
+================================================================================
+1. WHERE GENAI ENGINEERING SITS RELATIVE TO DATA ENGINEERING
+================================================================================
+
+A "Data and AI Engineer" role at a MAANG-tier company is rarely asked to
+train foundation models from scratch — that's research/ML science territory.
+What IS asked, heavily, is: how do you build the DATA INFRASTRUCTURE that
+makes an LLM application work well in production — the retrieval pipeline,
+the embedding generation pipeline, the evaluation pipeline, the feature/
+context pipeline feeding an agent, and the monitoring/cost infrastructure
+around it. This handbook is scoped exactly there: the intersection of data
+engineering and applied LLM systems, which is precisely where this job title
+lives. Interviewers in this space test whether you understand:
+  - Why naive RAG breaks in practice, and how to fix each failure mode
+  - How to build embedding/indexing pipelines at data-engineering scale
+    (batch reprocessing, incremental updates, versioning)
+  - How to evaluate a system that doesn't have a single "correct" answer
+  - How to reason about cost/latency tradeoffs unique to LLM calls
+  - How this connects to things you already know: medallion architecture,
+    streaming, feature stores, orchestration — GenAI infrastructure is
+    mostly a specialized data pipeline, not a wholly separate discipline.
+
+================================================================================
+2. LLM FUNDAMENTALS YOU NEED FOR SYSTEMS REASONING
+================================================================================
+
+This is deliberately NOT a transformer-architecture deep dive (that's ML
+research interview territory) — it's the minimum model-behavior knowledge
+that explains WHY the systems patterns in this handbook exist.
+
+CONTEXT WINDOW
+  The maximum number of tokens (input + output combined) a model can
+  process in one call. Directly drives RAG design: you can't just "put
+  everything in the prompt" — you must retrieve and select the most
+  relevant subset of your knowledge base to fit within the window,
+  which is the entire reason RAG (Section 5) exists as a pattern rather
+  than simply pasting a whole knowledge base into every prompt.
+
+TOKENS (not words)
+  Text is broken into sub-word units by a tokenizer; cost, context window
+  limits, and latency are all measured in tokens, not characters or words
+  — a rough rule of thumb is ~4 characters or ~0.75 words per token in
+  English, useful for back-of-envelope capacity/cost estimation in an
+  interview.
+
+HALLUCINATION
+  A model generating fluent, confident, but factually incorrect or
+  unsupported content — not a bug to "fix" in the model itself from an
+  engineering seat, but a risk to MANAGE through system design: grounding
+  responses in retrieved source documents (RAG), citing sources, evaluation
+  pipelines that specifically test for unsupported claims (Section 12),
+  and guardrails (Section 14). Framing hallucination as a system-design
+  problem rather than a model-training problem is the correct posture for
+  a Data & AI Engineer interview.
+
+NON-DETERMINISM
+  The same prompt can produce different outputs across calls (even at
+  temperature=0, due to floating-point/batching non-determinism in
+  production serving infra) — this has real engineering consequences:
+  idempotency/caching strategies need to account for it, and evaluation
+  pipelines must be designed to tolerate output variance rather than doing
+  brittle exact-string-match testing (Section 12).
+
+TEMPERATURE & SAMPLING PARAMETERS
+  Temperature controls randomness in token selection (low = more
+  deterministic/focused, high = more varied/creative) — a genuinely
+  practical engineering knob: production RAG/extraction pipelines
+  typically use LOW temperature (near 0) for consistency and
+  groundedness, while creative-generation features use higher temperature.
+  Know this as a config decision you make per use case, not a model
+  property.
+
+CONTEXT ROT / "LOST IN THE MIDDLE"
+  Model attention to information degrades for content placed in the
+  middle of a very long context, even when it's technically within the
+  context window — a real, practically-tested phenomenon that directly
+  informs RAG design: retrieved chunks should be ranked with the most
+  relevant content placed near the beginning or end of the prompt, and
+  retrieving fewer, higher-quality chunks often outperforms stuffing the
+  full context window with marginally-relevant ones. This is a genuinely
+  strong, specific interview point that goes beyond generic RAG
+  description.
+
+================================================================================
+3. EMBEDDINGS DEEP DIVE
+================================================================================
+
+WHAT AN EMBEDDING IS
+  A dense numerical vector (typically hundreds to a few thousand
+  dimensions) representing the semantic meaning of a piece of text (or
+  image, audio, etc.), produced by an embedding model, such that
+  semantically similar content produces vectors that are close together
+  in vector space (measured by cosine similarity, dot product, or
+  Euclidean distance). This is the foundational mechanism enabling
+  semantic search: it lets you find "conceptually related" content, not
+  just keyword matches.
+
+EMBEDDING MODEL CHOICE — PRACTICAL TRADEOFFS
+  - Dimensionality: higher dimensions can capture more nuance but cost
+    more to store and search (both storage bytes and compute for
+    similarity calculation scale with dimension count) — a real capacity-
+    planning tradeoff to name explicitly, same shape as the capacity
+    estimation exercises in the System Design handbook.
+  - Domain fit: a general-purpose embedding model may underperform a
+    domain-tuned one for specialized text (legal, medical, code) — worth
+    naming that embedding model choice is itself a data problem requiring
+    evaluation against YOUR specific corpus, not a fixed "best" answer.
+  - Symmetric vs. asymmetric search: some embedding models are optimized
+    for query-to-document search specifically (the query and the document
+    are different lengths/styles — "how do I reset my password" vs. a
+    long help-doc paragraph) versus symmetric similarity (comparing two
+    similar-length texts) — using the wrong mode measurably hurts
+    retrieval quality, a specific, testable detail.
+
+EMBEDDING PIPELINE AS A DATA ENGINEERING PROBLEM (this is your angle)
+  Generating embeddings for a large, evolving corpus is structurally a
+  batch/incremental ETL pipeline: source documents -> chunking (Section
+  6) -> embedding model inference (batched for throughput) -> write to
+  vector store, with the SAME concerns as any other DE pipeline —
+  idempotency (don't re-embed unchanged documents), incremental
+  processing (embed only new/changed chunks, tracked via a
+  content-hash or CDC-style change detection), versioning (if you
+  change embedding models, you generally need to re-embed the ENTIRE
+  corpus, since vectors from different models/versions aren't comparable
+  — this is a real, expensive operational event worth planning for
+  explicitly, analogous to a breaking schema change), and monitoring
+  (embedding job failures, latency, cost). Framing this explicitly as "an
+  incremental ETL pipeline with a specialized sink" is the strongest,
+  most on-brand answer a Data & AI Engineer can give.
+
+================================================================================
+4. VECTOR DATABASES AND VECTOR SEARCH
+================================================================================
+
+WHAT A VECTOR DATABASE ADDS BEYOND "STORE SOME VECTORS"
+  Efficient APPROXIMATE nearest-neighbor (ANN) search at scale — brute-
+  force exact nearest-neighbor search (comparing a query vector against
+  every stored vector) doesn't scale past a modest corpus size; vector
+  databases build specialized indexes (Section below) trading a small,
+  usually acceptable amount of recall for orders-of-magnitude faster
+  search, plus metadata filtering (combining vector similarity with
+  traditional filters like date/category/tenant_id), and CRUD operations
+  on top of the raw vectors.
+
+ANN INDEX ALGORITHMS (know these at a conceptual level)
+  HNSW (Hierarchical Navigable Small World): graph-based index, very
+    strong query speed/recall tradeoff, the most common default in modern
+    vector databases (Pinecone, Weaviate, pgvector's HNSW option) — worth
+    knowing it's graph-based (navigates a multi-layer graph of nearest
+    neighbors) versus:
+  IVF (Inverted File Index): clusters vectors into partitions (via
+    k-means-style clustering) and only searches the most relevant
+    partitions for a given query — faster to build than HNSW, sometimes
+    used as a first-pass filter or in resource-constrained settings.
+  Product Quantization (PQ): compresses vectors into smaller
+    representations to reduce memory footprint at some recall cost, often
+    combined with IVF (IVF-PQ) for very large-scale, memory-constrained
+    deployments.
+  Interview framing: "I don't need to implement these myself, but I know
+  HNSW is the strong general-purpose default for query speed and recall,
+  and that there's a real, tunable tradeoff between index build time,
+  memory footprint, and query recall/speed — the same class of tradeoff
+  as choosing a database index strategy in a traditional system."
+
+VECTOR DATABASE OPTIONS — PRACTICAL LANDSCAPE
+  Purpose-built vector DBs: Pinecone, Weaviate, Milvus, Qdrant — optimized
+    specifically for vector search at scale, managed or self-hosted.
+  Vector search bolted onto existing databases: pgvector (Postgres
+    extension), Elasticsearch/OpenSearch vector fields, MongoDB Atlas
+    Vector Search — good when you want vector search alongside existing
+    relational/document data without standing up a new system, and often
+    the pragmatic choice when the corpus is moderate-sized and you already
+    operate that database.
+  Lakehouse-native vector search: Databricks Vector Search (indexes
+    directly from Delta tables, keeping embeddings automatically in sync
+    with the source table via Delta CDF-style incremental updates) and
+    Snowflake Cortex Search — the 2026-relevant answer for a
+    Databricks/Snowflake-centric shop specifically, since it means the
+    "embedding pipeline as ETL" framing from Section 3 becomes literal:
+    the vector index is just another materialized, incrementally-
+    maintained artifact governed by the same catalog (Unity Catalog/
+    Snowflake Horizon) as the rest of the lakehouse, rather than a
+    separately-operated system with its own security/governance model.
+
+METADATA FILTERING
+  Combining a vector similarity search with structured filters
+  (e.g., "find semantically similar support tickets, but only from the
+  last 30 days, only for tenant_id=X") — critically important for
+  multi-tenant RAG systems (directly reusing the multi-tenant isolation
+  concepts from the System Design handbook: metadata filtering on
+  tenant_id in the vector search IS the tenant isolation mechanism for a
+  shared vector index in the "pool" model).
+
+================================================================================
+5. RAG (RETRIEVAL-AUGMENTED GENERATION) ARCHITECTURE
+================================================================================
+
+CORE PATTERN
+  User query -> embed the query -> vector search against an indexed
+  knowledge base -> retrieve top-K relevant chunks -> construct a prompt
+  combining the retrieved chunks + the user's question -> LLM generates a
+  response grounded in the retrieved content (ideally with citations back
+  to source documents).
+
+WHY RAG EXISTS (the fundamental justification, worth stating precisely)
+  It lets an LLM answer questions about information it wasn't trained on
+  (private/proprietary data, or data more recent than its training cutoff)
+  WITHOUT retraining or fine-tuning the model — you're injecting relevant
+  context at inference time instead. This is dramatically cheaper and
+  faster to keep current than fine-tuning (Section 9), and grounds
+  responses in retrievable, citable source documents, directly mitigating
+  hallucination risk (Section 2) by giving the model actual source
+  material to work from rather than relying purely on parametric
+  (trained-in) knowledge.
+
+NAIVE RAG FAILURE MODES — THE PART THAT ACTUALLY GETS TESTED
+  A "naive" implementation (embed everything, retrieve top-K by cosine
+  similarity, stuff into prompt) fails in specific, well-known ways that
+  interviewers expect you to name and fix:
+    1. Irrelevant retrieval: the top-K chunks by embedding similarity
+       aren't actually the most useful for answering the question (e.g.,
+       a chunk mentions the right keywords but not the right context) ->
+       fixed by hybrid search and reranking (Section 7).
+    2. Chunking breaks context: a relevant fact is split across two
+       chunks, and only one gets retrieved, losing critical context ->
+       fixed by better chunking strategy (Section 6), overlap between
+       chunks, or retrieving surrounding context (parent-document
+       retrieval — fetch a wider window around a matched chunk).
+    3. Query-document mismatch: the user's question is phrased very
+       differently from how the answer is phrased in the source documents
+       (e.g., a casual question vs. formal documentation), hurting
+       embedding similarity -> fixed by query transformation (Section 7).
+    4. Too many/too few chunks retrieved: too few misses relevant
+       context; too many introduces noise and triggers "lost in the
+       middle" degradation (Section 2) -> fixed by tuning top-K and
+       adding a reranking step that can more precisely rank a larger
+       initial retrieval set down to a smaller, higher-precision final
+       set.
+    5. Stale index: the knowledge base changed but the vector index
+       wasn't updated -> fixed by the incremental embedding pipeline
+       discipline from Section 3 (this is explicitly a DATA ENGINEERING
+       failure mode, not a model failure mode — a strong point to make
+       explicitly, since it's exactly the kind of failure a Data & AI
+       Engineer, not an ML researcher, is responsible for preventing).
+
+ADVANCED RAG PATTERNS
+  Parent-document retrieval: index small, precise chunks for accurate
+    matching, but retrieve and pass the LARGER parent section/document
+    they belong to for generation — balances precise retrieval against
+    sufficient context for generation.
+  Multi-hop / iterative retrieval: for questions requiring information
+    from multiple, non-adjacent sources, retrieve, generate an
+    intermediate reasoning step or sub-query, retrieve again based on
+    that, and repeat — used for complex questions a single retrieval pass
+    can't answer.
+  Contextual retrieval (retrieval-time context enrichment): prepending
+    a short LLM-generated summary of a chunk's surrounding document
+    context to the chunk BEFORE embedding it, so the chunk's embedding
+    captures more of the broader context it lives in — a genuinely
+    current (2026-relevant) technique worth naming for improving
+    retrieval precision on chunks that are ambiguous in isolation.
+  GraphRAG: building a knowledge graph from the corpus (entities and
+    relationships) and combining graph traversal with vector retrieval —
+    used when questions require understanding relationships/connections
+    across the corpus that pure semantic similarity search doesn't
+    capture well (e.g., "how are these two companies connected" rather
+    than "find documents similar to this").
+
+================================================================================
+6. CHUNKING STRATEGIES
+================================================================================
+
+WHY CHUNKING MATTERS AS MUCH AS IT DOES
+  Chunk size and boundaries directly determine what gets embedded and
+  what gets retrieved as a unit — too large, and a chunk's embedding
+  becomes a diluted average of many different topics (hurting precision);
+  too small, and a chunk loses necessary context to be understood or
+  useful on its own. This is a genuinely high-leverage, concretely
+  tunable design decision, and interviewers use it to check whether a
+  candidate treats RAG as "just call an embedding API" or actually
+  understands the data engineering behind it.
+
+FIXED-SIZE CHUNKING (with overlap)
+  Split text into fixed token/character-count chunks, with some overlap
+  between consecutive chunks (e.g., 500 tokens per chunk, 50-token
+  overlap) so a fact near a chunk boundary isn't lost entirely from
+  either chunk. Simple, fast, works reasonably as a baseline, but ignores
+  document structure entirely (can split mid-sentence or mid-table).
+
+RECURSIVE / STRUCTURE-AWARE CHUNKING
+  Splits along natural document boundaries first (sections, paragraphs,
+  then sentences as a fallback if a paragraph is still too large) —
+  respects the document's actual structure, generally outperforms naive
+  fixed-size chunking for well-structured source documents (markdown,
+  HTML, structured reports).
+
+SEMANTIC CHUNKING
+  Uses embedding similarity between consecutive sentences/paragraphs to
+  detect topic boundaries and split there, rather than at a fixed size or
+  purely structural marker — more computationally expensive to build
+  (requires embedding calls during the chunking process itself) but can
+  produce more semantically coherent chunks for documents without clean
+  structural markers.
+
+DOMAIN-SPECIFIC CHUNKING
+  Tables: chunking a table naively (e.g., splitting rows across chunks)
+    destroys its meaning — tables generally need special handling
+    (keep intact if small, or convert to a structured text representation
+    preserving row/column context if large).
+  Code: chunk along function/class boundaries rather than fixed line
+    counts, to keep a logically complete unit together.
+  Q&A/FAQ content: often best chunked one question-answer pair per chunk,
+    since that's already the natural retrieval unit.
+
+CHUNK SIZE — PRACTICAL GUIDANCE (a real, defensible starting point)
+  There's no universally correct chunk size — it depends on the embedding
+  model's effective range, the generation model's context window, and the
+  nature of the queries expected. A reasonable STARTING point for general
+  prose is a few hundred tokens per chunk with modest overlap (10-20% of
+  chunk size), then TUNED based on retrieval evaluation (Section 12)
+  against a representative set of real or synthetic queries — stating
+  "I'd start here and then evaluate and tune" is a stronger, more honest
+  answer than presenting any fixed number as universally correct.
+
+================================================================================
+7. RETRIEVAL QUALITY: HYBRID SEARCH, RERANKING, QUERY TRANSFORMATION
+================================================================================
+
+HYBRID SEARCH (dense + sparse retrieval combined)
+  Pure vector (dense) search captures semantic similarity but can miss
+  exact keyword/entity matches (e.g., a specific product SKU, an exact
+  error code) that a user's query contains verbatim — sparse retrieval
+  methods (BM25, traditional keyword/full-text search) excel at exactly
+  that case but miss semantic paraphrases. Hybrid search runs BOTH and
+  combines/re-ranks the results (commonly via Reciprocal Rank Fusion,
+  RRF, which combines rankings from multiple retrieval methods without
+  needing their raw scores to be on the same scale) — this is widely
+  considered current best practice over either method alone, and a strong
+  answer to "how would you improve retrieval quality for a knowledge base
+  containing both prose documentation and exact error codes/SKUs."
+
+RERANKING
+  A two-stage retrieval pattern: retrieve a larger initial candidate set
+  (e.g., top 50) cheaply via vector/hybrid search, then apply a more
+  computationally expensive but more precise RERANKING model (a
+  cross-encoder that jointly scores the query and each candidate
+  document together, unlike embedding similarity which scores them
+  independently) to re-rank that candidate set down to a smaller final
+  set (e.g., top 5) actually passed to the LLM. This directly addresses
+  the "irrelevant retrieval" and "too many chunks" naive-RAG failure
+  modes from Section 5, and is one of the highest-leverage, most commonly
+  recommended production RAG improvements — a strong, specific detail to
+  volunteer.
+
+QUERY TRANSFORMATION
+  Query expansion/rewriting: using an LLM call to rewrite or expand the
+    user's raw query into a form more likely to match how the answer is
+    phrased in the source documents (e.g., turning a terse query into a
+    more complete, explicit question), before running retrieval.
+  HyDE (Hypothetical Document Embeddings): generate a hypothetical
+    ANSWER to the query with an LLM first, then embed THAT hypothetical
+    answer (rather than the raw query) and use it for retrieval — the
+    intuition is that a hypothetical answer's embedding is often closer
+    in vector space to real relevant documents than the original
+    question's embedding is, since documents are written in
+    answer-style prose, not question-style prose.
+  Query decomposition: breaking a complex, multi-part question into
+    several simpler sub-queries, retrieving for each independently, and
+    combining results — connects directly to the multi-hop retrieval
+    pattern from Section 5.
+
+WHEN TO INVEST IN WHICH IMPROVEMENT (a genuinely useful framing)
+  Diagnose the failure mode first (via evaluation, Section 12) before
+  reaching for a fix: if retrieval RECALL is the problem (relevant
+  documents aren't even in the candidate set), improve chunking or add
+  hybrid search; if retrieval PRECISION is the problem (relevant
+  documents are retrieved but buried among irrelevant ones), add
+  reranking; if the QUERY itself is the mismatch, add query
+  transformation. Stating this diagnostic-first framing, rather than
+  listing techniques without justification, is what separates a strong
+  answer from a checklist recitation.
+
+================================================================================
+8. PROMPT ENGINEERING FOR PRODUCTION SYSTEMS
+================================================================================
+
+STRUCTURED PROMPTING (the production-relevant skill, beyond "write a good
+prompt")
+  System prompt separated from user content, clear role/task
+  instructions, explicit output format specification (often requesting
+  structured JSON output for programmatic downstream consumption — a
+  data engineering-relevant detail, since a pipeline consuming LLM output
+  needs a parseable, validated schema, not free-form prose), and few-shot
+  examples when the task benefits from demonstration.
+
+FEW-SHOT PROMPTING
+  Including a small number of example input/output pairs directly in the
+  prompt to steer the model toward the desired format/style/reasoning
+  pattern without any fine-tuning — often meaningfully improves
+  consistency for structured extraction or classification tasks at near-
+  zero additional engineering cost compared to fine-tuning, making it
+  usually the first lever to pull before considering fine-tuning
+  (Section 9).
+
+PROMPT VERSIONING AND TESTING (the DE-relevant angle)
+  Treat prompts as VERSIONED ARTIFACTS with their own change-management
+  discipline — a prompt change is a production code change with the
+  potential to silently degrade output quality, and should go through
+  the same evaluation pipeline (Section 12) as a model or retrieval
+  change before deployment, ideally with A/B testing or shadow evaluation
+  against a held-out eval set. This is a strong, production-mindset point
+  many candidates miss — treating prompt changes as casually as editing
+  a string, rather than as a governed change requiring evaluation.
+
+PROMPT INJECTION AWARENESS
+  User-supplied content (including RAG-retrieved documents, which are
+  effectively untrusted input if sourced from user-generated content or
+  external documents) can contain text designed to hijack the model's
+  instructions ("ignore previous instructions and instead...") —
+  worth naming as a security concern relevant specifically to RAG systems
+  that retrieve and inject external content into prompts, connecting
+  directly to the guardrails discussion in Section 14.
+
+================================================================================
+9. FINE-TUNING vs. RAG vs. PROMPTING — DECISION FRAMEWORK
+================================================================================
+
+This is one of the most commonly asked "which approach" questions —
+answer with the decision framework, not just definitions.
+
+PROMPTING / FEW-SHOT (cheapest, fastest to iterate)
+  Use when: the task is achievable by giving the model clear instructions
+  and a few examples, no proprietary/private knowledge is needed beyond
+  what's in the prompt, and requirements change frequently (a prompt is
+  trivial to update; a fine-tuned model is not).
+
+RAG (moderate cost, keeps knowledge current)
+  Use when: the model needs access to information it wasn't trained on
+  (private data, recent data) and that information changes over time —
+  RAG's core advantage is that updating the knowledge base (re-embedding
+  new/changed documents) is far cheaper and faster than retraining a
+  model, and it provides citable grounding.
+
+FINE-TUNING (highest cost/complexity, most durable behavior change)
+  Use when: you need to change the model's BEHAVIOR/STYLE/FORMAT
+  consistently (not just give it new facts) — e.g., teaching a model to
+  reliably follow a very specific, unusual output format, respond in a
+  very particular tone, or perform a specialized task pattern that
+  few-shot prompting can't reliably achieve, OR when you need to reduce
+  per-request latency/cost by baking behavior into the model instead of
+  needing a long prompt with many examples every single call. Critically:
+  fine-tuning is NOT the right tool for injecting FACTUAL knowledge that
+  changes over time — that's RAG's job; fine-tuning for facts risks the
+  model memorizing stale training-time facts and still hallucinating for
+  anything outside that fixed snapshot.
+  PARAMETER-EFFICIENT FINE-TUNING (PEFT), e.g., LoRA (Low-Rank
+  Adaptation): fine-tunes a small number of additional parameters rather
+  than the full model, dramatically reducing training cost/compute and
+  producing a small, swappable adapter rather than a full new model copy
+  — the practical, cost-effective way most fine-tuning is actually done
+  in 2026 rather than full-parameter fine-tuning, worth naming explicitly
+  if fine-tuning cost comes up.
+
+THE COMBINED, MOST COMMON PRODUCTION ANSWER
+  "In practice these aren't mutually exclusive — a common production
+  pattern is RAG for grounding in current, private knowledge, combined
+  with a lightly fine-tuned (often via LoRA) model for consistent output
+  format/behavior/tone, with prompting/few-shot examples layered on top
+  for task-specific steering. I'd start with prompting and RAG first
+  since they're fastest to iterate and cheapest, and only invest in
+  fine-tuning once evaluation (Section 12) shows a specific, persistent
+  behavioral gap that prompting/RAG can't close."
+
+================================================================================
+10. AGENTS AND AGENTIC PIPELINES
+================================================================================
+
+WHAT MAKES SOMETHING AN "AGENT" RATHER THAN A SINGLE LLM CALL
+  An agent uses an LLM in a LOOP to make multi-step decisions — observing
+  its environment/state, deciding on an action (often calling a tool,
+  Section 11), observing the result, and deciding on the next action —
+  rather than a single prompt-in, response-out call. This is the
+  structural distinction worth stating precisely when asked "what's an
+  agent" rather than a vague answer: it's the control loop, not the
+  underlying model, that makes something agentic.
+
+REACT PATTERN (Reason + Act)
+  A common, foundational agentic pattern: the model alternates between
+  producing a REASONING step (a short, explicit "thought" about what to
+  do next) and an ACTION step (typically a tool call), observing the
+  action's result, and repeating until it decides it has enough
+  information to produce a final answer. Worth knowing by name since it's
+  the conceptual basis for most modern agent frameworks even when they
+  add more structure on top.
+
+PLANNING AGENTS
+  For more complex, multi-step tasks, an agent may first generate an
+  explicit PLAN (a sequence of sub-tasks) before executing, rather than
+  deciding each next step reactively — trades some flexibility for more
+  predictable, auditable execution, useful for tasks with a genuinely
+  well-defined structure (e.g., a data pipeline authoring agent that
+  plans "extract schema -> validate -> generate transformation -> test"
+  as explicit stages).
+
+MULTI-AGENT SYSTEMS
+  Multiple specialized agents (e.g., a "researcher" agent, a "coder"
+  agent, a "reviewer" agent) coordinating on a task, either through a
+  central orchestrator agent delegating sub-tasks, or through direct
+  agent-to-agent communication — used when a task naturally decomposes
+  into distinct specialized roles, though it adds real coordination
+  complexity and cost (more LLM calls) and should be justified by
+  genuine task complexity, not adopted by default for its own sake.
+
+AGENT MEMORY
+  Short-term (within a single conversation/task, typically just the
+  conversation history in context) versus long-term (persisted across
+  sessions, typically stored in a vector database or structured store and
+  retrieved similarly to RAG — "memory" for an agent is very often
+  literally implemented as a RAG pipeline over the agent's own past
+  interactions) — worth connecting explicitly: agent long-term memory is
+  usually just RAG applied to a different corpus (interaction history
+  instead of documents).
+
+AGENTIC RELIABILITY CONCERNS (the DE-relevant, production angle)
+  Agents that call tools/take actions autonomously introduce real
+  failure modes beyond a single LLM call: infinite/runaway loops (an
+  agent stuck repeating similar actions without converging — needs an
+  explicit max-iteration guard), cascading errors (an early wrong
+  decision compounds through subsequent steps, since the agent's own
+  possibly-incorrect prior outputs become part of its context for later
+  decisions), and cost/latency unpredictability (an agent's total cost
+  isn't fixed like a single call — it depends on how many iterations it
+  takes, requiring cost monitoring and hard limits, not just per-call
+  budgeting). These reliability concerns are exactly the kind of thing a
+  Data & AI Engineer, thinking in terms of pipeline observability and
+  failure handling from the rest of this handbook library, is expected to
+  design for.
+
+================================================================================
+11. TOOL USE / FUNCTION CALLING
+================================================================================
+
+MECHANISM
+  The model is given a set of tool/function DEFINITIONS (name,
+  description, parameter schema) alongside the prompt; rather than
+  generating free-text, the model can generate a structured request to
+  call one of those tools with specific arguments — the calling
+  application executes the actual tool code (the model itself never
+  executes anything), returns the result to the model as additional
+  context, and the model continues (often producing a final natural-
+  language response, or deciding to call another tool).
+
+WHY THIS MATTERS FOR A DATA & AI ENGINEER SPECIFICALLY
+  Tools are frequently DATA-ACCESS FUNCTIONS — querying a database,
+  calling an internal API, running a SQL query against a warehouse,
+  searching a vector index. Designing good tool definitions (clear
+  descriptions, tightly-scoped parameters, sensible error handling when
+  a tool call fails or returns unexpected data) is directly a data
+  engineering skill applied to a new interface, and is exactly the kind
+  of work that shows up in "Agent Bricks"-style platforms (Section 16)
+  where the data engineer's job is building reliable, well-documented
+  tools for agents to call against the lakehouse.
+
+TOOL DESIGN BEST PRACTICES
+  - Narrow, single-purpose tools are generally more reliable than one
+    broad, do-everything tool — the model makes better decisions about
+    WHEN to call a tool when tool boundaries are clear and their
+    descriptions are unambiguous.
+  - Return structured, concise results from tools, not raw dumps (e.g., a
+    SQL query tool returning a huge raw result set wastes context window
+    and risks the "lost in the middle" problem from Section 2 — summarize
+    or paginate large results).
+  - Validate/sanitize tool inputs before execution, especially for tools
+    that can mutate data or call external systems — the model's generated
+    arguments should be treated as untrusted input requiring the same
+    validation discipline as any user-facing API, directly connecting to
+    the prompt injection concern in Section 8.
+
+GOVERNANCE FOR TOOL ACCESS (2026-relevant, ties to Unity AI Gateway)
+  In a lakehouse context, which tools/data an agent can access should be
+  governed the same way table/column access is governed for human users —
+  via the catalog's permission model, not a separate, parallel
+  authorization system bolted onto the agent framework. This is precisely
+  the role of something like Unity AI Gateway (Section 16): centralizing
+  and governing model/tool access the way Unity Catalog governs data
+  access.
+
+================================================================================
+12. LLM EVALUATION — THE HARDEST AND MOST-TESTED TOPIC
+================================================================================
+
+WHY THIS IS HARD (state this explicitly — it's a strong opening framing)
+  Unlike a traditional ML classification model with a clear ground-truth
+  label and accuracy metric, most LLM application outputs are open-ended
+  natural language with no single "correct" answer — "the response is
+  good" is inherently more subjective than "the prediction matches the
+  label." Good evaluation design is specifically about converting that
+  subjective judgment into something measurable, repeatable, and
+  automatable enough to run continuously in CI/CD, not just eyeballed
+  occasionally.
+
+RETRIEVAL EVALUATION (separate from generation evaluation — evaluate them
+independently first)
+  Precision@K / Recall@K: of the top-K retrieved chunks, what fraction
+    are actually relevant (precision), and what fraction of all truly
+    relevant chunks were retrieved (recall)? Requires a labeled eval set
+    of (query, relevant document) pairs — often built by domain experts,
+    or bootstrapped by generating synthetic questions FROM known
+    documents (a genuinely practical, common technique: take a document,
+    have an LLM generate plausible questions it answers, and now you have
+    a (query, known-relevant-document) pair for free, at scale).
+  MRR (Mean Reciprocal Rank): rewards ranking the first relevant result
+    higher, useful when there's typically one clearly-best relevant
+    document rather than several equally relevant ones.
+
+GENERATION EVALUATION
+  Reference-based metrics (BLEU, ROUGE): compare generated text against
+    a reference answer via n-gram overlap — cheap to compute but
+    notoriously poor proxies for actual quality/correctness in open-ended
+    generation, and increasingly considered weak/legacy for LLM output
+    evaluation specifically; worth knowing they exist and their
+    limitation, not recommending them as a primary strategy.
+  LLM-as-judge: using a (typically stronger/separate) LLM to score or
+    compare outputs against defined criteria (correctness, groundedness,
+    relevance, tone) — the dominant practical approach in 2026 for
+    scaling evaluation beyond what human review can cover, BUT requires
+    its own validation: the judge model's scores should themselves be
+    periodically checked against human judgment on a sample, since a
+    judge model has its own biases (e.g., a tendency to prefer longer
+    responses, or responses stylistically similar to its own outputs) —
+    stating this meta-validation step explicitly is a strong, precise
+    interview point showing real depth rather than surface familiarity.
+  Groundedness / faithfulness checks: specifically testing whether a
+    RAG response's claims are actually supported by the retrieved source
+    documents (as opposed to general "is this a good answer" quality) —
+    the direct, measurable proxy for hallucination risk in a RAG system,
+    typically implemented via an LLM-as-judge call comparing the
+    generated claims against the retrieved context specifically.
+  Human evaluation: still the gold standard for calibrating automated
+    metrics and catching failure modes automated evaluation misses,
+    but expensive and slow to run continuously — the practical pattern is
+    automated eval (LLM-as-judge + retrieval metrics) running on every
+    change/continuously, with periodic human evaluation on a sample to
+    validate the automated metrics haven't drifted from actual quality.
+
+BUILDING AN EVAL SET (the concrete, DE-relevant deliverable)
+  A representative, versioned dataset of (query, expected/acceptable
+  answer characteristics, relevant source documents) tuples, covering
+  common cases, edge cases, and known failure modes — treated as a
+  first-class, version-controlled artifact (same discipline as a dbt
+  test suite or a data quality expectation suite from the System Design
+  handbook), run automatically as part of CI/CD whenever the prompt,
+  retrieval pipeline, or underlying model changes, with regression
+  tracking over time (did this change make quality better or worse
+  compared to the last version).
+
+ONLINE EVALUATION / PRODUCTION MONITORING
+  Beyond offline eval-set testing before deployment, production systems
+  need ONGOING monitoring: user feedback signals (thumbs up/down,
+  explicit corrections), automated groundedness checks on a sample of
+  live traffic, drift detection (are query patterns or retrieval quality
+  changing over time as the underlying knowledge base or user population
+  shifts) — directly analogous to model monitoring/drift detection in
+  traditional MLOps, applied to LLM systems specifically.
+
+================================================================================
+13. LLMOPS: DEPLOYMENT, MONITORING, COST, CACHING
+================================================================================
+
+MODEL SERVING PATTERNS
+  Hosted API (OpenAI, Anthropic, etc. via API): no infrastructure to
+    manage, pay-per-token, fastest to get started, but external
+    dependency and per-token cost at scale.
+  Self-hosted/managed model serving (Databricks Model Serving, cloud-
+    native model endpoints): more control, potentially lower cost at
+    high, sustained volume, but requires managing GPU infrastructure/
+    scaling, and typically used for open-weight models rather than
+    proprietary hosted-API-only models.
+  The practical decision mirrors the Azure/AWS serverless-vs-provisioned
+  compute tradeoff from the Cloud Fundamentals handbooks: hosted APIs for
+  spiky/uncertain volume and fastest time-to-value, self-hosted for very
+  high, predictable, sustained volume where the economics tip toward
+  owning the infrastructure.
+
+CACHING STRATEGIES (a high-leverage, DE-native cost/latency lever)
+  Exact-match caching: cache the response for an identical prompt —
+    straightforward, effective for common/repeated queries (FAQ-style
+    traffic), implemented as a simple key-value cache keyed on a hash of
+    the full prompt.
+  Semantic caching: cache keyed on embedding similarity rather than
+    exact string match, so a semantically equivalent but differently-
+    worded query can hit the cache — more complex (requires an embedding
+    lookup on every request, and a similarity threshold tuning decision)
+    but captures far more cache hits than exact-match alone for
+    natural-language queries that are rarely worded identically twice.
+  Both directly reduce cost and latency, and this is a very concrete,
+  strong thing to volunteer when asked "how would you reduce the cost of
+  this RAG system in production."
+
+STREAMING RESPONSES
+  Returning generated tokens incrementally to the client as they're
+  produced, rather than waiting for the full response — doesn't reduce
+  total cost/compute, but dramatically improves PERCEIVED latency for
+  user-facing applications, a real, standard production pattern worth
+  naming when latency/UX comes up.
+
+COST MONITORING AND BUDGETING
+  Token usage (input + output, separately, since many providers price
+  them differently) tracked per feature/team/user for cost attribution,
+  hard rate limits/budgets to prevent runaway cost from a bug (e.g., an
+  agent stuck in a loop, Section 10), and cost-aware model routing
+  (using a smaller/cheaper model for simpler sub-tasks and a larger model
+  only for the steps that genuinely need it — a real, common cost-
+  optimization pattern in multi-step/agentic pipelines specifically).
+
+LATENCY OPTIMIZATION
+  Reducing prompt size (directly connects to chunking/retrieval quality —
+  fewer, more relevant chunks means both better quality AND lower
+  latency/cost, a genuinely nice alignment of incentives worth pointing
+  out), parallelizing independent LLM calls where possible (e.g., in a
+  multi-step agent, calls that don't depend on each other's output),
+  and model routing to smaller/faster models for latency-sensitive,
+  lower-complexity requests.
+
+================================================================================
+14. GUARDRAILS, SAFETY, AND GOVERNANCE
+================================================================================
+
+INPUT GUARDRAILS
+  Validating/filtering user input before it reaches the model — detecting
+  and blocking prompt injection attempts, PII in input that shouldn't be
+  sent to a third-party model API, off-topic/out-of-scope requests for a
+  narrowly-scoped application.
+
+OUTPUT GUARDRAILS
+  Validating model output before it reaches the user or a downstream
+  system — checking for PII leakage, toxic/inappropriate content,
+  structural validity (does the output actually match the expected
+  JSON schema for a downstream pipeline consuming it — a directly
+  DE-relevant concern, since a malformed structured-output response
+  breaking a downstream pipeline is exactly the kind of failure a data
+  engineer needs to guard against, e.g., with schema validation and a
+  retry/fallback strategy on validation failure).
+
+GROUNDEDNESS ENFORCEMENT
+  For RAG specifically, actively checking (either via the groundedness
+  evaluation from Section 12 run inline, or via prompt instructions
+  requiring the model to only answer from provided context and explicitly
+  say "I don't know" otherwise) that responses don't go beyond what the
+  retrieved context actually supports — a concrete hallucination-
+  mitigation mechanism, not just an evaluation-time check.
+
+PII AND DATA GOVERNANCE FOR LLM PIPELINES
+  Directly reuses concepts from the Cloud Fundamentals and System Design
+  handbooks: if a RAG knowledge base or an agent's tool access touches
+  sensitive/PII data, the same column-masking/row-level-security
+  governance patterns (Unity Catalog dynamic views, Lake Formation) apply
+  — an LLM application querying a governed lakehouse table should be
+  subject to the SAME governance as any other consumer, not granted a
+  separate, ungoverned backdoor path to the data. This is a strong,
+  specific point connecting GenAI engineering back to core data
+  governance discipline.
+
+AUDIT AND TRACEABILITY
+  Logging full request/response pairs (including intermediate agent
+  steps/tool calls, not just the final output) for audit, debugging, and
+  evaluation purposes — genuinely important both for compliance and for
+  being able to reconstruct WHY an agent made a particular decision when
+  investigating a production issue, directly analogous to the lineage/
+  observability discipline expected of any production data pipeline in
+  this handbook library.
+
+================================================================================
+15. DATA ENGINEERING'S ROLE IN GENAI SYSTEMS
+================================================================================
+
+This section exists specifically to help you frame your OWN experience
+(Databricks, Delta Lake, medallion architecture, SCD2) as directly
+transferable GenAI-relevant skill, which is exactly what a "Data and AI
+Engineer" interview loop is testing for.
+
+THE EMBEDDING PIPELINE IS A MEDALLION PIPELINE
+  Bronze: raw source documents (PDFs, wiki pages, tickets) landed as-is.
+  Silver: cleaned, deduplicated, parsed text extracted from raw formats,
+    with document-level metadata resolved (source, author, date,
+    access-control tags).
+  Gold: chunked, embedded, and indexed into the vector store — the
+    "gold" artifact here is the vector index itself, purpose-built for
+    the RAG consumption pattern, directly mirroring the OBT-for-ML-
+    training-table framing from the Data Modeling handbook.
+  This exact framing — "an embedding/RAG pipeline is a medallion
+  architecture where the gold layer happens to be a vector index instead
+  of a star schema" — is a strong, concrete way to bridge your existing
+  Databricks expertise directly into a GenAI systems answer.
+
+CDC FOR KNOWLEDGE BASE FRESHNESS
+  Keeping a RAG knowledge base current as source documents change is
+  structurally identical to the CDC pipeline problem from the System
+  Design handbook: detect changed/new/deleted source documents (via
+  timestamps, content hashing, or native CDC from the source system),
+  re-chunk and re-embed only what changed (never blindly re-embed the
+  entire corpus on every run — that's both wasteful and slow), and
+  upsert/delete the corresponding vectors in the index — literally a
+  MERGE operation against the vector store's underlying table if using a
+  lakehouse-native vector search product.
+
+ORCHESTRATION FOR GENAI PIPELINES
+  Embedding generation, index refresh, and evaluation pipelines are all
+  scheduled/triggered jobs like any other data pipeline — the same
+  orchestration tools (Databricks Jobs/Lakeflow, Airflow) apply directly,
+  with the same dependency management, retry, and monitoring concerns as
+  any batch/incremental pipeline in this handbook library.
+
+FEATURE STORE PARALLELS
+  An agent's "memory" or a RAG system's retrieved context is
+  conceptually similar to a feature lookup at inference time (System
+  Design handbook's recommendation system problem) — both require
+  low-latency retrieval of relevant, pre-computed context at serving
+  time, and both face the same point-in-time correctness class of
+  concerns if the retrieved context needs to reflect "what was true when
+  this interaction happened" for training/evaluation purposes rather than
+  only the current state.
+
+================================================================================
+16. DATABRICKS & SNOWFLAKE AI PLATFORM FEATURES (2026)
+================================================================================
+
+DATABRICKS
+  Mosaic AI / Agent Bricks: Databricks's platform for building, deploying,
+    and governing AI agents directly within the lakehouse — the practical
+    embodiment of the "tools as governed data access functions" framing
+    from Section 11, letting agents call governed Unity Catalog data/
+    functions as tools with the same access control as any other
+    consumer.
+  Databricks Vector Search: lakehouse-native vector index that stays
+    automatically, incrementally synced with a source Delta table — the
+    concrete implementation of the "embedding pipeline as ETL" framing
+    from Sections 3 and 15.
+  Unity AI Gateway: centralizes and governs access to LLM endpoints
+    (both Databricks-hosted and external provider APIs) the way Unity
+    Catalog governs data access — providing centralized rate limiting,
+    cost tracking/attribution, logging/audit, and a consistent interface
+    regardless of underlying model provider, directly addressing the
+    cost-monitoring and audit/traceability concerns from Sections 13-14
+    as a platform capability rather than something each team builds
+    separately.
+  Databricks Model Serving: managed endpoints for serving both custom/
+    fine-tuned models and proprietary hosted models behind a unified API.
+  Lakebase: Databricks's operational/serving-layer database offering,
+    relevant as a potential low-latency serving target for agent
+    state/memory or online feature-store-style lookups feeding an LLM
+    application, positioned similarly to how Cosmos DB/DynamoDB serve
+    that role in the Cloud Fundamentals handbooks.
+
+SNOWFLAKE
+  Cortex: Snowflake's suite of built-in AI functions runnable directly
+    against warehouse data via SQL — including LLM completion functions,
+    text embedding generation, and Cortex Search (Snowflake's managed
+    vector/hybrid search offering) — the Snowflake-native analogue to
+    Databricks Vector Search + Model Serving, letting embedding
+    generation and retrieval happen without moving data out of the
+    warehouse or standing up separate infrastructure.
+  Cortex Analyst / Cortex Agents: natural-language-to-SQL and agentic
+    capabilities built on top of Cortex, governed through Snowflake's
+    existing RBAC/Horizon governance layer — same "governance-first"
+    framing as Unity AI Gateway, applied within Snowflake's platform.
+
+INTERVIEW FRAMING
+  "Whether the shop is Databricks-centric or Snowflake-centric, the
+  underlying pattern is the same: the lakehouse/warehouse platform is
+  increasingly offering native embedding generation, vector search, and
+  agent/tool governance built directly on top of the existing catalog and
+  data — meaning a GenAI pipeline built this way inherits the platform's
+  existing governance, lineage, and access control automatically, rather
+  than requiring a parallel, separately-secured AI stack bolted onto the
+  side."
+
+================================================================================
+17. COMMON DESIGN PROBLEMS (WORKED EXAMPLES)
+================================================================================
+
+--------------------------------------------------------------------------------
+PROBLEM A: Design a RAG-based internal support-ticket assistant for a large
+enterprise, where the knowledge base (help docs + past resolved tickets)
+updates continuously and access must respect existing per-department
+permissions
+--------------------------------------------------------------------------------
+  Ingestion: help docs + resolved tickets land in bronze via existing
+    batch/CDC pipelines (help docs from a CMS export, tickets via CDC from
+    the ticketing system's database, reusing the Streaming & Kafka
+    handbook's CDC pattern).
+  Silver: parse/clean text, resolve document metadata including the
+    owning department/access-control tag from the source system.
+  Gold: structure-aware chunking (Section 6) respecting document
+    sections; embed via a domain-appropriate embedding model; index into
+    a lakehouse-native vector search (Databricks Vector Search/Snowflake
+    Cortex Search) kept incrementally in sync with the silver table via
+    the platform's native CDC-based refresh, avoiding full corpus
+    re-embeds on every update.
+  Retrieval: hybrid search (dense + BM25) given the likely mix of prose
+    help-docs and exact error-code/product-name matches in tickets, with
+    metadata filtering enforcing the requesting user's department access
+    (reusing the multi-tenant metadata-filtering pattern from Section 4),
+    plus a reranking step given the mixed-quality nature of historical
+    ticket text.
+  Generation: low-temperature, grounded prompt instructing the model to
+    answer only from retrieved context and cite the source ticket/doc,
+    with explicit "I don't know" fallback instructions.
+  Governance: retrieval-time metadata filtering enforces the SAME
+    department-level access control as the existing ticketing system —
+    the RAG system doesn't get a separate, more permissive access path.
+  Evaluation: a labeled eval set of (real support question, correct
+    resolution) pairs bootstrapped from historical successfully-resolved
+    tickets, run in CI on every prompt/retrieval pipeline change,
+    measuring retrieval precision/recall and LLM-as-judge groundedness,
+    plus production thumbs-up/down feedback monitoring.
+
+--------------------------------------------------------------------------------
+PROBLEM B: An agent that lets analysts ask natural-language questions
+against a Delta Lake gold-layer star schema, generating and running SQL
+--------------------------------------------------------------------------------
+  Core pattern: text-to-SQL agent with tool access to (a) a schema-lookup
+  tool (returns table/column definitions and sample rows for relevant
+  gold tables — critical grounding to reduce hallucinated column names)
+  and (b) a query-execution tool (runs generated SQL against the
+  warehouse and returns results, ideally paginated/summarized per the
+  tool-design guidance in Section 11).
+  Reliability guardrails: the query-execution tool enforces a hard row-
+  limit and a query timeout to prevent a runaway/expensive query;
+  generated SQL is validated (e.g., an EXPLAIN/dry-run check, or a SQL
+  parser check for destructive statements like DROP/DELETE) before actual
+  execution, since a text-to-SQL agent generating and directly running
+  arbitrary SQL against production data is a real operational risk
+  requiring the same defensive validation as any user-facing API.
+  Governance: the agent executes queries under the REQUESTING USER's own
+  Unity Catalog/Snowflake RBAC permissions (not a broad service-account
+  identity), so it can never surface data that specific user wasn't
+  already authorized to see — directly reusing the identity-based access
+  discipline from the Cloud Fundamentals handbooks, applied to an agent
+  rather than a human session.
+  Evaluation: an eval set of (natural-language question, expected SQL
+  pattern or expected result) pairs against a known schema/dataset,
+  checking both SQL correctness and whether the final natural-language
+  answer accurately summarizes the query result.
+
+================================================================================
+18. INTERVIEW QUESTION BANK WITH MODEL ANSWERS
+================================================================================
+
+Q: "Why does naive RAG often perform poorly in production, and how would
+   you improve it?"
+A: "A few specific failure modes: the top-K chunks by pure embedding
+   similarity often aren't the most useful ones, which hybrid search and
+   reranking address; chunking can split relevant context across chunk
+   boundaries, which better structure-aware chunking and overlap address;
+   and the user's query phrasing often doesn't closely match how the
+   answer is written in the source documents, which query transformation
+   techniques like HyDE address. I'd diagnose which specific failure mode
+   is actually occurring using retrieval evaluation metrics before
+   picking a fix, rather than applying all of these blindly."
+
+Q: "How do you evaluate a RAG system when there's no single correct
+   answer?"
+A: "I'd separate retrieval evaluation from generation evaluation.
+   Retrieval gets evaluated with precision/recall against a labeled eval
+   set of query-to-relevant-document pairs, which I can often bootstrap
+   by generating synthetic questions from known documents. Generation
+   quality — especially groundedness, whether the response is actually
+   supported by the retrieved context — I'd evaluate primarily with an
+   LLM-as-judge approach, since reference-based metrics like BLEU/ROUGE
+   are poor proxies for open-ended answer quality. I'd validate the
+   judge model's scores periodically against human review to make sure it
+   hasn't drifted from actual quality, and I'd build this into an
+   automated, versioned eval set that runs in CI on every prompt or
+   retrieval pipeline change."
+
+Q: "When would you fine-tune a model instead of using RAG?"
+A: "When the gap is about behavior, format, or style rather than
+   knowledge — teaching the model to reliably follow a specific unusual
+   output format or task pattern that few-shot prompting can't nail down
+   consistently. I wouldn't fine-tune to inject facts that change over
+   time — that's RAG's job, since updating a knowledge base is much
+   cheaper and faster than retraining, and fine-tuning for facts risks
+   the model still hallucinating outside its fixed training snapshot. In
+   practice I'd usually combine both: RAG for grounding, a lightweight
+   LoRA fine-tune for consistent behavior, starting with prompting and
+   RAG first since they're cheaper and faster to iterate on."
+
+Q: "How would you keep a RAG knowledge base's vector index up to date as
+   source documents change, at data-engineering scale?"
+A: "I'd treat it as an incremental pipeline, not a full-reprocessing job —
+   detect changed or new documents via content hashing or native CDC from
+   the source system, re-chunk and re-embed only those, and upsert or
+   delete the corresponding vectors in the index rather than rebuilding
+   the whole thing. On Databricks specifically, Vector Search can stay
+   automatically synced with a source Delta table using the same
+   CDC-based mechanics used for any other incremental Delta pipeline,
+   which is exactly the framing I'd use — this is a medallion-style
+   incremental ETL pipeline where the gold layer happens to be a vector
+   index."
+
+Q: "What are the specific operational risks of giving an LLM agent tool
+   access to production data, and how do you mitigate them?"
+A: "The agent's generated tool calls are effectively untrusted input, the
+   same way user input is — so I'd validate/sanitize arguments before
+   execution, enforce hard limits (row limits, timeouts, a max-iteration
+   guard against runaway loops), and critically, run the agent's queries
+   under the requesting user's own permissions rather than a broad
+   service account, so governance is inherited from the existing catalog
+   RBAC instead of creating a separate, more permissive access path. I'd
+   also log the full sequence of tool calls and intermediate reasoning
+   steps, not just the final output, for audit and debugging."
+
+================================================================================
+19. QUICK-REFERENCE CHEAT SHEET
+================================================================================
+
+RAG CORE PIPELINE
+  Document -> chunk -> embed -> index (vector DB) -> [query time] embed
+  query -> retrieve top-K -> (optional: rerank) -> construct prompt ->
+  LLM generates grounded response
+
+NAIVE RAG FAILURE -> FIX
+  Irrelevant retrieval           -> hybrid search + reranking
+  Context split across chunks     -> structure-aware chunking + overlap +
+                                      parent-document retrieval
+  Query/document phrasing mismatch -> query transformation (HyDE, rewrite)
+  Too many/noisy chunks            -> reduce top-K + add reranking
+  Stale index                      -> incremental CDC-style re-embed
+                                      pipeline (a DE problem, not a model
+                                      problem)
+
+FINE-TUNE vs. RAG vs. PROMPT
+  New facts / changing knowledge -> RAG
+  Behavior / format / style change -> Fine-tuning (LoRA/PEFT for cost)
+  Quick task steering, no persistent knowledge need -> Prompting/few-shot
+  (In practice: combine all three, cheapest-first)
+
+VECTOR INDEX ALGORITHM DEFAULT
+  HNSW — strong default query speed/recall tradeoff; IVF/PQ for
+  memory-constrained, very large-scale cases
+
+EVALUATION SPLIT
+  Retrieval quality -> Precision@K / Recall@K / MRR against labeled
+    query-to-document eval set
+  Generation quality -> LLM-as-judge (validated periodically against
+    human review) + groundedness/faithfulness checks
+  Never rely on BLEU/ROUGE alone for open-ended generation quality
+
+AGENT RELIABILITY CHECKLIST
+  [ ] Max-iteration guard against runaway loops
+  [ ] Tool inputs validated/sanitized as untrusted input
+  [ ] Cost/token budget enforced, not just per-call
+  [ ] Full tool-call + reasoning trace logged for audit/debugging
+  [ ] Executes under requesting user's own permissions, not a broad
+      service account
+
+COST/LATENCY LEVERS
+  Semantic caching, response streaming, model routing (cheap model for
+  simple sub-tasks), minimizing retrieved context to only what's
+  necessary (also improves quality — aligned incentive)
+
+DATA ENGINEERING FRAMING TO REUSE IN EVERY ANSWER
+  "The embedding/RAG pipeline is a medallion architecture where gold is a
+  vector index." "Keeping the index fresh is a CDC pipeline problem."
+  "Tool/agent governance should inherit the existing catalog RBAC, not a
+  parallel system." "Prompts and eval sets are versioned artifacts tested
+  in CI, same as dbt tests or data quality expectations."
+
+================================================================================
+END OF HANDBOOK
+================================================================================
