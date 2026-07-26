@@ -1,0 +1,680 @@
+================================================================================
+CLOUD FUNDAMENTALS — AZURE FOR DATA ENGINEERS — COMPLETE HANDBOOK (2026)
+MAANG / Top-Tier Tech Interview Preparation
+================================================================================
+Companion to: Databricks_COMPLETE_HANDBOOK_2026, Snowflake_COMPLETE_HANDBOOK_2026,
+System_Design_for_Data_Engineers_COMPLETE_HANDBOOK_2026,
+Data_Modeling_COMPLETE_HANDBOOK_2026, Streaming_and_Kafka_COMPLETE_HANDBOOK_2026
+
+This handbook is standalone. No external references required. Scope is
+deliberately Azure-first since Databricks on Azure and Azure-native data
+services are the most likely cloud context given your background — but the
+concepts (identity, networking, storage tiers, managed vs. self-managed
+compute) transfer directly if you're asked about AWS/GCP equivalents in an
+interview, which this handbook also cross-references throughout.
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+ 1. Why Cloud Fundamentals Show Up in DE Interviews
+ 2. Azure Global Infrastructure: Regions, AZs, Resource Groups
+ 3. Identity & Access: Entra ID, RBAC, Managed Identities, Service Principals
+ 4. Azure Storage Deep Dive: ADLS Gen2, Blob, Tiers, Redundancy
+ 5. Networking Fundamentals for Data Platforms
+ 6. Compute Options for Data Engineering Workloads
+ 7. Azure Data Platform Services Landscape
+ 8. Databricks on Azure — Architecture Specifics
+ 9. Security & Governance Patterns
+10. Cost Management for Data Platforms
+11. Azure vs. AWS vs. GCP — Equivalence Table
+12. Common Design Problems (worked examples)
+13. Interview Question Bank with Model Answers
+14. Quick-Reference Cheat Sheet
+
+================================================================================
+1. WHY CLOUD FUNDAMENTALS SHOW UP IN DE INTERVIEWS
+================================================================================
+
+Even a purely "Databricks/Spark" interview loop routinely drifts into
+questions like "how would you secure access to this data," "what happens if
+this region goes down," or "how do you connect Databricks to your storage
+without hardcoding credentials" — because production data platforms don't
+exist independent of the cloud they run on. Interviewers use these questions
+to check whether a candidate has actually operated a platform in production,
+versus only having run notebooks against pre-configured infrastructure. This
+handbook covers the Azure concepts that intersect most directly with data
+engineering: storage, identity, networking, and how Databricks specifically
+sits on top of Azure's primitives.
+
+================================================================================
+2. AZURE GLOBAL INFRASTRUCTURE: REGIONS, AZS, RESOURCE GROUPS
+================================================================================
+
+REGION
+  A geographic area containing one or more datacenters (e.g., East US,
+  West Europe, Central India). Data residency/compliance requirements
+  (GDPR, data sovereignty laws) often dictate which region a workload must
+  run in — a very real, very common constraint in enterprise data
+  platforms, worth naming explicitly when asked about compliance.
+
+AVAILABILITY ZONE (AZ)
+  Physically separate datacenters within a region, each with independent
+  power/cooling/networking — deploying across multiple AZs protects
+  against a single datacenter failure without the latency cost of
+  cross-region replication. Not all Azure regions have availability zones;
+  this is a real constraint to check when designing for high availability.
+
+REGION PAIRS
+  Azure pairs regions (e.g., East US paired with West US) for disaster
+  recovery — paired regions get sequenced platform updates (never both
+  updated simultaneously) and are the basis for geo-redundant storage
+  replication (Section 4).
+
+RESOURCE GROUP
+  A logical container grouping related Azure resources (storage accounts,
+  Databricks workspaces, key vaults) for unified lifecycle management,
+  access control, and billing/cost tracking — deleting a resource group
+  deletes everything in it, which is both a convenience (easy environment
+  teardown) and a real operational risk worth mentioning when discussing
+  environment management (dev/staging/prod are typically separate resource
+  groups, sometimes separate subscriptions entirely, specifically to
+  prevent this kind of blast radius).
+
+SUBSCRIPTION
+  The billing and access-control boundary above resource groups — an
+  organization typically has multiple subscriptions (e.g., one per
+  environment or business unit) under a single Azure tenant (Entra ID
+  organization), giving hard isolation between environments beyond what a
+  resource group alone provides.
+
+MANAGEMENT GROUPS / LANDING ZONES
+  For large enterprises, subscriptions are further organized under
+  management groups implementing "landing zone" patterns — standardized,
+  governed subscription templates (networking, security baseline, policy)
+  that new workloads deploy into, rather than every team hand-rolling
+  infrastructure from scratch. Worth naming if asked about how a large
+  organization governs many teams' cloud usage consistently.
+
+================================================================================
+3. IDENTITY & ACCESS: ENTRA ID, RBAC, MANAGED IDENTITIES, SERVICE PRINCIPALS
+================================================================================
+
+MICROSOFT ENTRA ID (formerly Azure Active Directory)
+  Azure's identity provider — every user, group, and application identity
+  in Azure is backed by Entra ID. Understanding this is the foundation for
+  every access-control question in an Azure-based interview.
+
+RBAC (ROLE-BASED ACCESS CONTROL)
+  Azure's primary authorization model: role assignments bind a
+  security principal (user, group, service principal, managed identity) to
+  a role definition (a set of permissions, e.g., "Storage Blob Data
+  Reader") at a scope (management group, subscription, resource group, or
+  individual resource). Permissions are ADDITIVE across assignments (no
+  explicit deny by default, though Azure Policy and deny assignments exist
+  for stricter control) — a key precise detail: "a user's effective
+  permission at a resource is the union of every role assigned to them or
+  their groups at that resource or any parent scope."
+
+SERVICE PRINCIPAL
+  An application identity — the "user account" an application/pipeline
+  uses to authenticate to Azure resources, secured via a client secret or
+  certificate. The traditional mechanism for a Databricks job or an
+  external application to authenticate to Azure, but requires managing
+  and rotating a secret, which is itself a security liability.
+
+MANAGED IDENTITY (the preferred modern pattern — know this precisely)
+  An Azure-managed identity automatically assigned to a resource (a
+  Databricks workspace, a VM, an Azure Function) that can authenticate to
+  other Azure services WITHOUT any stored credential at all — Azure
+  handles the underlying token issuance and rotation transparently.
+    System-assigned: tied 1:1 to the resource's lifecycle, deleted when
+      the resource is deleted.
+    User-assigned: created independently, can be attached to multiple
+      resources, persists independently of any one resource's lifecycle.
+  Interview framing: "I'd always prefer a managed identity over a service
+  principal with a stored secret wherever possible — it eliminates an
+  entire category of credential-leak risk since there's no secret to
+  accidentally commit to a repo or leave in a config file. Databricks on
+  Azure specifically supports Unity Catalog access to ADLS Gen2 via
+  managed identity-backed storage credentials, which is the standard 2026
+  recommended pattern over legacy service-principal-based mount points."
+
+CONDITIONAL ACCESS & PRIVILEGED IDENTITY MANAGEMENT (PIM)
+  Conditional Access enforces policy-based authentication requirements
+  (e.g., MFA required, only from managed devices). PIM provides
+  just-in-time, time-bound elevation to privileged roles rather than
+  standing privileged access — worth naming as governance best practice
+  for anyone with admin-level access to production data infrastructure.
+
+================================================================================
+4. AZURE STORAGE DEEP DIVE: ADLS GEN2, BLOB, TIERS, REDUNDANCY
+================================================================================
+
+AZURE DATA LAKE STORAGE (ADLS) GEN2
+  Built on top of Azure Blob Storage, adding a hierarchical namespace
+  (true directory/folder structure with atomic rename/move operations,
+  unlike flat blob storage's simulated "folders" via key prefixes) plus
+  POSIX-style ACLs at the file/directory level — this is THE default
+  storage layer for a lakehouse on Azure (Delta Lake/Databricks, Synapse)
+  specifically because Spark-style workloads benefit heavily from
+  efficient directory listing and atomic rename semantics that flat blob
+  storage doesn't provide natively.
+
+STORAGE ACCOUNT
+  The top-level container for blob/ADLS storage — a storage account can
+  hold multiple containers (roughly analogous to S3 buckets), each holding
+  the actual blobs/files. Hierarchical namespace is enabled per storage
+  account (this is the specific setting that turns "Blob Storage" into
+  "ADLS Gen2").
+
+ACCESS TIERS (cost optimization lever — directly relevant to the System
+Design handbook's tiered-storage cost discussion)
+  Hot: frequent access, highest storage cost, lowest access/read cost —
+    default for actively-queried bronze/silver/gold data.
+  Cool: infrequent access (accessed less than monthly), lower storage
+    cost, higher per-access cost, minimum 30-day retention expectation —
+    good for older partitions still occasionally queried.
+  Cold: even less frequent access, lower storage cost than Cool, higher
+    access cost, minimum 90-day retention expectation.
+  Archive: rarely/never accessed, lowest storage cost by far, but data
+    must be REHYDRATED (an asynchronous operation taking hours) before it
+    can be read — appropriate for long-term compliance/audit retention of
+    old bronze data that's essentially never queried but must be kept.
+  LIFECYCLE MANAGEMENT POLICIES automate tier transitions based on
+  last-modified/last-accessed age (e.g., "move to Cool after 30 days, Cold
+  after 90, Archive after 365") — this is the concrete Azure mechanism
+  behind the "tiered storage lifecycle policy" cost optimization mentioned
+  throughout the System Design handbook.
+
+REDUNDANCY OPTIONS (durability/availability tradeoff)
+  LRS (Locally Redundant Storage): 3 copies within a single datacenter —
+    cheapest, protects against hardware failure only, not datacenter loss.
+  ZRS (Zone-Redundant Storage): copies across multiple AZs within a
+    region — protects against a full datacenter/AZ outage, requires the
+    region to support AZs.
+  GRS (Geo-Redundant Storage): LRS in the primary region PLUS
+    asynchronously replicated copies in the paired secondary region —
+    protects against full regional outage, secondary copy not directly
+    readable unless a failover is initiated (or RA-GRS is used).
+  RA-GRS (Read-Access GRS): GRS plus the ability to READ from the
+    secondary region directly, without failover — used when you need
+    read availability during a primary-region outage without waiting for
+    failover to complete.
+  Interview framing: "The choice is a direct availability/durability vs.
+  cost tradeoff, same shape as Kafka's replication factor decision — LRS
+  for non-critical/easily-reproducible data, ZRS as a strong default for
+  production data needing protection against a single-datacenter failure,
+  GRS/RA-GRS when full regional disaster recovery is a hard requirement,
+  typically for the most critical gold-layer/compliance data rather than
+  every bronze table."
+
+BLOB TYPES
+  Block blobs (the standard type for data files — Parquet/Delta files are
+  stored as block blobs), append blobs (optimized for append-only
+  workloads like logs), page blobs (used for VM disks, not relevant to
+  DE workloads directly).
+
+================================================================================
+5. NETWORKING FUNDAMENTALS FOR DATA PLATFORMS
+================================================================================
+
+VIRTUAL NETWORK (VNet)
+  Azure's isolated private network construct — resources deployed into a
+  VNet can communicate privately; a Databricks workspace deployed with
+  VNet injection (rather than the default Microsoft-managed network) gives
+  the organization control over the network the Databricks control/data
+  plane compute runs in, which is required for many enterprise security
+  postures.
+
+PRIVATE ENDPOINT / PRIVATE LINK
+  Allows a service (a storage account, a Databricks workspace) to be
+  reached via a private IP address within your VNet, instead of over the
+  public internet — eliminates public internet exposure for
+  storage-to-compute traffic entirely, a very common enterprise security
+  requirement and a frequent interview topic ("how would you ensure your
+  data never traverses the public internet between Databricks and ADLS" ->
+  Private Endpoints + VNet injection).
+
+NETWORK SECURITY GROUP (NSG)
+  Stateful firewall rules (allow/deny by source/destination IP, port,
+  protocol) applied at the subnet or NIC level — the basic network-layer
+  access control mechanism, analogous to AWS security groups.
+
+FIREWALL RULES ON STORAGE ACCOUNTS
+  Independent of NSGs, a storage account itself can be configured to only
+  accept traffic from specific VNets/subnets or IP ranges (or to deny all
+  public network access entirely, requiring Private Endpoint access) —
+  worth distinguishing this storage-account-level firewall from VNet-level
+  NSGs as two separate, complementary layers of network control.
+
+DNS CONSIDERATIONS
+  Private Endpoints require Private DNS Zones so that the service's
+  standard hostname (e.g., mystorageaccount.blob.core.windows.net)
+  resolves to the private IP within the VNet rather than the public IP —
+  a genuinely common real-world gotcha ("Private Endpoint is configured
+  but connections still go over the public internet" -> almost always a
+  DNS resolution misconfiguration) worth mentioning if asked about
+  troubleshooting private connectivity.
+
+================================================================================
+6. COMPUTE OPTIONS FOR DATA ENGINEERING WORKLOADS
+================================================================================
+
+AZURE DATABRICKS
+  Managed Spark platform (Section 8 covers Azure-specific architecture in
+  depth) — the primary compute engine assumed throughout your other
+  handbooks.
+
+AZURE SYNAPSE ANALYTICS
+  Microsoft's integrated analytics service combining SQL-based data
+  warehousing (dedicated SQL pools and serverless SQL pools), Spark pools,
+  and pipeline orchestration in one workspace — positioned as a
+  Microsoft-native alternative/complement to a Databricks-centric
+  architecture; worth knowing conceptually since it may come up in an
+  Azure-shop interview as "how does this compare to Databricks."
+    Serverless SQL pool: pay-per-query, good for ad hoc querying directly
+      over files in ADLS without provisioning dedicated compute.
+    Dedicated SQL pool: provisioned, MPP (massively parallel processing)
+      data warehouse compute, billed for uptime regardless of query
+      volume — more like a traditional warehouse commitment.
+
+AZURE DATA FACTORY (ADF)
+  Cloud-native data integration/orchestration service — visual
+  pipeline authoring for ETL/ELT, hundreds of built-in connectors, native
+  integration with Databricks (triggering notebook/job runs as a pipeline
+  activity) — the traditional Azure-native answer to "how do you
+  orchestrate ingestion and transformation across many source systems,"
+  though increasingly Databricks Lakeflow Jobs/Workflows covers similar
+  ground natively within the lakehouse itself for Databricks-centric
+  shops.
+
+AZURE FUNCTIONS
+  Serverless, event-driven compute (e.g., triggered by a new blob landing
+  in storage, or an HTTP call) — used for lightweight
+  transformation/orchestration glue rather than heavy data processing;
+  a common pattern is an Azure Function triggering a Databricks job run
+  when a new file lands, rather than running the actual transformation
+  logic in the Function itself.
+
+AZURE KUBERNETES SERVICE (AKS)
+  Managed Kubernetes — relevant for DE when running custom containerized
+  processing (e.g., a Flink cluster, custom microservices for a streaming
+  pipeline) rather than using managed Spark/Databricks directly; worth
+  naming if a design calls for something Databricks doesn't natively
+  cover (e.g., self-managed Flink for the lowest-latency CEP workloads
+  discussed in the Streaming & Kafka handbook).
+
+VIRTUAL MACHINES / VM SCALE SETS
+  The underlying raw compute that Databricks clusters, Synapse Spark
+  pools, and AKS nodes all ultimately run on — worth knowing that
+  Databricks cluster "node types" map directly to Azure VM SKUs, and that
+  choosing memory-optimized vs. compute-optimized VM families is a real,
+  concrete cost/performance tuning lever for Spark cluster sizing.
+
+SPOT VMs
+  Discounted, interruptible VM capacity (Azure can reclaim it with short
+  notice when it needs the capacity back) — commonly used for Databricks
+  worker nodes (not driver nodes, which need to stay stable) to
+  significantly cut compute cost for fault-tolerant, retriable batch
+  workloads, directly tying back to the System Design handbook's cost
+  optimization guidance ("spot/serverless compute" for spiky/interruption-
+  tolerant workloads).
+
+================================================================================
+7. AZURE DATA PLATFORM SERVICES LANDSCAPE
+================================================================================
+
+INGESTION
+  Azure Event Hubs: Kafka-protocol-compatible managed event streaming
+    service (supports the Kafka protocol directly, meaning many Kafka
+    clients/connectors work against it with minimal changes) — the
+    Azure-native equivalent to AWS Kinesis, and the typical streaming
+    ingestion entry point feeding into Structured Streaming or Databricks
+    Lakeflow Connect on Azure.
+  Azure Data Factory / Databricks Lakeflow Connect: batch/CDC ingestion
+    from SaaS and database sources.
+  IoT Hub: specialized for high-volume device telemetry ingestion,
+    relevant if a design scenario involves IoT/sensor data specifically.
+
+STORAGE
+  ADLS Gen2 (Section 4) — the lakehouse foundation.
+  Azure SQL Database / Azure Database for PostgreSQL/MySQL: managed OLTP
+    sources, common as the "source system" a CDC pipeline reads from.
+  Cosmos DB: globally distributed, multi-model NoSQL database — relevant
+    as a low-latency online feature store / serving layer target (System
+    Design handbook's recommendation system and fraud detection problems)
+    given its single-digit-millisecond read/write SLAs and tunable
+    consistency levels.
+
+PROCESSING
+  Azure Databricks (primary), Synapse Spark pools, ADF Mapping Data Flows
+  (a lower-code, visual Spark-based transformation option within ADF).
+
+GOVERNANCE
+  Microsoft Purview: enterprise-wide data catalog, lineage, and
+  classification service spanning across Azure AND non-Azure/multi-cloud
+  sources — complements (and for enterprise-wide governance often sits
+  above) Unity Catalog, which governs specifically within the Databricks
+  lakehouse; worth distinguishing the two scopes if asked ("Purview for
+  enterprise-wide, cross-platform catalog and classification; Unity
+  Catalog for fine-grained governance and lineage within the Databricks
+  lakehouse itself — the two increasingly integrate rather than compete").
+
+KEY MANAGEMENT / SECRETS
+  Azure Key Vault: centralized secrets/key/certificate management —
+  Databricks integrates with Key Vault-backed secret scopes so
+  credentials never need to be hardcoded in notebooks/jobs, the standard
+  answer to "how do you avoid putting a connection string in your
+  notebook code."
+
+================================================================================
+8. DATABRICKS ON AZURE — ARCHITECTURE SPECIFICS
+================================================================================
+
+CONTROL PLANE vs. DATA PLANE
+  Control plane: managed by Databricks (in a Databricks-owned Azure
+  subscription) — hosts the web UI, job scheduler, notebook management,
+  cluster manager orchestration logic.
+  Data plane: runs in YOUR Azure subscription/VNet (classic deployment)
+    — the actual Spark clusters (VMs) and your data (ADLS Gen2) live here,
+    meaning your data never leaves your own Azure tenant's boundary except
+    for the control-plane metadata/commands needed to manage clusters —
+    a genuinely important, precise security detail worth stating exactly
+    this way if asked "does Databricks ever see my actual data" (control
+    plane orchestrates; data plane, in your subscription, is where data
+    actually lives and gets processed).
+  Serverless compute (2026 default direction for many workloads):
+    Databricks-managed compute running in a Databricks-managed, securely
+    isolated environment rather than your own VNet directly — trades some
+    of the "data plane in my subscription" control for zero infrastructure
+    management and faster cluster startup; worth knowing this represents a
+    deliberate architecture shift and mentioning the tradeoff if it comes
+    up (classic compute for maximum network/infrastructure control,
+    serverless for operational simplicity and speed).
+
+VNET INJECTION
+  Deploying the Databricks workspace's data plane into a customer-managed
+  VNet (rather than the default Databricks-managed VNet) — required to
+  apply custom NSGs, Private Endpoints, and enterprise network security
+  policy directly to the Spark cluster VMs themselves; this is the
+  prerequisite for the Private Endpoint-based ADLS access pattern
+  mentioned in Section 5.
+
+UNITY CATALOG STORAGE ACCESS ON AZURE
+  Unity Catalog external locations reference ADLS Gen2 paths, secured via
+  storage credentials — the 2026 recommended pattern uses an Azure managed
+  identity (access connector resource) rather than a service principal
+  with a stored secret (Section 3), meaning Unity Catalog itself
+  authenticates to ADLS Gen2 without any credential material stored
+  in Databricks configuration at all.
+
+CLUSTER NODE TYPES
+  Databricks cluster "node types" (e.g., Standard_DS3_v2) map directly to
+  Azure VM SKUs — memory-optimized families for large shuffle/cache-heavy
+  workloads, compute-optimized for CPU-bound transformation-heavy jobs,
+  and Azure's Spot VM pricing applies directly to Databricks worker pools
+  configured for spot instances (Section 6).
+
+DBFS vs. DIRECT ADLS ACCESS
+  DBFS (Databricks File System) is a legacy abstraction layer over cloud
+  storage; the 2026 recommended pattern is direct, Unity-Catalog-governed
+  access to ADLS Gen2 paths (via external locations/volumes) rather than
+  DBFS mounts, both for cleaner governance (every access goes through
+  Unity Catalog's permission model) and to avoid DBFS's historical
+  credential-passthrough security limitations.
+
+================================================================================
+9. SECURITY & GOVERNANCE PATTERNS
+================================================================================
+
+DEFENSE IN DEPTH FOR A LAKEHOUSE ON AZURE (the layered answer an
+interviewer wants for "how do you secure this platform end to end")
+  1. Identity: Entra ID + managed identities for all service-to-service
+     auth, no stored secrets where avoidable.
+  2. Network: VNet injection + Private Endpoints, storage account
+     firewall denying public network access.
+  3. Data access: Unity Catalog RBAC (table/column/row-level security) as
+     the single governed access layer, rather than relying on storage-
+     level ACLs alone for fine-grained access control.
+  4. Encryption: at-rest (Azure Storage Service Encryption, on by
+     default) and in-transit (TLS) — worth naming as baseline, not
+     differentiating, since it's essentially always on by default on
+     Azure; the differentiating security decisions are identity and
+     network, not encryption toggles.
+  5. Secrets: Key Vault-backed secret scopes, never hardcoded credentials.
+  6. Audit: Unity Catalog access logs + Azure Monitor/Purview for
+     cross-platform audit trail.
+
+PII / SENSITIVE DATA HANDLING
+  Column-level masking/row-level security in Unity Catalog for PII
+  columns (e.g., dynamic views or Unity Catalog's native row filters/
+  column masks) rather than physically separate tables per access level —
+  lets one physical table serve multiple audiences with different visible
+  columns based on the querying identity's group membership, a strong,
+  concrete answer to "how do you let analysts query a customer table
+  without exposing SSNs to everyone."
+
+================================================================================
+10. COST MANAGEMENT FOR DATA PLATFORMS
+================================================================================
+
+COMPUTE COST LEVERS
+  - Cluster autoscaling (min/max workers) rather than fixed-size clusters
+    running idle.
+  - Auto-termination on interactive clusters (shut down after N minutes
+    idle) — one of the single biggest, easiest cost wins in a Databricks-
+    on-Azure environment, and a very common "what would you check first"
+    interview answer for an unexpectedly high Databricks bill.
+  - Spot VMs for fault-tolerant worker nodes (Section 6).
+  - Serverless SQL/Jobs compute for spiky, unpredictable workloads instead
+    of always-on provisioned clusters.
+  - Job clusters (ephemeral, spun up per job run and torn down after)
+    instead of running production jobs against a shared, always-on
+    interactive cluster.
+
+STORAGE COST LEVERS
+  - Lifecycle management policies moving cold bronze data through
+    Cool/Cold/Archive tiers (Section 4).
+  - Delta OPTIMIZE + VACUUM to control the volume of small/orphaned files
+    accumulating storage cost (Spark Internals handbook, Section 15).
+  - Choosing ZRS over GRS for non-critical data where full regional DR
+    isn't actually required, rather than defaulting to the most redundant
+    (and most expensive) option everywhere.
+
+VISIBILITY & GOVERNANCE
+  - Azure Cost Management + Budgets for alerting on spend anomalies.
+  - Tagging resources (by team, environment, cost center) for chargeback/
+    showback accountability — a real, common enterprise practice worth
+    naming when asked "how do you make sure teams are accountable for
+    their cloud spend" in a platform-team-oriented interview.
+  - Databricks cluster policies restricting node types/max cluster size
+    available to a given team/workspace, preventing accidental
+    runaway-cost cluster configurations at the source rather than
+    catching them after the fact in a bill.
+
+================================================================================
+11. AZURE vs. AWS vs. GCP — EQUIVALENCE TABLE
+================================================================================
+
+Useful for interviews that ask about a specific cloud you haven't used
+directly — map the concept, not just the product name.
+
+  CONCEPT                  | AZURE            | AWS              | GCP
+  --------------------------------------------------------------------------
+  Object/lake storage      | ADLS Gen2 (Blob) | S3               | GCS
+  Identity provider        | Entra ID         | IAM              | Cloud IAM
+  Service identity (no     | Managed Identity | IAM Role (for    | Service
+   stored credential)      |                  |  EC2/Lambda)     |  Account +
+                           |                  |                  |  Workload
+                           |                  |                  |  Identity
+  Kafka-compatible stream  | Event Hubs       | Kinesis (Kinesis | Pub/Sub +
+                           |                  |  is not Kafka-   |  Dataflow
+                           |                  |  protocol-       |  (not Kafka
+                           |                  |  compatible;     |  protocol-
+                           |                  |  MSK = managed   |  compatible;
+                           |                  |  Kafka directly) |  Confluent
+                           |                  |                  |  on GCP for
+                           |                  |                  |  managed
+                           |                  |                  |  Kafka)
+  Managed warehouse        | Synapse (dedicated| Redshift        | BigQuery
+                           |  SQL pool)       |                  |
+  Managed ETL/orchestration| Data Factory     | Glue / Step      | Dataflow /
+                           |                  |  Functions       |  Cloud
+                           |                  |                  |  Composer
+  Secrets management       | Key Vault        | Secrets Manager /| Secret
+                           |                  |  Parameter Store |  Manager
+  Serverless functions     | Azure Functions  | Lambda           | Cloud
+                           |                  |                  |  Functions
+  Managed Kubernetes       | AKS              | EKS              | GKE
+  Low-latency NoSQL/KV     | Cosmos DB        | DynamoDB         | Firestore /
+                           |                  |                  |  Bigtable
+  Network isolation        | VNet + Private   | VPC + PrivateLink| VPC +
+                           |  Endpoint        |  / VPC Endpoint  |  Private
+                           |                  |                  |  Service
+                           |                  |                  |  Connect
+  Enterprise data catalog  | Purview          | Glue Data Catalog| Dataplex /
+                           |                  |  (+ DataZone)    |  Data
+                           |                  |                  |  Catalog
+
+INTERVIEW FRAMING FOR CROSS-CLOUD QUESTIONS
+  "I've worked primarily on Azure/Databricks, but the underlying patterns
+  transfer directly — identity-based access instead of stored credentials,
+  hierarchical/columnar object storage as the lakehouse foundation,
+  private networking between compute and storage, and tiered storage
+  lifecycle policies for cost. On AWS I'd reach for S3 + IAM roles +
+  PrivateLink in place of ADLS Gen2 + Managed Identity + Private Endpoint
+  — same architecture, different product names."
+
+================================================================================
+12. COMMON DESIGN PROBLEMS (WORKED EXAMPLES)
+================================================================================
+
+--------------------------------------------------------------------------------
+PROBLEM A: Secure a Databricks-on-Azure lakehouse so data never traverses
+the public internet, with no stored credentials anywhere in pipeline code
+--------------------------------------------------------------------------------
+  - Deploy Databricks workspace with VNet injection into a customer-
+    managed VNet.
+  - Configure ADLS Gen2 storage account with public network access
+    disabled, accessible only via a Private Endpoint into that same VNet
+    (with matching Private DNS Zone so the standard storage hostname
+    resolves privately).
+  - Unity Catalog access connector using a system- or user-assigned
+    managed identity granted RBAC (Storage Blob Data Contributor or a
+    narrower custom role) on the storage account — zero stored secrets.
+  - Any external service credentials (e.g., a source database connection
+    string for CDC ingestion) stored in Azure Key Vault, referenced via a
+    Databricks Key Vault-backed secret scope, never hardcoded.
+  - NSGs on the VNet's subnets restricting traffic to only what's needed
+    between Databricks cluster VMs and required Azure service endpoints.
+
+--------------------------------------------------------------------------------
+PROBLEM B: Design a cost-optimized storage lifecycle for a 5-year-retention
+bronze layer that's queried heavily in its first 30 days, occasionally for
+90 days, and essentially never after that but must be retained for compliance
+--------------------------------------------------------------------------------
+  - Land in Hot tier (frequent queries expected in the first 30 days).
+  - Lifecycle management policy: move to Cool tier after 30 days
+    (occasional access, still directly readable without rehydration).
+  - Move to Archive tier after 90 days (compliance-only retention, never
+    genuinely queried, lowest cost; accept the hours-long rehydration
+    delay as acceptable given it's essentially never actually needed).
+  - Auto-delete after 5 years (compliance retention period expires) via
+    the same lifecycle policy's expiration rule.
+  - Explicitly note the tradeoff: if there's a real (even if rare)
+    possibility of needing rapid access to data older than 90 days
+    (e.g., an audit request with a tight turnaround), use Cold tier
+    instead of Archive for the 90-day-to-5-year range, trading some
+    storage cost for avoiding the rehydration delay — state this as a
+    business-requirements-dependent choice, not a fixed answer.
+
+================================================================================
+13. INTERVIEW QUESTION BANK WITH MODEL ANSWERS
+================================================================================
+
+Q: "How would you give a Databricks pipeline access to ADLS Gen2 without
+   storing any credentials?"
+A: "Use a managed identity — specifically, in Unity Catalog, create an
+   access connector resource backed by a managed identity, grant it the
+   appropriate RBAC role on the storage account, and register it as a
+   Unity Catalog storage credential. Azure handles token issuance and
+   rotation transparently, so there's no secret to store, rotate, or
+   accidentally leak in code or configuration."
+
+Q: "What's the difference between the Databricks control plane and data
+   plane, and why does that distinction matter for security?"
+A: "The control plane — the UI, job scheduler, cluster orchestration
+   logic — is managed by Databricks in their own Azure environment. The
+   data plane — the actual Spark cluster VMs and your storage — runs in
+   your own Azure subscription and VNet. That means your actual data is
+   processed and stored within your own tenant boundary; Databricks
+   orchestrates it but the data itself doesn't leave your environment.
+   That's the basis for a lot of enterprise security sign-off
+   conversations."
+
+Q: "How would you design storage redundancy for a lakehouse's gold layer
+   versus its bronze layer?"
+A: "I'd differentiate by criticality and reproducibility. Bronze is raw
+   and, worst case, could often be re-ingested from the source if truly
+   lost — LRS or ZRS is usually sufficient. Gold layers feeding
+   business-critical reporting, especially anything with regulatory
+   retention requirements, justify GRS or RA-GRS for full regional
+   disaster recovery, since reconstructing gold from scratch after a
+   regional outage could take much longer and cost much more than the
+   marginal storage cost of geo-redundancy."
+
+Q: "A Databricks job's Azure bill spiked 5x this month with no change in
+   data volume. How do you investigate?"
+A: "First check for idle interactive clusters without auto-termination
+   configured — that's the single most common runaway-cost cause.
+   Second, check if job clusters are being reused/kept warm unnecessarily
+   versus properly ephemeral. Third, check for a node-type change (someone
+   sized up to a much larger/more expensive VM SKU) or a shift away from
+   spot instances. Fourth, check Delta table small-file counts — a
+   pipeline change that stopped OPTIMIZE from running, or increased write
+   frequency, can dramatically inflate both compute and storage cost
+   without any change in logical data volume."
+
+================================================================================
+14. QUICK-REFERENCE CHEAT SHEET
+================================================================================
+
+IDENTITY, PREFERRED ORDER
+  Managed Identity (no stored secret) > Service Principal + Key Vault
+  secret > hardcoded credential (never acceptable)
+
+STORAGE TIERS, COST vs. ACCESS SPEED (highest storage cost -> lowest)
+  Hot > Cool > Cold > Archive (Archive needs rehydration before read)
+
+REDUNDANCY, COST vs. PROTECTION (cheapest -> most protected)
+  LRS (datacenter HW failure) < ZRS (AZ/datacenter outage) < GRS (regional
+  outage, secondary not directly readable) < RA-GRS (regional outage,
+  secondary directly readable)
+
+NETWORK ISOLATION STACK
+  VNet injection (Databricks data plane in your VNet) + Private Endpoint
+  (private IP to storage) + Private DNS Zone (correct hostname resolution)
+  + storage account firewall (deny public access) + NSGs (subnet-level
+  rules)
+
+COMPUTE COST, TOP 3 LEVERS
+  1. Auto-termination on interactive clusters
+  2. Spot VMs for fault-tolerant worker nodes
+  3. Ephemeral job clusters instead of shared always-on clusters
+
+AZURE <-> AWS <-> GCP QUICK MAP
+  ADLS Gen2 <-> S3 <-> GCS
+  Entra ID <-> IAM <-> Cloud IAM
+  Managed Identity <-> IAM Role <-> Service Account
+  Event Hubs <-> Kinesis/MSK <-> Pub/Sub
+  Synapse <-> Redshift <-> BigQuery
+  Key Vault <-> Secrets Manager <-> Secret Manager
+  AKS <-> EKS <-> GKE
+
+CONTROL PLANE vs DATA PLANE (Databricks on Azure)
+  Control plane -> Databricks-managed (orchestration, UI, scheduler)
+  Data plane -> your subscription/VNet (actual clusters + your data)
+
+================================================================================
+END OF HANDBOOK
+================================================================================

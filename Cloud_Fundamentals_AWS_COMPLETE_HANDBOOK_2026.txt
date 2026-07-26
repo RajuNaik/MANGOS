@@ -1,0 +1,789 @@
+================================================================================
+CLOUD FUNDAMENTALS — AWS FOR DATA ENGINEERS — COMPLETE HANDBOOK (2026)
+MAANG / Top-Tier Tech Interview Preparation
+================================================================================
+Companion to: Cloud_Fundamentals_Azure_COMPLETE_HANDBOOK_2026,
+Databricks_COMPLETE_HANDBOOK_2026, Snowflake_COMPLETE_HANDBOOK_2026,
+System_Design_for_Data_Engineers_COMPLETE_HANDBOOK_2026,
+Data_Modeling_COMPLETE_HANDBOOK_2026, Streaming_and_Kafka_COMPLETE_HANDBOOK_2026
+
+This handbook is standalone. No external references required. AWS is the most
+commonly assumed default cloud in MAANG interviews specifically — Amazon
+obviously, but also very common as the "assumed stack" at Meta, Netflix, and
+in generic system-design rounds even at companies that don't run on AWS
+internally. Structured to mirror the Azure handbook directly so the two can
+be cross-referenced concept-for-concept.
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+ 1. Why AWS Fundamentals Matter Even Outside Amazon Interviews
+ 2. AWS Global Infrastructure: Regions, AZs, Accounts
+ 3. Identity & Access: IAM, Roles, Policies, STS
+ 4. AWS Storage Deep Dive: S3 Deep Dive, Classes, Replication
+ 5. Networking Fundamentals for Data Platforms
+ 6. Compute Options for Data Engineering Workloads
+ 7. AWS Data Platform Services Landscape
+ 8. Databricks on AWS — Architecture Specifics
+ 9. Security & Governance Patterns
+10. Cost Management for Data Platforms
+11. AWS vs. Azure vs. GCP — Equivalence Table
+12. Common Design Problems (worked examples)
+13. Interview Question Bank with Model Answers
+14. Quick-Reference Cheat Sheet
+
+================================================================================
+1. WHY AWS FUNDAMENTALS MATTER EVEN OUTSIDE AMAZON INTERVIEWS
+================================================================================
+
+AWS's vocabulary (S3, IAM roles, VPC, Lambda) functions as the de facto
+lingua franca for cloud data engineering system design interviews across
+MAANG, even when the interviewer's own company runs on a different cloud —
+interviewers will often just say "assume S3" the way they'd say "assume a
+relational database" in a general system design round. Being fluent in the
+AWS-specific mechanics (especially IAM's precise permission model and S3's
+consistency/durability guarantees) signals the same production-operational
+depth that Azure fluency signals in an Azure-shop interview, and the two
+handbooks are designed to be read together so the underlying concepts
+(identity-based access, tiered storage, private networking) reinforce each
+other rather than needing to be learned twice.
+
+================================================================================
+2. AWS GLOBAL INFRASTRUCTURE: REGIONS, AZS, ACCOUNTS
+================================================================================
+
+REGION
+  A geographic area (e.g., us-east-1, eu-west-1, ap-south-1) containing
+  multiple, physically separate Availability Zones. Data residency/
+  sovereignty requirements dictate region choice the same way they do on
+  Azure — a very common real constraint, not just a theoretical one, for
+  any multinational data platform.
+
+AVAILABILITY ZONE (AZ)
+  One or more discrete datacenters within a region, each with independent
+  power, cooling, and networking, connected to other AZs in the region via
+  low-latency links — unlike Azure, virtually every AWS region has
+  multiple AZs (3 minimum in nearly all regions), making multi-AZ
+  deployment the practical default expectation for production workloads
+  rather than a capability you need to check for.
+
+ACCOUNT (the AWS equivalent of an Azure subscription, but a harder
+boundary)
+  AWS's fundamental billing AND security isolation boundary — resources in
+  different accounts are isolated by default, with cross-account access
+  requiring EXPLICIT resource policies or role assumption (Section 3).
+  This is a meaningfully harder isolation boundary than an Azure resource
+  group, closer to (but still distinct in mechanics from) an Azure
+  subscription. Enterprises typically run a multi-account strategy (one
+  account per environment, or per team/business unit) specifically because
+  account-level isolation is AWS's strongest, most reliable blast-radius
+  boundary.
+
+AWS ORGANIZATIONS & LANDING ZONES
+  AWS Organizations centrally manages multiple accounts under one payer
+  account, with Service Control Policies (SCPs) enforcing guardrails
+  across all member accounts (e.g., "no account may disable CloudTrail
+  logging," "no account may create resources outside approved regions") —
+  AWS Control Tower automates setting up this multi-account "landing zone"
+  pattern, directly analogous to Azure's management groups + landing zone
+  pattern from the Azure handbook. Worth naming as the enterprise-scale
+  governance answer when asked how a large org manages many teams' AWS
+  usage consistently.
+
+================================================================================
+3. IDENTITY & ACCESS: IAM, ROLES, POLICIES, STS
+================================================================================
+
+IAM (IDENTITY AND ACCESS MANAGEMENT)
+  AWS's identity and authorization system — IAM users (long-lived human/
+  application identities with static credentials, increasingly
+  discouraged), IAM groups (collections of users for shared policy
+  attachment), and IAM roles (Section below, the modern default) all live
+  within an AWS account.
+
+IAM POLICIES
+  JSON documents defining permissions — a statement grants (Allow) or
+  denies (Deny) specific actions on specific resources, optionally with
+  conditions. CRITICAL PRECISE DETAIL, a genuinely common interview trap:
+  unlike Azure RBAC's purely additive model, IAM evaluates an EXPLICIT
+  DENY as always overriding any Allow, regardless of how many other
+  policies grant access — "the most restrictive explicit statement always
+  wins" is the correct one-line answer if asked how IAM resolves
+  conflicting policies. Absent any explicit statement, access defaults to
+  denied (implicit deny) — IAM is default-deny, not default-allow.
+
+IAM ROLES (the preferred pattern — always prefer over long-lived IAM user
+credentials)
+  A role is an identity with a set of permissions that can be ASSUMED
+  temporarily by a trusted principal (an EC2 instance, a Lambda function,
+  a user, or even an identity from another AWS account) — assuming a role
+  yields short-lived, automatically-rotating temporary credentials via
+  AWS STS (Security Token Service) rather than a static, long-lived
+  credential. This is the direct AWS equivalent of Azure's managed
+  identity concept, and is worth stating that equivalence explicitly:
+  "an EC2 instance profile or Lambda execution role serves the same
+  purpose as an Azure managed identity — no stored secret, automatically
+  rotated temporary credentials, scoped tightly to what that specific
+  compute resource needs."
+
+INSTANCE PROFILES
+  The mechanism that attaches an IAM role to an EC2 instance so that
+  applications running on it can retrieve temporary credentials from the
+  instance metadata service without any credential ever being stored on
+  disk — the practical implementation detail behind "EC2 uses an IAM
+  role."
+
+RESOURCE-BASED POLICIES vs. IDENTITY-BASED POLICIES
+  Identity-based: attached to a user/role/group, defining what THAT
+  identity can do.
+  Resource-based: attached directly to a resource (e.g., an S3 bucket
+  policy, a Kafka/MSK cluster policy) defining who CAN access THAT
+  resource, including principals from other AWS accounts — this is the
+  mechanism enabling cross-account access without needing the accessing
+  account to assume a role in the resource's account, and a common,
+  concrete interview point: "how do you give another team's AWS account
+  read access to your S3 data lake" -> a bucket policy granting that
+  account's role ARN read permissions, or alternatively that account
+  assuming a role you've defined with a trust policy naming them as a
+  trusted principal — both are valid, complementary patterns worth naming.
+
+STS (SECURITY TOKEN SERVICE) & ASSUME ROLE
+  The service issuing temporary security credentials when a role is
+  assumed — the AssumeRole API call is the concrete mechanism underlying
+  cross-account access, federated identity (e.g., an Entra ID/Okta user
+  federating into AWS), and service-to-service authentication throughout
+  AWS. Understanding "assuming a role calls STS, which returns temporary
+  credentials with an expiration" is the precise mechanical answer beneath
+  the higher-level "use roles, not static keys" advice.
+
+================================================================================
+4. AWS STORAGE DEEP DIVE: S3, CLASSES, REPLICATION
+================================================================================
+
+AMAZON S3 (SIMPLE STORAGE SERVICE)
+  Object storage, the foundational lakehouse storage layer on AWS —
+  functionally the direct equivalent of ADLS Gen2 for lakehouse purposes,
+  though architecturally S3 is fundamentally a FLAT key-value namespace
+  (no true native hierarchical directory structure the way ADLS Gen2 has)
+  — "folders" in S3 are a UI/convention built on key prefixes
+  (e.g., bronze/orders/date=2026-01-01/file.parquet is really just one
+  long object key, not a nested directory tree). This is a real, concrete
+  interview-testable distinction from ADLS Gen2 worth stating precisely:
+  "S3 doesn't have atomic rename or true directories the way ADLS Gen2's
+  hierarchical namespace does — this historically mattered a lot for
+  naive Hadoop/Spark commit protocols relying on rename-based atomicity
+  (the classic 'S3 is eventually consistent for listing' concern), which
+  is exactly the kind of problem Delta Lake's transaction log solves by
+  not depending on atomic file rename at all — Delta tracks the true table
+  state via its own log, sidestepping S3's lack of native directory
+  semantics entirely."
+
+S3 CONSISTENCY MODEL (2026 status — worth stating precisely, this has
+changed over the platform's history)
+  S3 has provided strong read-after-write consistency for all operations
+  (including overwrite PUTs and DELETEs) since a platform-wide consistency
+  upgrade — there is no longer an "eventually consistent" caveat to
+  mention for standard S3 usage, unlike in S3's early years. Correctly
+  knowing that this historical caveat no longer applies (rather than
+  reciting outdated "S3 is eventually consistent" folklore) is itself a
+  small but real interview signal of staying current.
+
+STORAGE CLASSES (the AWS equivalent of Azure access tiers)
+  S3 Standard: frequent access, default class, highest storage cost among
+    the "immediately readable" classes.
+  S3 Intelligent-Tiering: automatically moves objects between access
+    tiers based on observed access patterns, without the operational
+    overhead of manually authoring lifecycle rules — a genuinely strong
+    default answer for "I don't know my exact access pattern in advance"
+    scenarios, at a small monitoring/automation fee.
+  S3 Standard-IA (Infrequent Access): lower storage cost than Standard,
+    higher per-GB retrieval cost, minimum 30-day storage duration
+    expectation — direct analogue to Azure's Cool tier.
+  S3 One Zone-IA: like Standard-IA but stored in only ONE AZ rather than
+    replicated across multiple — cheaper, but with a real availability
+    tradeoff (loss of that single AZ means data loss, not just
+    unavailability) worth stating explicitly as the durability tradeoff
+    for choosing this class, appropriate only for easily-reproducible
+    data.
+  S3 Glacier Instant Retrieval: archive-tier pricing with millisecond
+    retrieval (unlike traditional archive tiers) — a 2026-relevant, often
+    underappreciated option for "rarely accessed but occasionally needs
+    fast access" data, worth naming as distinct from the slower Glacier
+    tiers below.
+  S3 Glacier Flexible Retrieval: lower cost than Instant Retrieval,
+    retrieval takes minutes to hours depending on retrieval speed tier
+    chosen — direct analogue to Azure's Archive tier's rehydration delay.
+  S3 Glacier Deep Archive: lowest-cost storage class of all, retrieval
+    takes up to 12+ hours — for long-term compliance/audit retention that
+    is essentially never actually read, the AWS deepest-cold-storage
+    equivalent.
+  LIFECYCLE POLICIES automate class transitions by object age, exactly
+  mirroring Azure's lifecycle management policies (System Design
+  handbook's tiered storage cost optimization concept, concretely
+  implemented here).
+
+DURABILITY vs. AVAILABILITY (a precise, testable AWS-specific detail)
+  S3 Standard is designed for 11 nines (99.999999999%) of DURABILITY
+  (extremely unlikely to ever lose an object, because it's redundantly
+  stored across multiple AZs automatically by default) but only "4 nines"-
+  class AVAILABILITY SLA (99.99%, meaning brief periods where a request
+  might fail/need retry, without any actual data loss). This
+  durability-vs-availability distinction is a genuinely common,
+  precise interview question: "does S3 guarantee my data is safe, or that
+  my request always succeeds instantly?" — the correct answer distinguishes
+  the two guarantees explicitly, since they're different SLAs with very
+  different numbers.
+
+CROSS-REGION REPLICATION (CRR) & SAME-REGION REPLICATION (SRR)
+  S3 can automatically, asynchronously replicate objects to a bucket in
+  another region (CRR, for regional disaster recovery — the direct
+  analogue to Azure's GRS) or within the same region to a different bucket
+  (SRR, e.g. for compliance requiring a logically separate copy, or
+  aggregating from multiple source buckets into one). Unlike Azure's
+  built-in GRS (automatic at the storage-account level), S3 replication is
+  explicitly configured per-bucket with its own IAM role granting
+  replication permission — a slightly more manual, explicit setup worth
+  contrasting with Azure's more "built-in" redundancy model if asked to
+  compare.
+
+VERSIONING & OBJECT LOCK
+  S3 Versioning preserves every version of an object on overwrite/delete
+  (protects against accidental deletion/overwrite, and is a prerequisite
+  for cross-region replication). S3 Object Lock provides WORM
+  (write-once-read-many) enforcement — genuinely immutable objects for a
+  defined retention period, even against account-root deletion attempts —
+  relevant for regulatory/compliance data retention requirements
+  (financial records, audit logs) where "even we, the platform admins,
+  cannot delete this early" is a hard requirement.
+
+================================================================================
+5. NETWORKING FUNDAMENTALS FOR DATA PLATFORMS
+================================================================================
+
+VPC (VIRTUAL PRIVATE CLOUD)
+  AWS's isolated private network construct — the direct equivalent of an
+  Azure VNet. Subnets within a VPC are explicitly PUBLIC (route to an
+  Internet Gateway) or PRIVATE (no direct internet route) — data platform
+  compute (Databricks clusters, EMR, Spark on EC2) is standard practice to
+  deploy into private subnets, with any needed outbound internet access
+  (e.g., pip installing a package) routed through a NAT Gateway rather
+  than a direct public IP.
+
+VPC ENDPOINTS (the AWS equivalent of Azure Private Endpoints)
+  Gateway endpoints (for S3 and DynamoDB specifically — route-table-based,
+  no additional hourly cost) and Interface endpoints (PrivateLink-backed,
+  for most other AWS services, an ENI with a private IP in your subnet,
+  billed hourly) allow private-subnet resources to reach AWS services
+  without traversing the public internet or requiring a NAT Gateway at
+  all — this is the concrete AWS mechanism behind "how do you let a
+  private-subnet Spark cluster read from S3 without any public internet
+  path," and the Gateway endpoint's zero-additional-cost nature for S3
+  specifically is a genuinely useful, concrete cost-and-security detail to
+  know.
+
+SECURITY GROUPS vs. NETWORK ACLS
+  Security Groups: STATEFUL, instance/ENI-level firewall (return traffic
+    automatically allowed) — the AWS equivalent of an Azure NSG applied
+    at the resource level, and the primary, most commonly used network
+    access control mechanism day to day.
+  Network ACLs (NACLs): STATELESS, subnet-level firewall (return traffic
+    must be explicitly allowed both directions) — a coarser, secondary
+    layer, less commonly the primary access-control tool in practice but
+    worth naming as the subnet-level complement to security groups, and a
+    real interview trap ("why isn't my security group rule working" ->
+    check whether a NACL is silently blocking the return traffic, since
+    NACLs are stateless and easy to misconfigure by forgetting the reverse
+    direction).
+
+TRANSIT GATEWAY & VPC PEERING
+  VPC Peering directly connects two VPCs' networks (non-transitive — peer
+  A-B and B-C does NOT give A reachability to C). Transit Gateway acts as
+  a central hub connecting many VPCs (and on-premises networks via VPN/
+  Direct Connect) with transitive routing — the standard answer for "how
+  do you connect networking across dozens of VPCs/accounts" at
+  enterprise scale, where pairwise VPC Peering would become an
+  unmanageable mesh.
+
+DIRECT CONNECT
+  A dedicated, private network connection from an on-premises datacenter
+  into AWS, bypassing the public internet entirely — relevant for hybrid
+  data platforms still migrating from on-prem, or bulk data transfer
+  scenarios needing consistent, high-bandwidth, low-latency connectivity
+  rather than internet-based transfer.
+
+================================================================================
+6. COMPUTE OPTIONS FOR DATA ENGINEERING WORKLOADS
+================================================================================
+
+AMAZON EMR (ELASTIC MAPREDUCE)
+  AWS's managed Hadoop/Spark platform — the closest AWS-native analogue to
+  running Spark directly (as opposed to Databricks, which also runs ON
+  AWS as a third-party managed platform, covered in Section 8). Worth
+  knowing EMR exists and roughly what it is, since "EMR vs. Databricks" is
+  a legitimate, common interview comparison question at AWS-centric
+  companies (Databricks generally offers a more polished, opinionated,
+  higher-level experience — Unity Catalog, Delta Lake-native tooling,
+  collaborative notebooks — while EMR offers more raw, lower-level control
+  and can be meaningfully cheaper for teams willing to manage more of the
+  Spark/Hadoop ecosystem themselves).
+
+AWS GLUE
+  A serverless ETL service — Glue Jobs run Spark (or Python shell)
+  scripts without cluster management, Glue Data Catalog provides a
+  Hive-metastore-compatible metadata catalog usable by Athena, EMR,
+  Redshift Spectrum, and other AWS analytics services, and Glue Crawlers
+  automatically infer schema from files in S3 to populate the catalog —
+  the AWS-native, lower-code answer to "how do you run a scheduled Spark
+  transformation without standing up a persistent cluster," roughly
+  analogous in spirit to ADF Mapping Data Flows on Azure, though Glue's
+  serverless-Spark model and its Data Catalog role are both more central
+  to the AWS analytics ecosystem than ADF's transformation feature is on
+  Azure.
+
+AMAZON ATHENA
+  Serverless, pay-per-query SQL directly over data in S3 (built on Trino/
+  Presto under the hood) — no cluster to manage, ideal for ad hoc querying
+  or infrequent analytical queries directly against the data lake without
+  standing up a warehouse; the direct analogue to Azure Synapse's
+  serverless SQL pool.
+
+AMAZON REDSHIFT
+  AWS's managed MPP data warehouse — the AWS-native analogue to Synapse's
+  dedicated SQL pool / Snowflake / BigQuery. Redshift Spectrum extends
+  Redshift's query engine to also query data directly in S3 without
+  loading it into Redshift first, blurring the lake/warehouse boundary
+  similarly to how Databricks SQL and BigQuery both query external
+  lake data directly.
+
+AWS LAMBDA
+  Serverless, event-driven compute — directly analogous to Azure
+  Functions; the standard pattern is Lambda triggering a Databricks/EMR/
+  Glue job when a new object lands in S3 (via S3 event notifications),
+  rather than doing heavy data processing inside the Lambda itself (Lambda
+  has execution time and memory limits unsuited to large-scale Spark-style
+  processing).
+
+AMAZON EKS (ELASTIC KUBERNETES SERVICE)
+  Managed Kubernetes — the AWS analogue to AKS, used for the same
+  "custom containerized processing not natively covered by managed Spark"
+  scenarios (e.g., self-managed Flink clusters for the lowest-latency CEP
+  workloads from the Streaming & Kafka handbook).
+
+EC2 & SPOT INSTANCES
+  The underlying raw compute beneath EMR, Databricks (classic compute),
+  and self-managed clusters — EC2 Spot Instances offer steep discounts
+  for interruptible capacity, directly analogous to Azure Spot VMs, and
+  are the standard cost lever for fault-tolerant Spark worker nodes on
+  both EMR and Databricks-on-AWS.
+
+================================================================================
+7. AWS DATA PLATFORM SERVICES LANDSCAPE
+================================================================================
+
+INGESTION
+  Amazon MSK (Managed Streaming for Kafka): fully-managed, ACTUAL Apache
+    Kafka (not just protocol-compatible — this is real Kafka under the
+    hood, unlike Azure Event Hubs which is Kafka-protocol-compatible but
+    not Kafka itself) — the direct, native choice whenever a design calls
+    for genuine Kafka on AWS, and worth stating this distinction precisely
+    if compared against Event Hubs.
+  Amazon Kinesis Data Streams: AWS's own native streaming service
+    (not Kafka-based/compatible) — simpler operationally than
+    self-managing Kafka, tightly integrated with other AWS services, but
+    with its own distinct API/semantics rather than the Kafka protocol.
+  AWS Database Migration Service (DMS): supports CDC-based replication
+    from source databases, the AWS-native analogue to Debezium/ADF for
+    CDC ingestion pipelines.
+  Amazon Data Firehose: fully-managed delivery of streaming data
+    (typically FROM Kinesis or MSK) directly into S3/Redshift/OpenSearch
+    with built-in batching, compression, and format conversion — commonly
+    the "last mile" from a Kinesis/MSK stream into the lake without
+    writing custom consumer code.
+
+STORAGE
+  S3 (Section 4) — the lakehouse foundation.
+  RDS / Aurora: managed relational OLTP databases (Aurora being AWS's own
+    high-performance MySQL/PostgreSQL-compatible engine) — common CDC
+    source systems.
+  DynamoDB: AWS's native low-latency, highly scalable key-value/document
+    NoSQL database — the standard AWS answer for an online feature store
+    or real-time serving layer (System Design handbook's recommendation
+    and fraud detection problems), directly analogous to Cosmos DB on
+    Azure.
+
+PROCESSING
+  Databricks on AWS (primary, Section 8), EMR, Glue.
+
+GOVERNANCE
+  AWS Glue Data Catalog: the foundational, widely-integrated metadata
+    catalog across AWS analytics services.
+  AWS Lake Formation: builds on top of the Glue Data Catalog to add
+    fine-grained, centralized permissions (table/column/row-level) across
+    multiple AWS analytics services (Athena, Redshift Spectrum, EMR) —
+    roughly analogous in governance ambition to Purview, though scoped
+    specifically to AWS-native analytics access rather than Purview's
+    broader cross-platform catalog scope; worth distinguishing from Unity
+    Catalog the same way Purview is distinguished from Unity Catalog in
+    the Azure handbook ("Lake Formation/Glue Catalog governs AWS-native
+    analytics service access; Unity Catalog governs specifically within
+    the Databricks lakehouse — organizations running Databricks on AWS
+    typically use Unity Catalog as the primary fine-grained governance
+    layer for lakehouse data specifically").
+  Amazon DataZone: AWS's newer data catalog/governance/data-sharing
+    service aimed at business-user-facing data discovery, positioned
+    somewhat similarly to how Purview extends beyond pure technical
+    catalog into broader enterprise data governance.
+
+KEY MANAGEMENT / SECRETS
+  AWS Secrets Manager: centralized secrets storage with automatic
+    rotation support — the direct analogue to Azure Key Vault (Key Vault
+    also handles certificates/keys more broadly; AWS splits this slightly
+    across Secrets Manager for secrets and KMS for encryption keys).
+  AWS KMS (Key Management Service): manages encryption keys used for
+    encrypting S3 objects, EBS volumes, RDS databases, etc. — the
+    encryption-key-specific counterpart to Secrets Manager's
+    credential-specific role.
+
+================================================================================
+8. DATABRICKS ON AWS — ARCHITECTURE SPECIFICS
+================================================================================
+
+CONTROL PLANE vs. DATA PLANE (same conceptual split as Azure, AWS-specific
+mechanics)
+  Control plane: managed by Databricks in a Databricks-owned AWS account
+    — web UI, job scheduler, cluster orchestration.
+  Data plane: runs in YOUR AWS account/VPC (classic compute) — the actual
+    EC2 instances backing Spark clusters, and your S3 data — meaning, as
+    on Azure, your data is processed and stored within your own AWS
+    account boundary, with Databricks orchestrating remotely rather than
+    ever directly handling your data.
+  Serverless compute: Databricks-managed compute running in a
+    Databricks-managed, isolated environment — same tradeoff discussion
+    as the Azure handbook (control/customization vs. operational
+    simplicity and startup speed).
+
+CROSS-ACCOUNT IAM ROLE (the AWS-specific setup mechanic worth knowing
+precisely)
+  Databricks's own AWS account is granted the ability to launch/manage EC2
+  instances IN YOUR account via a cross-account IAM role that you create
+  and configure with a trust policy naming Databricks's AWS account as a
+  trusted principal — this is the concrete mechanism (an application of
+  the resource-based/trust-policy pattern from Section 3) that lets
+  Databricks's control plane orchestrate compute living in your data
+  plane account without Databricks ever holding standing credentials
+  INTO your account; it assumes a role, gets temporary STS credentials,
+  performs the needed actions, and the credentials expire.
+
+UNITY CATALOG STORAGE ACCESS ON AWS
+  Unity Catalog external locations reference S3 paths, secured via an IAM
+  role (an AWS-specific storage credential type) rather than a stored
+  access key — the AWS-specific implementation of the same "no stored
+  credential, identity-based access" principle as Azure's managed-identity-
+  backed storage credentials; the storage credential's IAM role trust
+  policy is scoped to allow assumption specifically by the Databricks Unity
+  Catalog IAM role/external ID pairing, following the same trust-policy
+  pattern described above.
+
+INSTANCE PROFILES FOR CLASSIC (NON-UNITY-CATALOG-GOVERNED) ACCESS
+  Legacy pattern: attaching an EC2 instance profile (Section 3) directly
+  to a Databricks cluster so all code running on that cluster inherits the
+  instance profile's S3 permissions — the 2026 recommended pattern is
+  Unity Catalog-governed access (external locations/volumes) instead,
+  for the same reasons DBFS mounts are deprecated in favor of Unity
+  Catalog on Azure: centralized, auditable, fine-grained governance
+  through one system rather than broad cluster-wide instance-profile
+  permissions.
+
+CLUSTER INSTANCE TYPES
+  Databricks cluster node types map directly to EC2 instance types
+  (e.g., i3.xlarge, r5.2xlarge) — memory-optimized (r-family) for
+  shuffle/cache-heavy workloads, compute-optimized (c-family) for
+  CPU-bound transformations, storage-optimized (i-family, with local NVMe
+  SSD) historically favored for Delta Lake caching performance — and Spot
+  Instance pricing applies directly to worker node pools the same way
+  Spot VMs do on Azure.
+
+================================================================================
+9. SECURITY & GOVERNANCE PATTERNS
+================================================================================
+
+DEFENSE IN DEPTH FOR A LAKEHOUSE ON AWS (mirrors the Azure handbook's
+layered structure, AWS-specific mechanics)
+  1. Identity: IAM roles for all service-to-service auth via STS-issued
+     temporary credentials, no long-lived IAM user access keys where
+     avoidable.
+  2. Network: private subnets + VPC Endpoints for S3/other AWS services,
+     Security Groups restricting cluster network access, no direct public
+     IP on data-plane compute.
+  3. Data access: Unity Catalog RBAC (or Lake Formation for
+     non-Databricks AWS-native analytics) as the governed access layer,
+     rather than relying on broad IAM/instance-profile permissions alone.
+  4. Encryption: at-rest (S3 default encryption via SSE-S3 or SSE-KMS for
+     customer-managed keys) and in-transit (TLS) — on by default/easily
+     enabled, baseline rather than differentiating.
+  5. Secrets: Secrets Manager-backed secret scopes, never hardcoded
+     credentials.
+  6. Audit: AWS CloudTrail (API-call-level audit log across the account)
+     + Unity Catalog access logs for lakehouse-specific data access audit
+     — CloudTrail is the AWS-specific answer worth naming explicitly when
+     asked "how do you audit who did what across your AWS account," since
+     it's the account-wide API audit trail underlying essentially all AWS
+     security investigations.
+
+PII / SENSITIVE DATA HANDLING
+  Same Unity Catalog column-masking/row-filtering pattern as the Azure
+  handbook (dynamic views, native row filters/column masks) — this
+  Unity Catalog governance layer is cloud-agnostic once the Databricks
+  workspace is set up, worth noting explicitly: "the Unity Catalog
+  governance model itself doesn't change between AWS and Azure — what
+  changes is how the underlying storage credential authenticates (IAM
+  role vs. managed identity) and how network isolation is configured
+  (VPC Endpoint vs. Private Endpoint)."
+
+================================================================================
+10. COST MANAGEMENT FOR DATA PLATFORMS
+================================================================================
+
+COMPUTE COST LEVERS (directly mirroring the Azure handbook's structure)
+  - Cluster autoscaling + auto-termination on interactive clusters —
+    still the single biggest, easiest win, identical advice to Azure.
+  - EC2 Spot Instances for fault-tolerant worker nodes.
+  - Serverless SQL (Athena, Databricks Serverless) for spiky/unpredictable
+    query workloads instead of always-on provisioned compute.
+  - Ephemeral job clusters instead of shared, always-on interactive
+    clusters for production jobs.
+  - Savings Plans / Reserved Instances for genuinely steady-state,
+    predictable compute needs — an AWS-specific cost lever with no direct
+    Azure equivalent named in this handbook's scope, worth mentioning as
+    "committing to sustained usage in exchange for a meaningful discount,
+    appropriate once a workload's baseline compute need is well
+    understood and stable, as opposed to Spot's use case of tolerating
+    interruption for variable/batch workloads."
+
+STORAGE COST LEVERS
+  - S3 Lifecycle policies moving cold data through IA -> Glacier tiers.
+  - S3 Intelligent-Tiering when access patterns are genuinely unpredictable,
+    to avoid manually guessing lifecycle rules.
+  - Delta OPTIMIZE + VACUUM (identical rationale to Azure — controls small/
+    orphaned file volume regardless of which cloud's object store is
+    underneath).
+  - Choosing S3 One Zone-IA over Standard-IA only for genuinely
+    easily-reproducible data, given its real availability/durability
+    tradeoff.
+
+VISIBILITY & GOVERNANCE
+  - AWS Cost Explorer + Budgets for spend visibility and anomaly alerting
+    — the direct analogue to Azure Cost Management + Budgets.
+  - Resource tagging (team, environment, cost center) enforced via
+    AWS Organizations SCPs or tag policies for chargeback/showback,
+    identical rationale to the Azure handbook.
+  - Databricks cluster policies restricting available instance types/max
+    cluster size per team/workspace, same rationale as Azure — prevent
+    runaway cost at the source rather than catching it after the fact.
+
+================================================================================
+11. AWS vs. AZURE vs. GCP — EQUIVALENCE TABLE
+================================================================================
+
+  CONCEPT                  | AWS               | AZURE            | GCP
+  --------------------------------------------------------------------------
+  Object/lake storage      | S3                | ADLS Gen2 (Blob) | GCS
+  Identity provider/system | IAM               | Entra ID         | Cloud IAM
+  Service identity (no     | IAM Role (EC2     | Managed Identity | Service
+   stored credential)      |  instance profile,|                  |  Account +
+                           |  Lambda exec role)|                  |  Workload
+                           |                   |                  |  Identity
+  Native/compatible Kafka  | MSK (real Kafka)  | Event Hubs       | Confluent
+                           | / Kinesis (native,|  (Kafka-protocol-|  on GCP /
+                           |  non-Kafka)       |  compatible, not |  Pub/Sub +
+                           |                   |  real Kafka)     |  Dataflow
+                           |                   |                  |  (non-Kafka)
+  Managed warehouse        | Redshift          | Synapse (dedicated| BigQuery
+                           |                   |  SQL pool)       |
+  Serverless SQL over lake | Athena            | Synapse           | BigQuery
+                           |                   |  serverless SQL  |  (native)
+  Managed ETL/orchestration| Glue / Step       | Data Factory     | Dataflow /
+                           |  Functions        |                  |  Cloud
+                           |                   |                  |  Composer
+  Secrets management       | Secrets Manager   | Key Vault        | Secret
+                           |  (+ KMS for keys) |  (secrets+keys   |  Manager
+                           |                   |  combined)       |
+  Serverless functions     | Lambda            | Azure Functions  | Cloud
+                           |                   |                  |  Functions
+  Managed Kubernetes       | EKS               | AKS              | GKE
+  Low-latency NoSQL/KV     | DynamoDB          | Cosmos DB        | Firestore /
+                           |                   |                  |  Bigtable
+  Network isolation        | VPC + VPC         | VNet + Private   | VPC +
+                           |  Endpoint /       |  Endpoint        |  Private
+                           |  PrivateLink      |                  |  Service
+                           |                   |                  |  Connect
+  Enterprise data catalog/ | Glue Data Catalog | Purview          | Dataplex /
+   governance               |  + Lake Formation|                  |  Data
+                           |  + DataZone       |                  |  Catalog
+  Account/subscription     | AWS Account       | Subscription     | Project
+   isolation boundary      |  (hard boundary)  |  (softer than    |  (roughly
+                           |                   |  AWS account)    |  similar to
+                           |                   |                  |  AWS
+                           |                   |                  |  account)
+
+INTERVIEW FRAMING FOR CROSS-CLOUD QUESTIONS
+  "The underlying architecture patterns are identical across clouds —
+  identity-based, credential-free service authentication; private
+  networking between compute and storage via endpoint/private-link
+  mechanisms; tiered storage lifecycle policies for cost; a governed
+  catalog layer for fine-grained access control. What changes between AWS
+  and Azure is mostly product names and some specific mechanics — for
+  example, AWS's account boundary is a harder isolation boundary than an
+  Azure subscription, and IAM's explicit-deny-always-wins rule is a real,
+  precise difference from Azure RBAC's purely additive model worth
+  getting right rather than assuming the two work identically."
+
+================================================================================
+12. COMMON DESIGN PROBLEMS (WORKED EXAMPLES)
+================================================================================
+
+--------------------------------------------------------------------------------
+PROBLEM A: Secure a Databricks-on-AWS lakehouse so data never traverses the
+public internet, with no stored credentials anywhere in pipeline code
+--------------------------------------------------------------------------------
+  - Deploy Databricks classic compute into private subnets within a
+    customer-managed VPC (no public IPs on cluster EC2 instances).
+  - S3 Gateway VPC Endpoint for private-subnet clusters to reach S3
+    without a NAT Gateway or public internet path at all (and at no
+    additional hourly cost, unlike an Interface endpoint).
+  - Unity Catalog storage credential backed by an IAM role, with a trust
+    policy scoped to Databricks's Unity Catalog IAM role + a unique
+    external ID (preventing the "confused deputy" problem where another
+    Databricks customer could otherwise attempt to assume the same role) —
+    zero stored access keys.
+  - Any external service credentials (e.g., a source database connection
+    string for CDC ingestion) stored in AWS Secrets Manager, referenced
+    via a Databricks Secrets Manager-backed secret scope.
+  - Security Groups on the cluster's ENIs restricting traffic to only
+    what's required between cluster nodes and necessary AWS service
+    endpoints.
+
+--------------------------------------------------------------------------------
+PROBLEM B: Design a cost-optimized S3 storage lifecycle for a 5-year-
+retention bronze layer, heavily queried in its first 30 days, occasional
+for 90 days, essentially never after that but retained for compliance
+--------------------------------------------------------------------------------
+  - Land in S3 Standard (heavy access expected in the first 30 days).
+  - Lifecycle rule: transition to S3 Standard-IA after 30 days.
+  - Transition to S3 Glacier Flexible Retrieval (or Deep Archive if truly
+    zero expected access, accepting the longer retrieval window) after 90
+    days.
+  - Expiration rule deletes objects after 5 years to satisfy the
+    compliance retention window automatically.
+  - Same tradeoff note as the Azure version of this problem: if there's a
+    real chance of needing fast access to data older than 90 days (e.g.,
+    a tight-turnaround audit request), use Glacier Instant Retrieval
+    instead of Flexible/Deep Archive for that range — millisecond
+    retrieval at somewhat higher storage cost than the slower Glacier
+    tiers, a genuinely useful middle option many candidates don't know to
+    mention.
+
+================================================================================
+13. INTERVIEW QUESTION BANK WITH MODEL ANSWERS
+================================================================================
+
+Q: "How does IAM resolve a situation where one policy allows an action and
+   another policy explicitly denies it?"
+A: "An explicit Deny always wins, regardless of any Allow statements
+   elsewhere — IAM evaluates all applicable policies and if any of them
+   contains an explicit Deny for that action/resource, access is denied
+   full stop. Absent any explicit statement at all, the default is also
+   deny — IAM is default-deny, not default-allow, so you have to
+   explicitly grant everything a principal needs."
+
+Q: "Walk me through how Databricks on AWS accesses your S3 data without
+   storing credentials."
+A: "Through an IAM role rather than access keys. You create an IAM role
+   in your AWS account with a trust policy that names Databricks's Unity
+   Catalog IAM identity as a trusted principal, typically combined with
+   an external ID to prevent a confused-deputy scenario. Unity Catalog
+   registers that role as a storage credential, assumes it via STS to get
+   short-lived temporary credentials whenever it needs to access S3, and
+   those credentials automatically expire and get refreshed — there's no
+   static access key stored anywhere in Databricks configuration."
+
+Q: "What's the practical difference between S3 durability and S3
+   availability, and why does it matter?"
+A: "Durability is about whether your data is ever lost — S3 Standard is
+   designed for eleven nines of durability because it's redundantly
+   stored across multiple AZs by default, so losing an object is
+   extraordinarily unlikely. Availability is about whether a given request
+   succeeds when you make it — that's a separate, lower SLA, around four
+   nines, meaning you should design your application to retry on
+   occasional request failures even though the underlying data itself is
+   essentially never actually at risk of loss."
+
+Q: "How would you connect a private-subnet Spark cluster to S3 without any
+   public internet path, and does it cost anything extra?"
+A: "An S3 Gateway VPC Endpoint — it adds a route in the subnet's route
+   table sending S3 traffic privately within the AWS network instead of
+   over the internet or through a NAT Gateway. Unlike Interface endpoints,
+   Gateway endpoints for S3 don't have an hourly cost, which makes this
+   both a security win and genuinely free compared to routing that traffic
+   through a NAT Gateway, which does have a per-GB processing cost."
+
+Q: "When would you choose EMR over Databricks on AWS, or vice versa?"
+A: "Databricks when the team wants a more polished, opinionated,
+   collaborative platform — Unity Catalog governance, native Delta Lake
+   tooling, notebook collaboration — essentially paying for a better
+   developer experience and less operational overhead. EMR when the team
+   wants more direct, lower-level control over the Hadoop/Spark ecosystem
+   and is willing to manage more of that complexity themselves, often to
+   reduce cost at large, steady-state scale where Databricks's platform
+   fee becomes a bigger fraction of total spend."
+
+================================================================================
+14. QUICK-REFERENCE CHEAT SHEET
+================================================================================
+
+IAM POLICY EVALUATION, ONE RULE TO REMEMBER
+  Explicit Deny always wins. No applicable statement = implicit deny
+  (default-deny system, not default-allow).
+
+IDENTITY, PREFERRED ORDER
+  IAM Role (STS temporary credentials, no stored secret) > IAM user
+  access key in Secrets Manager > hardcoded credential (never acceptable)
+
+S3 STORAGE CLASSES, COST vs. ACCESS SPEED (highest cost -> lowest)
+  Standard > Intelligent-Tiering > Standard-IA > One Zone-IA > Glacier
+  Instant Retrieval > Glacier Flexible Retrieval > Glacier Deep Archive
+
+S3 DURABILITY vs. AVAILABILITY
+  Durability: 11 nines (data essentially never lost, multi-AZ by default)
+  Availability: ~4 nines (occasional request failures possible — design
+  for retry)
+
+NETWORK ISOLATION STACK
+  Private subnets (no public IP) + VPC Endpoint (Gateway for S3/DynamoDB,
+  free; Interface/PrivateLink for most other services, hourly cost) +
+  Security Groups (stateful, instance-level) + NACLs (stateless,
+  subnet-level, remember both directions)
+
+COMPUTE COST, TOP 3 LEVERS
+  1. Auto-termination on interactive clusters
+  2. EC2 Spot Instances for fault-tolerant worker nodes
+  3. Ephemeral job clusters instead of shared always-on clusters
+  (Savings Plans/Reserved Instances for genuinely steady-state workloads)
+
+AWS <-> AZURE <-> GCP QUICK MAP
+  S3 <-> ADLS Gen2 <-> GCS
+  IAM <-> Entra ID <-> Cloud IAM
+  IAM Role <-> Managed Identity <-> Service Account
+  MSK (real Kafka) / Kinesis <-> Event Hubs (Kafka-compatible) <-> Pub/Sub
+  Redshift <-> Synapse <-> BigQuery
+  Secrets Manager + KMS <-> Key Vault <-> Secret Manager
+  EKS <-> AKS <-> GKE
+
+CONTROL PLANE vs DATA PLANE (Databricks on AWS)
+  Control plane -> Databricks-managed AWS account (orchestration, UI,
+  scheduler)
+  Data plane -> your AWS account/VPC (actual EC2 clusters + your S3 data)
+
+================================================================================
+END OF HANDBOOK
+================================================================================
