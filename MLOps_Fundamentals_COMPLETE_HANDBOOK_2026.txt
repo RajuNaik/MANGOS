@@ -1,0 +1,768 @@
+================================================================================
+MLOPS FUNDAMENTALS — COMPLETE HANDBOOK (2026)
+MAANG / Top-Tier Tech Interview Preparation — Data & AI Engineer Track
+================================================================================
+Companion to: GenAI_LLM_Engineering_COMPLETE_HANDBOOK_2026,
+System_Design_for_Data_Engineers_COMPLETE_HANDBOOK_2026,
+Data_Modeling_COMPLETE_HANDBOOK_2026, Databricks_COMPLETE_HANDBOOK_2026,
+AI_on_Databricks_COMPLETE_HANDBOOK, AI_on_Snowflake_COMPLETE_HANDBOOK
+
+This handbook is standalone. No external references required. It covers the
+operational lifecycle of classical/deep ML models in production — the
+counterpart to the GenAI handbook's focus on LLM-specific systems. Scope is
+the Data/AI Engineer's actual ownership: feature pipelines, model deployment
+patterns, monitoring/drift detection, CI/CD for ML, and experiment tracking —
+not the model training/algorithm-selection depth owned by an ML researcher.
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+ 1. What MLOps Actually Is, and Where a Data/AI Engineer Fits
+ 2. The ML Lifecycle End to End
+ 3. Feature Engineering & Feature Stores (expanded from System Design handbook)
+ 4. Experiment Tracking & Model Registry
+ 5. Model Deployment Patterns
+ 6. CI/CD for ML (the parts that differ from normal software CI/CD)
+ 7. Model Monitoring: Performance, Drift, and Data Quality
+ 8. A/B Testing and Online Evaluation for ML
+ 9. Retraining Strategies
+10. Model Governance, Reproducibility, and Rollback
+11. Infrastructure Patterns: Training vs. Inference Compute
+12. Common Design Problems (worked examples)
+13. Interview Question Bank with Model Answers
+14. Quick-Reference Cheat Sheet
+
+================================================================================
+1. WHAT MLOPS ACTUALLY IS, AND WHERE A DATA/AI ENGINEER FITS
+================================================================================
+
+MLOps is DevOps principles (versioning, CI/CD, monitoring, reproducibility)
+applied to the ML lifecycle, addressing the failure mode that plagues most
+ML projects: a model that scores well in a notebook but never reliably
+reaches, or survives in, production. The uncomfortable industry statistic
+worth internalizing for interview framing: the majority of ML projects
+never make it to production, and of those that do, a large fraction decay
+silently without anyone noticing until business metrics visibly suffer —
+MLOps exists specifically to close that gap.
+
+WHERE THE DATA/AI ENGINEER OWNS THIS (versus the ML researcher/scientist)
+  ML researcher/scientist: model architecture, algorithm selection,
+    hyperparameter tuning, offline model evaluation methodology.
+  Data/AI Engineer: the PIPELINE around the model — feature engineering
+    pipelines (batch and streaming), the data feeding training AND
+    serving, model deployment infrastructure, monitoring pipelines,
+    retraining triggers, and the CI/CD scaffolding that makes any of this
+    repeatable and safe to change. A precise, reusable interview framing:
+    "I don't own model architecture decisions, but I own making sure the
+    model has correct, fresh, point-in-time-correct data to train and
+    serve on, and that when something breaks in production — data drift,
+    a pipeline failure, a silent accuracy regression — someone finds out
+    from a dashboard, not from a business stakeholder complaining weeks
+    later."
+
+================================================================================
+2. THE ML LIFECYCLE END TO END
+================================================================================
+
+  1. Problem framing & data collection — often collaborative with
+     product/business, DE owns making the right data available and
+     correctly modeled.
+  2. Feature engineering — DE-owned (Section 3), the highest-leverage,
+     most DE-adjacent stage in the entire lifecycle.
+  3. Experimentation & training — ML-owned, but DE-adjacent for
+     experiment tracking infrastructure (Section 4) and compute
+     provisioning (Section 11).
+  4. Evaluation (offline) — joint; DE builds the pipelines producing
+     evaluation datasets and metrics dashboards, ML scientists interpret
+     results and decide readiness.
+  5. Deployment — DE/platform-owned (Section 5): packaging, serving
+     infrastructure, rollout strategy.
+  6. Monitoring — DE-owned (Section 7): performance metrics, drift
+     detection, data quality checks on live inference traffic.
+  7. Retraining / iteration — triggered by monitoring signals, DE owns
+     the retraining pipeline's automation and triggering logic
+     (Section 9), closing the loop back to step 2/3.
+  This is a LOOP, not a line — a mature MLOps answer emphasizes that
+  production monitoring feeds back into retraining and even re-framing
+  the problem, rather than treating deployment as the finish line.
+
+================================================================================
+3. FEATURE ENGINEERING & FEATURE STORES (EXPANDED FROM SYSTEM DESIGN HANDBOOK)
+================================================================================
+
+RECAP FROM SYSTEM DESIGN HANDBOOK, RESTATED PRECISELY
+  A feature store separates feature COMPUTATION from feature SERVING,
+  with two paths: offline (batch, full history, used for training) and
+  online (low-latency, current-value-only, used for real-time inference)
+  — unified by a shared feature definition so both paths compute the
+  SAME logical feature, preventing training/serving skew.
+
+TRAINING/SERVING SKEW — THE #1 FEATURE ENGINEERING FAILURE MODE
+  Occurs when the feature computation logic used at training time
+  differs, even subtly, from the logic used at serving/inference time
+  (e.g., a "days since last purchase" feature computed with a slightly
+  different date-boundary convention in a batch SQL job versus a
+  real-time Python service) — the model was trained on one distribution
+  of feature values and is served a systematically different
+  distribution in production, causing a silent, hard-to-diagnose
+  accuracy regression that offline evaluation would never catch (since
+  offline evaluation also uses the training-time computation).
+  MITIGATION: define feature transformation logic ONCE (shared code or a
+  feature store's declarative feature definitions) and generate BOTH the
+  offline and online computation paths from that single definition,
+  rather than hand-writing the logic twice — this is precisely why
+  feature stores exist as infrastructure rather than "just compute
+  features in whatever pipeline is convenient."
+
+POINT-IN-TIME CORRECTNESS (restated and expanded)
+  Training data generation must join each label/example row to feature
+  values AS OF that example's timestamp, not the feature's current
+  value — otherwise the model trains on information that wouldn't have
+  been available at real prediction time (a specific form of data
+  leakage). Concretely implemented via a point-in-time join (an "as-of
+  join" — for each label row, find the most recent feature value with a
+  timestamp <= the label's timestamp) — structurally identical to
+  joining against an SCD Type 2 dimension "as of" a given date (Data
+  Modeling handbook, Section 7 and Section 13), and worth stating that
+  connection explicitly in an interview to show the concepts are the
+  same underlying mechanism, not a separate ML-specific trick.
+
+FEATURE FRESHNESS SLA
+  Different features have genuinely different freshness requirements —
+  "user's lifetime purchase count" can tolerate daily batch updates,
+  "items in cart in the last 5 minutes" needs streaming/near-real-time
+  updates — a feature store design should support BOTH cadences (batch
+  and streaming feature pipelines writing into the same logical feature
+  table/online store) rather than forcing every feature onto the same
+  refresh schedule, directly echoing the batch-vs-streaming decision
+  framework from the System Design handbook applied per-feature rather
+  than per-pipeline.
+
+FEATURE VERSIONING
+  Feature definitions change over time (a bug fix, a new business
+  definition of "active user") — versioning feature definitions (not
+  just feature VALUES) lets you reproduce exactly which feature logic
+  produced a given historical training run, and lets you roll out a
+  redefined feature without silently breaking models already trained on
+  the old definition — a genuinely important reproducibility concern
+  (Section 10) specific to feature engineering.
+
+================================================================================
+4. EXPERIMENT TRACKING & MODEL REGISTRY
+================================================================================
+
+EXPERIMENT TRACKING
+  Systematically logging, for every training run: the exact code
+  version, the exact data version/snapshot used, hyperparameters,
+  resulting metrics, and produced artifacts (the model file itself,
+  plots, evaluation reports) — tools like MLflow Tracking (the standard,
+  and native to Databricks) provide this as queryable, comparable
+  records rather than scattered notebook outputs or spreadsheet
+  tracking. The concrete interview-testable value: "if someone asks 'why
+  did we choose this model over the alternatives,' I should be able to
+  pull up the actual comparison — same eval set, same metrics, logged
+  systematically — not reconstruct it from memory or old Slack
+  messages."
+
+MODEL REGISTRY
+  A versioned catalog of trained models promoted from experiment
+  tracking, with STAGE/LIFECYCLE metadata (e.g., None/Staging/
+  Production/Archived in classic MLflow Model Registry terms, or a more
+  general "aliases" system in modern MLflow/Unity Catalog Models) —
+  separates "a model that was trained and logged" from "a model that has
+  been reviewed, approved, and is authorized to serve production
+  traffic," which is the actual governance boundary that matters for a
+  production ML system. Promoting a model version from Staging to
+  Production should be a deliberate, ideally reviewed/approved action —
+  not an automatic consequence of training completing.
+
+REPRODUCIBILITY, THE CONCRETE REQUIREMENT
+  Given a model version in the registry, you should be able to answer
+  precisely: what code produced it, what data (exact version/snapshot)
+  trained it, what hyperparameters were used, and what environment
+  (library versions) it was trained in — missing any one of these breaks
+  true reproducibility, and this is a common, concrete interview probe
+  ("a model is behaving unexpectedly in production — how do you
+  reproduce the exact conditions that produced it to debug?").
+
+UNITY CATALOG MODELS (2026-relevant, ties to your Databricks background)
+  Models registered in Unity Catalog get the same governance,
+  lineage, and access-control benefits as any other Unity Catalog asset
+  (tables, volumes) — a model's lineage back to the exact feature tables
+  and training data used is tracked automatically, directly extending
+  the data lineage concepts from your Databricks handbook into the model
+  artifact itself, worth naming explicitly as the 2026-current answer
+  over the legacy standalone MLflow Model Registry.
+
+================================================================================
+5. MODEL DEPLOYMENT PATTERNS
+================================================================================
+
+BATCH INFERENCE
+  The model runs on a schedule (or triggered by new data arrival),
+  scoring a batch of records at once, writing predictions to a table for
+  downstream consumption — appropriate when predictions don't need to be
+  fresher than the batch cadence (e.g., a weekly churn-risk score, a
+  daily product recommendation refresh). Cheapest and operationally
+  simplest deployment pattern; reuses standard batch pipeline
+  infrastructure (Spark jobs, Lakeflow Jobs) rather than needing a
+  dedicated serving system at all.
+
+ONLINE / REAL-TIME INFERENCE
+  The model is deployed behind a low-latency serving endpoint, called
+  synchronously per-request (e.g., a fraud-scoring call at checkout, a
+  real-time recommendation) — requires dedicated model-serving
+  infrastructure (Databricks Model Serving, SageMaker Endpoints, a
+  custom containerized service behind a load balancer) with its own
+  latency/availability SLA, autoscaling, and monitoring, distinct from
+  and generally more operationally demanding than batch inference.
+
+STREAMING INFERENCE
+  The model scores records as they arrive on a stream (Structured
+  Streaming/Flink applying the model within a micro-batch or per-record
+  processing step) — the middle ground between batch and online,
+  appropriate when predictions need to be fresh within seconds-to-
+  minutes but don't require the strict synchronous request/response
+  latency of true online serving (e.g., scoring every transaction on a
+  Kafka topic for fraud triage, feeding results to a downstream queue
+  rather than blocking a user-facing request) — directly reuses the
+  batch/micro-batch/streaming decision framework from the System Design
+  and Streaming & Kafka handbooks, applied specifically to model
+  inference rather than generic data transformation.
+
+CHOOSING THE DEPLOYMENT PATTERN — DECISION FRAMEWORK
+  Does a specific user-facing request need this prediction synchronously,
+  right now?
+    YES -> Online/real-time serving
+    NO -> Does it need to be fresh within seconds-minutes but not
+          block a live request?
+          YES -> Streaming inference
+          NO -> Batch inference (cheapest, simplest — default unless a
+                genuine latency requirement forces otherwise)
+
+ROLLOUT STRATEGIES (minimizing risk when deploying a NEW model version)
+  Shadow deployment: the new model runs alongside the current production
+    model, scoring the same live traffic, but its predictions are logged
+    for comparison WITHOUT being used to make actual decisions — lets
+    you validate a new model's real-world behavior on live traffic
+    before it has any user-facing impact, the safest possible rollout
+    stage.
+  Canary deployment: the new model serves a small percentage of live
+    traffic (e.g., 5%) while the current model continues serving the
+    rest, with monitoring comparing outcomes between the two before
+    gradually increasing the new model's traffic share — catches
+    real-world issues with limited blast radius before a full rollout.
+  Blue-green deployment: two complete, independent serving environments
+    (blue = current, green = new) with traffic switched atomically from
+    one to the other — enables instant, clean rollback (switch traffic
+    back to blue) if the new version misbehaves, at the cost of running
+    two full environments simultaneously during the transition.
+  Interview framing: "I'd almost never flip 100% of traffic to a new
+  model version directly — shadow deployment first to validate behavior
+  without any risk, then canary to validate real-world impact with
+  limited blast radius, then a full rollout, with the ability to roll
+  back at every stage."
+
+MODEL PACKAGING / SERVING FORMAT
+  Standardized packaging (MLflow's model format, ONNX for cross-
+  framework portability, containerization for custom serving code) lets
+  a model trained in one framework be served consistently regardless of
+  the training framework's specifics — worth naming ONNX specifically as
+  the answer to "how do you serve a model without being locked into the
+  training framework's own serving runtime."
+
+================================================================================
+6. CI/CD FOR ML (THE PARTS THAT DIFFER FROM NORMAL SOFTWARE CI/CD)
+================================================================================
+
+WHY ML CI/CD IS GENUINELY HARDER THAN STANDARD SOFTWARE CI/CD
+  Standard CI/CD validates that CODE behaves correctly given fixed
+  inputs (unit/integration tests with deterministic expected outputs).
+  ML systems have THREE things that can each independently break
+  correctness: the code, the DATA, and the MODEL ARTIFACT itself — and
+  "correctness" for a model isn't binary pass/fail, it's a statistical
+  quality judgment against a metric threshold, which changes how testing
+  has to work.
+
+WHAT GETS TESTED IN ML CI, BEYOND NORMAL UNIT TESTS
+  - Data validation tests: schema checks, null-rate/distribution checks
+    on training data (reusing the same data-quality-gate concepts from
+    Great Expectations/dbt tests in your other handbooks) — catching a
+    broken upstream feature pipeline BEFORE it silently trains a bad
+    model.
+  - Model quality gates: automated evaluation against a held-out/golden
+    test set, with a MINIMUM METRIC THRESHOLD the new model must clear
+    before it's allowed to be promoted — directly analogous to the
+    golden-dataset regression testing pattern from the GenAI handbook,
+    applied to classical ML metrics (AUC, F1, RMSE) instead of
+    LLM-as-judge scores.
+  - Comparison against the current production model: not just "is this
+    model good in isolation" but "is this model at least as good as
+    what's currently serving" — a new model can pass an absolute quality
+    bar while still being a regression relative to production, which
+    only a direct comparison catches.
+  - Behavioral/slice tests: checking model performance doesn't
+    regress on specific important subgroups/slices of data (e.g., a
+    fraud model's performance on a specific transaction type, a
+    recommendation model's performance for new/low-history users) — an
+    aggregate metric improving while a specific important slice quietly
+    regresses is a real, common failure mode a single overall-accuracy
+    gate would miss entirely.
+  - Inference latency/resource tests: confirming the new model meets
+    latency/throughput requirements for its deployment pattern before
+    promotion, especially for online-serving models with a hard SLA.
+
+CD FOR ML — THE DEPLOYMENT PIPELINE
+  Training pipeline (triggered by new data, a schedule, or manual
+  trigger) -> automated evaluation against the quality gates above ->
+  if passed, model registered and promoted through registry
+  stages (Section 4) -> deployment pipeline packages/deploys per the
+  chosen rollout strategy (Section 5) -> post-deployment monitoring
+  (Section 7) feeds back into the next training cycle (Section 9) —
+  the same CI/CD philosophy as any data pipeline, with the addition of
+  statistical quality gates rather than purely deterministic test
+  assertions.
+
+================================================================================
+7. MODEL MONITORING: PERFORMANCE, DRIFT, AND DATA QUALITY
+================================================================================
+
+WHY MONITORING IS THE MOST OPERATIONALLY CRITICAL — AND MOST OFTEN
+SKIPPED — PART OF MLOPS
+  A model can silently degrade in production for reasons that have
+  nothing to do with a code bug: the real-world distribution of inputs
+  shifts, a business process the model was trained around changes, or an
+  upstream data pipeline starts producing subtly wrong feature values —
+  none of these trigger a traditional software error, so without
+  dedicated monitoring, the FIRST sign of a problem is often a business
+  stakeholder noticing outcomes have gotten worse, weeks after the
+  actual regression began.
+
+DATA DRIFT (a.k.a. covariate shift)
+  The distribution of MODEL INPUTS (features) at inference time diverges
+  from the distribution the model was trained on — e.g., a fraud model
+  trained on pre-pandemic transaction patterns facing a genuinely
+  different transaction mix post-pandemic. Detected via statistical
+  distribution comparison between a reference window (training data or a
+  recent stable period) and the current production input distribution —
+  common methods: Population Stability Index (PSI), Kolmogorov-Smirnov
+  test for continuous features, chi-squared test for categorical
+  features. Worth naming PSI specifically as a common, interview-
+  recognizable metric with rough interpretation thresholds (PSI < 0.1
+  generally considered stable, 0.1-0.25 moderate shift worth
+  investigating, > 0.25 significant shift warranting action).
+
+CONCEPT DRIFT
+  The relationship between INPUTS and the TARGET/label itself changes —
+  even if input feature distributions look stable, the mapping from
+  those features to the correct prediction has shifted (e.g., customer
+  behavior patterns that predicted churn pre-pandemic no longer predict
+  churn the same way post-pandemic, even though the FEATURE
+  distributions themselves look similar). Harder to detect than data
+  drift because it requires comparing model PREDICTIONS against actual
+  outcomes/labels over time, not just input distributions — which
+  requires ground-truth labels to become available with some delay
+  (Section 9's "label latency" problem) rather than being detectable
+  purely from input data alone.
+  Interview framing, precisely stated: "Data drift is detectable from
+  inputs alone, without waiting for labels. Concept drift requires
+  labels to detect directly, because it's specifically about whether the
+  input-to-output relationship has changed, not just whether the inputs
+  themselves look different — that's why concept drift often surfaces
+  later than data drift, purely because of label latency."
+
+PERFORMANCE MONITORING (when ground-truth labels ARE available with
+reasonable latency)
+  Tracking the actual model quality metric (accuracy, AUC, RMSE,
+  precision/recall) on live production predictions once true outcomes
+  are known — the most direct, unambiguous signal of model health, but
+  only available for the (often delayed) subset of predictions where
+  ground truth eventually arrives (e.g., "did this transaction actually
+  turn out to be fraud" might not be confirmed for days/weeks).
+
+PREDICTION DRIFT (a useful proxy when labels are slow/unavailable)
+  Monitoring the distribution of the model's OUTPUT predictions
+  themselves over time (e.g., "the fraud model used to flag 2% of
+  transactions as high-risk, it's now flagging 8%") — doesn't require
+  ground truth at all, and a sudden shift is a strong, actionable signal
+  worth investigating even before labels confirm whether it represents a
+  genuine problem or a genuine change in the underlying population.
+
+DATA QUALITY MONITORING FOR MODEL INPUTS (distinct from drift)
+  Standard data quality checks (null rates, schema conformance,
+  value-range checks, referential integrity against feature tables)
+  applied specifically to the features flowing into a model at inference
+  time — reusing exactly the same DLT expectations / Great Expectations
+  patterns from your existing Databricks handbook and System Design
+  handbook, applied to the ML inference pipeline's inputs as a
+  first-class monitored surface, not just the general data pipeline.
+
+MONITORING INFRASTRUCTURE PATTERN
+  Log every inference request's inputs, outputs, model version, and
+  timestamp into a queryable table (a straightforward fact-table
+  modeling exercise — grain = one row per inference call, Data Modeling
+  handbook Section 5) — this inference log is the foundation both drift
+  detection and performance monitoring are computed FROM, typically via
+  a scheduled batch job comparing recent windows against a reference
+  baseline and alerting on threshold breaches, directly reusing standard
+  DE pipeline/orchestration patterns rather than requiring exotic
+  ML-specific infrastructure.
+
+================================================================================
+8. A/B TESTING AND ONLINE EVALUATION FOR ML
+================================================================================
+
+WHY OFFLINE EVALUATION ISN'T SUFFICIENT ON ITS OWN
+  Offline metrics (measured against a held-out test set) tell you the
+  model is statistically better on historical data — they don't
+  guarantee the model produces better real-world BUSINESS outcomes,
+  because offline test sets can't fully capture feedback loops, changed
+  user behavior in response to the model's own predictions, or subtle
+  distribution differences between historical and live traffic. A/B
+  testing measures actual causal business impact under real production
+  conditions, which is the only fully trustworthy signal for a launch
+  decision on anything with meaningful business stakes.
+
+A/B TEST DESIGN FOR ML MODELS
+  Randomly assign live traffic between the control (current production
+  model) and treatment (candidate new model) arms, measure the actual
+  business metric the model is meant to influence (click-through rate,
+  conversion, fraud losses avoided — NOT just the offline ML metric),
+  and require statistical significance before declaring a winner —
+  directly reuses standard A/B testing statistical rigor (proper
+  randomization, adequate sample size/power, avoiding peeking at results
+  before reaching planned sample size) that applies to any product
+  experimentation, now applied specifically to comparing model versions.
+
+INTERLEAVING (an ML-specific alternative to standard A/B testing, worth
+naming for recommendation/ranking systems specifically)
+  Instead of splitting USERS between control and treatment, interleave
+  results from both models within the SAME user's session (e.g.,
+  alternating which model's recommended items appear in a ranked list)
+  and measure which model's items get more engagement — requires
+  meaningfully fewer users/less traffic to reach statistical significance
+  than standard between-user A/B testing for ranking-quality
+  comparisons specifically, a genuinely useful, less commonly known
+  technique worth mentioning if a ranking/recommendation system design
+  question comes up.
+
+GUARDRAIL METRICS
+  Beyond the primary metric being optimized, an A/B test for a model
+  change should monitor GUARDRAIL metrics that must not regress even if
+  the primary metric improves (e.g., a recommendation model that
+  improves click-through rate but increases returns/refunds, or a fraud
+  model that reduces false negatives but spikes false positives harming
+  legitimate customer experience) — a mature answer names this
+  explicitly: "I wouldn't ship a model purely because the primary metric
+  improved without checking it didn't regress something else that
+  matters just as much."
+
+================================================================================
+9. RETRAINING STRATEGIES
+================================================================================
+
+SCHEDULED RETRAINING
+  Retrain on a fixed cadence (daily/weekly/monthly) regardless of
+  detected drift — simplest to operate, appropriate when the underlying
+  data distribution is known to shift gradually and predictably (e.g.,
+  seasonal retail patterns), and the cost of periodic retraining is low
+  relative to the risk of missing a drift window.
+
+TRIGGERED RETRAINING (drift/performance-based)
+  Retrain when monitoring (Section 7) detects drift or performance
+  degradation crossing a defined threshold, rather than on a fixed
+  calendar — more responsive to actual need, avoids unnecessary
+  retraining cost when the model is still performing well, but requires
+  reliable, well-calibrated monitoring to trigger on (a noisy/poorly-
+  tuned drift detector causes either wasted retraining churn from false
+  triggers, or missed regressions from under-sensitive thresholds).
+
+CONTINUOUS / ONLINE LEARNING
+  The model updates incrementally as new labeled data arrives, rather
+  than periodic full retraining from scratch — appropriate for
+  high-velocity, rapidly-shifting domains (e.g., ad click prediction)
+  where even daily retraining lags too far behind actual behavior
+  shifts, at the cost of significantly more operational complexity
+  (risk of the model drifting based on a bad batch of recent data,
+  harder reproducibility, need for careful safeguards against feedback
+  loops where the model's own predictions influence the data it's
+  next trained on).
+
+LABEL LATENCY — THE PRACTICAL CONSTRAINT SHAPING RETRAINING CADENCE
+  Retraining cadence is fundamentally bounded by how quickly ground-
+  truth labels become available (a fraud model can't retrain faster than
+  confirmed fraud outcomes arrive; a churn model can't retrain faster
+  than churn itself is observable, often a 30/60/90-day definition) —
+  worth stating this constraint explicitly when discussing retraining
+  cadence, since it's a real, concrete limiting factor independent of
+  compute cost or pipeline sophistication.
+
+RETRAINING PIPELINE AUTOMATION
+  A production retraining pipeline should be a fully automated,
+  versioned pipeline (not a data scientist manually re-running a
+  notebook) — new training data pulled from the (point-in-time correct)
+  feature store, training executed, evaluated against the CI/CD quality
+  gates from Section 6, and only promoted to the registry/deployed if it
+  passes — closing the loop from Section 2's lifecycle diagram into a
+  genuinely automated system rather than a manually-triggered one-off
+  process.
+
+================================================================================
+10. MODEL GOVERNANCE, REPRODUCIBILITY, AND ROLLBACK
+================================================================================
+
+MODEL CARDS / DOCUMENTATION
+  Structured documentation accompanying a registered model: intended
+  use case, training data description, known limitations, evaluated
+  performance across relevant slices, and any ethical/fairness
+  considerations — increasingly a compliance expectation (and good
+  practice regardless) for models with real business/customer impact,
+  worth naming as a governance artifact alongside the registry entry
+  itself.
+
+ROLLBACK STRATEGY
+  Given a model registry with versioned models and a rollout strategy
+  supporting fast traffic-switching (blue-green, or a canary that can be
+  reverted), rolling back to a previous known-good model VERSION should
+  be a fast, low-risk, well-rehearsed operation — not a novel
+  incident-response scramble. A strong interview point: "the model
+  registry's version history is what makes rollback fast — I always
+  know exactly which prior version was serving successfully and can
+  redirect traffic back to it immediately while investigating the
+  regression, rather than needing to retrain or hotfix under pressure."
+
+REGULATORY / COMPLIANCE CONSIDERATIONS
+  For models influencing consequential decisions (credit, hiring,
+  insurance, healthcare), explainability requirements (being able to
+  explain WHY a specific prediction was made, via techniques like SHAP/
+  feature importance) and audit trails (exactly what model version, what
+  input data, produced a specific historical decision) become hard
+  requirements, not nice-to-haves — worth naming if a design scenario
+  touches a regulated domain, tying back to the same lineage/audit-log
+  infrastructure (Unity Catalog lineage, inference logging from Section
+  7) already built for monitoring purposes.
+
+================================================================================
+11. INFRASTRUCTURE PATTERNS: TRAINING vs. INFERENCE COMPUTE
+================================================================================
+
+TRAINING COMPUTE CHARACTERISTICS
+  Bursty, high-intensity, often GPU-bound for deep learning workloads,
+  tolerant of longer job duration — well-suited to ephemeral,
+  autoscaled clusters (spun up for a training job, torn down after,
+  directly reusing the ephemeral job cluster cost pattern from the
+  Databricks/Spark handbooks) and Spot/preemptible instances for
+  fault-tolerant, checkpointed training runs.
+
+INFERENCE COMPUTE CHARACTERISTICS
+  For batch inference: similar profile to any other batch Spark job —
+    ephemeral clusters, standard cost optimization patterns apply
+    directly.
+  For online/real-time inference: needs ALWAYS-AVAILABLE, low-latency,
+    autoscaling serving infrastructure with a real availability SLA —
+    a fundamentally different operational profile from training compute,
+    closer to standard production microservice infrastructure than to a
+    batch data pipeline; this is why dedicated model-serving platforms
+    (Databricks Model Serving, SageMaker Endpoints, KServe on
+    Kubernetes) exist as distinct infrastructure from training
+    infrastructure, optimized for request/response latency and uptime
+    rather than throughput over a large batch.
+
+GPU vs. CPU SERVING
+  Deep learning models (especially large ones) often need GPU inference
+  for acceptable latency; classical ML models (gradient-boosted trees,
+  linear models) typically serve efficiently on CPU — a genuinely
+  practical cost/architecture decision point worth naming: "matching the
+  serving hardware to the actual model type rather than defaulting to
+  GPU everywhere is a real cost lever, the same 'don't use a bigger tool
+  than the task needs' principle as model tiering in the GenAI
+  handbook."
+
+MODEL SERVING AT SCALE — BATCHING AND CACHING
+  Dynamic request batching (grouping multiple incoming inference
+  requests together to process as one batch on the serving hardware,
+  within a small latency budget) improves throughput/hardware
+  utilization for online serving, directly analogous to Kafka producer
+  batching's throughput-vs-latency tradeoff (Streaming & Kafka handbook,
+  Section 3) — worth drawing that connection explicitly to show the
+  tradeoff pattern recurs across the stack.
+
+================================================================================
+12. COMMON DESIGN PROBLEMS (WORKED EXAMPLES)
+================================================================================
+
+--------------------------------------------------------------------------------
+PROBLEM A: Design a production ML system for real-time fraud scoring with
+full MLOps lifecycle (training, deployment, monitoring, retraining)
+--------------------------------------------------------------------------------
+  Feature pipeline: offline feature store (Delta, point-in-time correct,
+  Section 3) for training + online low-latency store (Redis/DynamoDB)
+  for real-time serving, both generated from one shared feature
+  definition to prevent training/serving skew.
+  Training: scheduled retraining (e.g., weekly) PLUS triggered
+  retraining on drift detection, since fraud patterns can shift abruptly
+  (fraud rings adapting to a known model); training runs logged via
+  experiment tracking, evaluated against CI quality gates (Section 6)
+  including a required comparison against current production
+  performance, not just an absolute threshold.
+  Deployment: online real-time serving (sub-second SLA at checkout),
+  rolled out via shadow deployment first (score live traffic, log
+  predictions, don't act on them) then canary (small % of real
+  decisions) before full rollout — given the direct financial and
+  customer-experience stakes of a bad fraud model, this staged rollout
+  is non-negotiable, not optional rigor.
+  Monitoring: prediction drift (fraud-flag rate) monitored continuously
+  since it needs no label latency; true performance monitoring (actual
+  fraud outcome vs. prediction) lags by the time it takes chargebacks/
+  confirmed fraud reports to arrive — both signals tracked, with
+  prediction drift as the earlier, faster warning signal.
+  Rollback: model registry + blue-green-style traffic switching enables
+  immediate rollback to the last known-good model version if monitoring
+  flags a regression, without waiting for a new training cycle.
+
+--------------------------------------------------------------------------------
+PROBLEM B: A recommendation model's offline evaluation metrics look great,
+but production engagement dropped after rollout. Diagnose.
+--------------------------------------------------------------------------------
+  First check: was the rollout staged (shadow/canary) or did it flip to
+  100% directly — if direct, that's a process gap independent of this
+  incident, worth fixing regardless of root cause.
+  Check training/serving skew: are the online feature values at
+  inference time actually computed identically to how offline training
+  features were computed — a subtle skew (e.g., a stale online feature
+  due to a lagging streaming pipeline) can make a model that scored well
+  offline behave differently in production, since it's effectively
+  seeing a different feature distribution than it was evaluated on.
+  Check guardrail metrics, not just the primary metric: did the "offline
+  metric" being optimized (e.g., predicted click-through) actually
+  diverge from the real business metric (engagement, satisfaction) —
+  offline ranking metrics can look better while a genuinely worse set of
+  items gets surfaced to users in aggregate, especially if the offline
+  eval set doesn't fully represent live traffic's distribution.
+  Check for a feedback loop: if the new model changed what users are
+  shown, user behavior itself may have shifted in response (users
+  learning to ignore a recommendation carousel that got less relevant),
+  which an offline static test set inherently cannot capture — this is
+  exactly why A/B testing under real, live conditions (Section 8) is
+  necessary even after strong offline results.
+
+================================================================================
+13. INTERVIEW QUESTION BANK WITH MODEL ANSWERS
+================================================================================
+
+Q: "What's the difference between data drift and concept drift, and why
+   does the distinction matter operationally?"
+A: "Data drift is a shift in the input feature distribution — detectable
+   purely from inputs, no labels needed, so it can be monitored
+   continuously and catches problems early. Concept drift is a shift in
+   the relationship between inputs and the true outcome — detecting it
+   requires comparing predictions against actual ground-truth labels,
+   which often arrive with real delay. Practically, that means I'd
+   monitor data/prediction drift as a fast, always-available early
+   warning signal, and treat performance-metric monitoring against
+   actual labels as a slower, delayed but more definitive confirmation
+   signal — I wouldn't wait for labels to notice something's wrong if
+   input drift is already flagging it."
+
+Q: "How do you prevent training/serving skew?"
+A: "Define the feature transformation logic once, in a feature store or
+   shared code, and generate both the offline batch computation and the
+   online real-time computation from that single definition rather than
+   hand-implementing the logic twice in different languages/systems.
+   Any place where the same logical feature has two independent
+   implementations is a place training/serving skew can creep in
+   silently, since offline evaluation would never catch it — it only
+   shows up once the model is actually serving live traffic."
+
+Q: "Walk me through how you'd roll out a new model version safely."
+A: "Shadow deployment first — run the new model on live traffic,
+   log its predictions, but don't act on them, purely to validate
+   real-world behavior with zero risk. Then canary — let it make actual
+   decisions for a small percentage of traffic, monitoring both the
+   primary metric and guardrail metrics against the current production
+   model. Only after that looks healthy would I ramp to full traffic,
+   and I'd want the ability to roll back to the previous registered
+   model version quickly at any stage if something regresses."
+
+Q: "How would you decide between batch, streaming, and real-time
+   inference for a given model?"
+A: "I'd ask whether a specific live user request needs this prediction
+   synchronously right now — if yes, real-time serving. If not, but it
+   needs to be fresh within seconds to minutes without blocking a live
+   request, streaming inference. Otherwise, batch — it's the cheapest
+   and operationally simplest option, and I'd default to it unless
+   there's a genuine latency requirement forcing something more complex,
+   the same logic as the batch-versus-streaming decision for any other
+   data pipeline."
+
+Q: "Why isn't a good offline evaluation metric sufficient to greenlight a
+   model launch?"
+A: "Offline metrics measure performance against historical, static data
+   — they can't capture feedback loops where the model's own output
+   changes future user behavior, and they can't fully guarantee the live
+   feature pipeline matches the training pipeline's assumptions. A/B
+   testing under real production conditions measures actual causal
+   business impact, which is the only fully trustworthy signal for a
+   launch decision on anything with real stakes — I'd treat a strong
+   offline result as a necessary gate to even attempt a launch, not as
+   sufficient justification to fully ship."
+
+================================================================================
+14. QUICK-REFERENCE CHEAT SHEET
+================================================================================
+
+ML LIFECYCLE LOOP
+  Data -> Features -> Train -> Evaluate -> Deploy -> Monitor -> (triggers)
+  Retrain -> back to Train
+
+TRAINING/SERVING SKEW, ONE FIX
+  Define feature logic once, generate both online and offline paths from
+  it — never hand-implement the same feature twice.
+
+POINT-IN-TIME CORRECTNESS
+  Join features to labels AS OF the label's timestamp — same mechanism
+  as an SCD Type 2 "as of" join.
+
+DEPLOYMENT PATTERN DECISION
+  Needs synchronous response now -> Online/real-time
+  Needs freshness in seconds-minutes, no live block -> Streaming
+  Neither -> Batch (default, cheapest)
+
+ROLLOUT STAGES (always in this order)
+  Shadow (log only, no impact) -> Canary (small % real traffic) -> Full
+  rollout, with rollback available at every stage
+
+DRIFT TYPES
+  Data drift -> input distribution shift, detectable from inputs alone
+    (PSI, KS test, chi-squared)
+  Concept drift -> input-to-output relationship shift, requires labels
+    to detect, often delayed by label latency
+  Prediction drift -> output distribution shift, no labels needed, fast
+    proxy signal
+
+CI/CD FOR ML, BEYOND STANDARD TESTS
+  Data validation -> schema/distribution checks on training data
+  Model quality gate -> metric threshold + comparison vs. current
+    production model
+  Slice/behavioral tests -> catch regressions on important subgroups
+  Latency/resource tests -> for online-serving models specifically
+
+RETRAINING TRIGGER TYPES
+  Scheduled (fixed cadence) | Triggered (drift/performance threshold) |
+  Continuous/online (incremental updates, high operational complexity)
+  All bounded by label latency — can't retrain faster than ground truth
+  arrives.
+
+A/B TESTING FOR ML
+  Measure the real business metric, not just the offline ML metric.
+  Track guardrail metrics alongside the primary metric.
+  Interleaving = alternative to standard A/B for ranking/recommendation
+  comparisons, needs less traffic for significance.
+
+ROLLBACK REQUIREMENT
+  Model registry + fast traffic-switching rollout strategy = rollback is
+  a fast, rehearsed operation, not an incident-time scramble.
+
+================================================================================
+END OF HANDBOOK
+================================================================================
