@@ -1,0 +1,833 @@
+================================================================================
+MOCK INTERVIEW QUESTION BANK — COMPLETE (2026)
+MAANG / Top-Tier Tech Interview Preparation — Data & AI Engineer Track
+================================================================================
+Companion to: EVERY handbook in this library. This file is deliberately
+QUESTION-FIRST, not explanation-first — each question is tagged with
+[difficulty] [company flavor] [-> handbook pointer], so you can drill without
+re-reading full explanations. Use it to self-test, not to learn concepts cold.
+
+This handbook is standalone as a question bank, but answers assume you've
+studied the referenced handbook sections. No external references required.
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+ 1. How to Use This Bank
+ 2. Round Types You'll Actually Face
+ 3. Track A — SQL & Data Modeling Questions (25)
+ 4. Track B — Spark / Databricks Internals Questions (25)
+ 5. Track C — Streaming & Kafka Questions (20)
+ 6. Track D — System Design Prompts (15 full prompts)
+ 7. Track E — Cloud & Infrastructure Questions (15)
+ 8. Track F — GenAI / Agentic AI / MLOps Questions (25)
+ 9. Track G — Coding & DSA Drills (15)
+10. Track H — Orchestration Questions (15)
+11. Company-Flavored Tracks
+12. Full Mock Loop Simulation (a complete onsite day)
+13. Self-Assessment Rubric
+14. Rapid-Fire Round (60 one-liners for warm-up/cooldown)
+
+================================================================================
+1. HOW TO USE THIS BANK
+================================================================================
+
+  - Difficulty tags: [E] Easy/screening-level, [M] Mid-level onsite, [H]
+    Hard/senior-level or bar-raiser-style.
+  - Company flavor tags: [AMZN] [GOOG] [META] [NFLX] [DBX] [SNOW] [GEN]
+    (generic/any company) — reflects the STYLE of question that
+    company's loops disproportionately favor, not that the question is
+    exclusive to them.
+  - Pointers like "-> SD.P3" mean System Design handbook, Problem 3;
+    "-> SI.6" means Spark Internals handbook, Section 6. Use these to
+    go build/verify your answer against the source material, not to
+    skip the thinking.
+  - Best practice: answer OUT LOUD or in writing before checking the
+    pointer. If you go straight to the handbook, you're studying, not
+    drilling — do both, at different times.
+  - Recommended cadence: once you've been through Phases 1-6 of the
+    Master Index study sequence, spend the final 1-2 weeks doing FULL
+    mock loops (Section 12) rather than isolated question drilling.
+
+================================================================================
+2. ROUND TYPES YOU'LL ACTUALLY FACE
+================================================================================
+
+  PHONE SCREEN / OA: 1-2 SQL or coding problems, sometimes a lightweight
+    "tell me about a project" — Tracks A/G, [E]-[M] difficulty.
+  TECHNICAL DEEP DIVE: "walk me through a project you built" followed by
+    increasingly pointed follow-ups probing whether you actually
+    understand what you built — Tracks A-C, F, H, all difficulties.
+  SYSTEM DESIGN: one open-ended design prompt, 45 minutes — Track D.
+  CODING: 1-2 algorithmic problems, sometimes SQL-as-algorithm — Track G.
+  BAR RAISER / HIRING MANAGER: mix of technical + behavioral, often the
+    most senior interviewer, asks the hardest follow-ups across every
+    track — treat every track's [H] questions as bar-raiser material.
+  BEHAVIORAL: not deeply covered in this file (a dedicated playbook is
+    still pending per the Master Index gap tracker) — but Section 12's
+    mock loop includes placeholder behavioral prompts so you can
+    simulate a full day.
+
+================================================================================
+3. TRACK A — SQL & DATA MODELING QUESTIONS (25)
+================================================================================
+
+[E][GEN] 1. Write a query to find the second-highest salary per
+  department. -> Advanced SQL handbook
+
+[E][GEN] 2. What's the difference between RANK(), DENSE_RANK(), and
+  ROW_NUMBER()? Give an example where the choice changes the result.
+  -> DM.5, Coding.11
+
+[E][GEN] 3. Explain the grain of a fact table and why it matters, using
+  an example where getting it wrong causes double-counting.
+  -> DM.5
+
+[M][GEN] 4. Write a query to find users with 3+ consecutive days of
+  activity (gaps-and-islands). -> Advanced SQL handbook, Coding.16 P1
+
+[M][AMZN] 5. Given an orders table and a returns table, write a query
+  computing net revenue per product per month, handling returns that
+  happen in a different month than the original order.
+
+[M][GEN] 6. Implement SCD Type 2 logic in SQL using MERGE — walk through
+  both the "expire old row" and "insert new row" steps. -> DM.7
+
+[M][GEN] 7. What's the difference between SCD Type 2 and SCD Type 4, and
+  when would you choose Type 4 over Type 2? -> DM.7
+
+[H][GOOG] 8. Design a query (or set of queries) to detect an "accumulating
+  snapshot" fact table's data quality issue: a row where a later-stage
+  timestamp is EARLIER than an earlier-stage timestamp (impossible
+  in a valid funnel). -> DM.5, DM.15 P3
+
+[M][GEN] 9. What's the difference between a star schema and a snowflake
+  schema? When, if ever, would you deliberately choose snowflake in
+  2026? -> DM.8
+
+[H][GEN] 10. Explain Data Vault modeling (hubs/links/satellites) and why
+  you'd use it as a staging layer rather than a presentation layer.
+  -> DM.9
+
+[M][GEN] 11. What's a role-playing dimension? Give an example with SQL
+  showing how you'd expose it via views. -> DM.6
+
+[E][GEN] 12. What's a degenerate dimension? Give an example.  -> DM.6
+
+[M][META] 13. Design a fact table for an A/B test exposure-logging
+  system. What's the grain? What are the measures?
+
+[H][GEN] 14. You're asked to build a "One Big Table" for an ML training
+  set. What are the tradeoffs versus keeping a star schema, and how
+  would you keep the OBT's underlying dimension logic in sync with the
+  governed star schema it's derived from? -> DM.10
+
+[M][GEN] 15. Write a query using a window function to compute a 7-day
+  trailing moving average of daily revenue. -> Advanced SQL handbook
+
+[M][GEN] 16. What's the difference between normalized (3NF) and
+  denormalized schema design, and why does an OLTP system want one and
+  an analytics system want the other? -> DM.2, DM.3
+
+[H][AMZN] 17. A finance stakeholder says yesterday's revenue number in
+  the gold mart doesn't match the source system. Walk through your
+  debugging process. -> DM.15 P1 (rollup), SD.8
+
+[M][GEN] 18. Explain a conformed dimension and why it matters when
+  scaling a warehouse across multiple teams. -> DM.6
+
+[M][GEN] 19. Write a recursive CTE to traverse an employee-manager
+  hierarchy and compute each employee's depth in the org chart.
+  -> Advanced SQL handbook, Coding.12
+
+[H][GEN] 20. Design the data model (grain, fact/dimension structure) for
+  a subscription business's MRR (Monthly Recurring Revenue) reporting.
+  Why does a pure transaction-fact model fail here? -> DM.15 P2
+
+[M][GEN] 21. What's SCD Type 6, and what specific requirement would push
+  you to use it over plain Type 2? -> DM.7
+
+[M][SNOW] 22. Explain how you'd implement idempotent upserts in
+  Snowflake using MERGE, and how that connects to safe pipeline
+  backfills. -> Snowflake handbook, Orchestration.6
+
+[H][GEN] 23. Given a table of raw change events (insert/update/delete
+  with before/after images), write SQL to reconstruct the current state
+  of each entity as of any given point in time. -> DM.13, Coding.13 P4
+
+[M][GEN] 24. What's a junk dimension and why would you use one instead
+  of several small separate dimension tables? -> DM.6
+
+[H][GEN] 25. You need to model a hiring pipeline (applied -> screened ->
+  interviewed -> offered -> hired) for a recruiting analytics dashboard.
+  What fact table type do you use, and why would a transaction-fact
+  model be the wrong choice here? -> DM.15 P3
+
+================================================================================
+4. TRACK B — SPARK / DATABRICKS INTERNALS QUESTIONS (25)
+================================================================================
+
+[E][GEN] 1. What's the difference between a narrow and a wide
+  transformation? Give two examples of each. -> SI.3
+
+[E][GEN] 2. Walk through what happens between calling .filter() and
+  calling .collect() on a DataFrame. -> SI.16 Q1
+
+[M][GEN] 3. Explain the Catalyst optimizer's pipeline from unresolved
+  logical plan to selected physical plan. -> SI.4
+
+[M][GEN] 4. Why are Python UDFs an "optimization barrier" for Catalyst?
+  What's the alternative for row-by-row Python logic at scale? -> SI.5
+
+[H][GEN] 5. Explain shuffle in detail — what happens on the map side and
+  the reduce side, and why is it expensive? -> SI.6
+
+[M][GEN] 6. Your join is slow. Walk through your diagnosis process using
+  .explain(). -> SI.16 Q2
+
+[H][DBX] 7. One task in a 200-task stage takes 25 minutes while the
+  other 199 finish in 30 seconds. Diagnose and fix. -> SI.7
+
+[M][GEN] 8. Explain the difference between a broadcast hash join and a
+  sort-merge join, and how Spark decides which to use. -> SI.8
+
+[H][GEN] 9. What does AQE actually change about query execution
+  compared to static Catalyst optimization? Name all three of its
+  runtime behaviors. -> SI.9
+
+[M][GEN] 10. What's the difference between coalesce() and repartition()?
+  When would you use each? -> SI.6, SI.16 Q3
+
+[H][GEN] 11. Explain Spark's Unified Memory Manager — how is memory
+  split between execution and storage, and what happens under memory
+  pressure? -> SI.10
+
+[M][GEN] 12. When should you .cache() a DataFrame, and when is caching
+  actively wasteful? -> SI.11
+
+[H][DBX] 13. Given an explain plan showing a SortMergeJoin where you
+  expected a BroadcastHashJoin, what would you check? -> SI.12 Ex2
+
+[M][GEN] 14. Explain Delta Lake's transaction log and how it provides
+  ACID guarantees on top of object storage that itself has no native
+  transactions. -> SI.15
+
+[M][GEN] 15. What's the difference between Z-ORDER and Liquid
+  Clustering? Why does Databricks favor Liquid Clustering in 2026?
+  -> SI.15
+
+[H][GEN] 16. Why does groupByKey get discouraged in favor of
+  reduceByKey / DataFrame aggregation? -> SI.16 Q3
+
+[M][GEN] 17. Explain data skipping in Delta Lake and how it works with
+  Z-ORDER/clustering to accelerate selective queries. -> SI.15
+
+[H][GEN] 18. Explain Change Data Feed (CDF) in Delta Lake — what problem
+  does it solve, and how does it connect to incremental pipeline
+  processing? -> SI.15, SD.12 Problem A
+
+[M][GEN] 19. What's data skew, and what's the salting technique for
+  fixing it manually when AQE's automatic handling isn't sufficient?
+  -> SI.7
+
+[H][GEN] 20. Explain whole-stage code generation and why a chain of
+  Python UDFs breaks it. -> SI.5
+
+[M][GEN] 21. What's the difference between MEMORY_ONLY and
+  MEMORY_AND_DISK storage levels for caching, and why is the latter
+  usually the safer default? -> SI.11
+
+[H][DBX] 22. A job's Azure/AWS bill spiked 5x this month with no change
+  in data volume. Walk through your investigation. -> Cloud handbooks,
+  Section 13 (Azure)/10 (AWS)
+
+[M][GEN] 23. Explain the difference between DBFS mounts and Unity
+  Catalog-governed external locations/volumes, and why the latter is
+  the 2026-recommended pattern. -> SI.8 (Azure/AWS Databricks sections)
+
+[H][GEN] 24. Walk through diagnosing a job that got 10x slower after a
+  code change with the same data volume. -> SI.16 Q5
+
+[M][GEN] 25. What's the difference between spill to memory and spill to
+  disk in the Spark UI, and what does visible spill tell you about your
+  job's resource sizing? -> SI.10
+
+================================================================================
+5. TRACK C — STREAMING & KAFKA QUESTIONS (20)
+================================================================================
+
+[E][GEN] 1. What does Kafka actually guarantee about message ordering?
+  -> SK.2, SK.7
+
+[E][GEN] 2. What's the difference between at-least-once and
+  exactly-once delivery, and how do you actually achieve exactly-once
+  in a real pipeline? -> SK.6
+
+[M][GEN] 3. Explain the role of acks, min.insync.replicas, and ISR in
+  Kafka's durability guarantees. -> SK.5
+
+[M][GEN] 4. Why do stream-stream joins in Spark Structured Streaming
+  require watermarks on both sides? -> SK.11
+
+[H][GEN] 5. Explain watermarking precisely — what does it bound, and
+  what does it trade away? -> SK.10
+
+[M][GEN] 6. What's the difference between tumbling, sliding, and session
+  windows? Give a use case for each. -> SK.10
+
+[H][NFLX] 7. Consumer lag is climbing steadily on a topic. Walk through
+  your diagnosis. -> SK.16 Q4
+
+[M][GEN] 8. What's the difference between BACKWARD, FORWARD, and FULL
+  schema compatibility modes? Which would you pick as a default for a
+  topic with many independent consumer teams? -> SK.8
+
+[H][GEN] 9. Explain log-based CDC (Debezium) and why it's preferred over
+  polling-based CDC. -> SK.12, SD.7 Problem 3
+
+[M][GEN] 10. What's the difference between Kafka Streams, Spark
+  Structured Streaming, and Flink? When would you choose each?
+  -> SK.13, SK.14
+
+[H][GEN] 11. Design a topic/partitioning scheme for a multi-tenant event
+  platform with wildly varying tenant sizes. -> SK.16 Problem B
+
+[M][GEN] 12. Explain the difference between startingOffsets="earliest"
+  and checkpoint-based offset resumption in Structured Streaming — why
+  does startingOffsets get ignored after a checkpoint exists? -> SK.9
+
+[H][GEN] 13. Why is foreachBatch + Delta MERGE the standard pattern for
+  idempotent streaming sinks? -> SK.9
+
+[M][GEN] 14. What's Trigger.AvailableNow, and why is it a cost-relevant
+  pattern for "near-real-time but not truly streaming" use cases? -> SK.9,
+  SI (Spark Internals streaming section)
+
+[H][GEN] 15. Explain RocksDB-backed state stores in Structured
+  Streaming — what problem do they solve? -> SK.9 (Stateful ops)
+
+[M][GEN] 16. What's log compaction in Kafka, and how does it differ from
+  time-based retention? -> SK.2
+
+[H][AMZN] 17. Design an exactly-once pipeline from Kafka to a Delta
+  table end-to-end, and explain precisely why it's exactly-once at
+  every hop. -> SK.16 Problem A
+
+[M][GEN] 18. What's the "hot partition" problem in Kafka, and what are
+  two mitigation strategies? -> SK.7
+
+[H][GEN] 19. Explain the difference between MSK and Kinesis on AWS, or
+  Event Hubs on Azure, in terms of actual Kafka protocol compatibility.
+  -> SK.7 (AWS/Azure services sections), Cloud AWS.7
+
+[M][GEN] 20. Why would you choose Kafka Streams over Spark Structured
+  Streaming for a given use case? -> SK.16 Q5
+
+================================================================================
+6. TRACK D — SYSTEM DESIGN PROMPTS (15 FULL PROMPTS)
+================================================================================
+
+Use the RADIO-DE framework (SD.2) for every one of these. Full worked
+answers for most exist in SD.7 — attempt cold first.
+
+[M][GEN] 1. Design a lakehouse platform for a global retailer with POS
+  and e-commerce data sources. -> SD.7 Problem 1
+
+[H][GEN] 2. Design a real-time clickstream analytics pipeline with a
+  10-30 second freshness SLA. -> SD.7 Problem 2
+
+[M][GEN] 3. Design a CDC pipeline replicating an OLTP database into a
+  lakehouse. -> SD.7 Problem 3
+
+[M][NFLX] 4. Design a log aggregation and monitoring pipeline for
+  thousands of microservices. -> SD.7 Problem 4
+
+[H][META] 5. Design the data pipeline behind a recommendation system,
+  covering both offline training and online inference feature paths.
+  -> SD.7 Problem 5
+
+[H][AMZN] 6. Design a real-time fraud detection pipeline with a
+  sub-second scoring SLA. -> SD.7 Problem 6
+
+[M][GEN] 7. Design a batch data warehouse for e-commerce finance/BI
+  reporting. -> SD.7 Problem 7
+
+[M][GEN] 8. Design a notification/alerting pipeline that avoids
+  duplicate/spam notifications. -> SD.7 Problem 8
+
+[H][GEN] 9. Design a multi-tenant SaaS analytics platform for hundreds
+  of customers with strict data isolation requirements. -> SD.7 Problem 9
+
+[H][GOOG] 10. Design a system to detect and alert on data quality
+  regressions across a lakehouse with hundreds of tables, without
+  drowning the on-call team in false positives.
+
+[H][GEN] 11. Design the ingestion and freshness architecture for an
+  internal RAG-based knowledge assistant over Confluence/Slack/Drive
+  with per-user permissions. -> GenAI.15 Problem A
+
+[H][GEN] 12. Design a production ML system for real-time fraud scoring,
+  covering the full MLOps lifecycle (training, deployment, monitoring,
+  retraining). -> MLOps.12 Problem A
+
+[M][GEN] 13. Design the orchestration for a daily medallion pipeline
+  with a hard 6 AM BI freshness SLA. -> Orchestration.14 Problem A
+
+[H][AMZN] 14. Design a secure Databricks-on-AWS (or Azure) lakehouse
+  where data never traverses the public internet and no credentials are
+  ever stored in code. -> Cloud AWS.12 Problem A / Cloud Azure.12
+  Problem A
+
+[H][GEN] 15. Design a multi-agent system for automated data quality
+  incident triage: detect an anomaly, investigate root cause, draft
+  (not send) a remediation. -> Agentic AI.15 Problem B
+
+================================================================================
+7. TRACK E — CLOUD & INFRASTRUCTURE QUESTIONS (15)
+================================================================================
+
+[E][AZURE] 1. What's the difference between a managed identity and a
+  service principal on Azure, and which should you prefer? -> Cloud
+  Azure.3
+
+[E][AWS] 2. What's the difference between an IAM role and a static IAM
+  user access key, and which should you prefer? -> Cloud AWS.3
+
+[M][AWS] 3. Explain how IAM resolves conflicting Allow/Deny policy
+  statements. -> Cloud AWS.3
+
+[M][GEN] 4. What's the difference between the Databricks control plane
+  and data plane, and why does that distinction matter for security?
+  -> Cloud Azure.8 / Cloud AWS.8
+
+[H][AZURE] 5. Design network isolation so a Databricks-on-Azure
+  lakehouse never sends data over the public internet. -> Cloud Azure.12
+  Problem A
+
+[H][AWS] 6. Same question for AWS — what's the S3-specific mechanism
+  that makes this both secure AND free? -> Cloud AWS.12 Problem A, Cloud
+  AWS Section 5 (Gateway endpoints)
+
+[M][AZURE] 7. Explain Azure Storage access tiers and how a lifecycle
+  policy would move bronze data through them over its retention period.
+  -> Cloud Azure.4
+
+[M][AWS] 8. Explain S3 storage classes and the durability-vs-availability
+  distinction specifically. -> Cloud AWS.4
+
+[M][GEN] 9. Compare ADLS Gen2's hierarchical namespace to S3's flat key
+  namespace — why did this historically matter for Spark commit
+  protocols, and how does Delta Lake sidestep the issue? -> Cloud AWS.4
+
+[H][GEN] 10. Design storage redundancy differently for a bronze layer
+  versus a compliance-critical gold layer. -> Cloud Azure.13 Q3
+
+[M][GEN] 11. What's the AWS equivalent of Azure Event Hubs, and why is
+  the distinction between "Kafka-protocol-compatible" and "actual
+  Kafka" a real, testable detail? -> Cloud AWS.7
+
+[M][GEN] 12. Explain the three-layer network isolation stack (VNet/VPC,
+  Private Endpoint/VPC Endpoint, NSG/Security Group) for securing
+  storage access. -> Cloud Azure.16 / Cloud AWS.16 Cheat Sheets
+
+[H][GEN] 13. When would you choose EMR over Databricks on AWS?
+  -> Cloud AWS.13 Q5
+
+[M][GEN] 14. What are the top 3 compute cost levers for a Databricks
+  workload on any cloud? -> Cloud Azure.10 / Cloud AWS.10
+
+[H][GEN] 15. Walk through a cost-optimized 5-year storage lifecycle for
+  a bronze layer that's hot for 30 days, warm for 90, then essentially
+  never accessed but must be retained for compliance. -> Cloud Azure.12
+  Problem B / Cloud AWS.12 Problem B
+
+================================================================================
+8. TRACK F — GENAI / AGENTIC AI / MLOPS QUESTIONS (25)
+================================================================================
+
+[E][GEN] 1. When would you use RAG versus fine-tuning? -> GenAI.10,
+  GenAI.16 Q1
+
+[M][GEN] 2. Why does chunk size matter so much for RAG retrieval
+  quality, and how would you actually decide on one? -> GenAI.7
+
+[M][GEN] 3. Explain hybrid search and why pure vector search alone often
+  isn't sufficient. -> GenAI.8
+
+[H][GEN] 4. How would you keep a RAG system's knowledge base fresh as
+  source documents change? -> GenAI.16 Q2
+
+[H][GEN] 5. A RAG system gives a wrong answer even though retrieval
+  found the right documents. Diagnose. -> GenAI.16 Q3
+
+[M][GEN] 6. How do you evaluate a RAG system without manually reading
+  every response? -> GenAI.9, GenAI.16 Q4
+
+[H][GEN] 7. What's the biggest data engineering challenge in a
+  production RAG system, versus the AI/modeling side? -> GenAI.16 Q5
+
+[E][GEN] 8. What are the three properties that make a system
+  "agentic" as opposed to just an LLM call with tools? -> Agentic.1,
+  Agentic.16 Q1
+
+[M][GEN] 9. How do you prevent an agent from taking a wrong,
+  consequential action it's confident about? -> Agentic.11, Agentic.16
+  Q2
+
+[H][GEN] 10. Explain prompt injection via tool outputs and why it's a
+  distinct concern for agentic systems specifically. -> Agentic.10,
+  Agentic.16 Q3
+
+[M][GEN] 11. How would you evaluate an agent beyond just checking if the
+  final answer is correct? -> Agentic.9, Agentic.16 Q4
+
+[M][GEN] 12. When would you use a multi-agent architecture instead of a
+  single agent? -> Agentic.7, Agentic.16 Q5
+
+[E][GEN] 13. What is MCP, and what problem does it solve that bespoke
+  tool integration code doesn't? -> Agentic.4
+
+[M][GEN] 14. What's training/serving skew in a feature store, and how
+  do you prevent it? -> MLOps.3, MLOps.13 Q2
+
+[H][GEN] 15. Explain point-in-time correctness for ML training data, and
+  connect it explicitly to SCD Type 2 join logic. -> MLOps.3, DM.13
+
+[M][GEN] 16. What's the difference between data drift and concept
+  drift, and why does the distinction matter operationally? -> MLOps.7,
+  MLOps.13 Q1
+
+[H][GEN] 17. Walk through a safe rollout strategy for a new model
+  version. -> MLOps.5, MLOps.13 Q3
+
+[M][GEN] 18. How would you decide between batch, streaming, and
+  real-time inference for a given model? -> MLOps.5, MLOps.13 Q4
+
+[H][GEN] 19. Why isn't a strong offline evaluation metric sufficient to
+  greenlight a model launch? -> MLOps.8, MLOps.13 Q5
+
+[H][GEN] 20. A recommendation model's offline metrics look great but
+  production engagement dropped after rollout. Diagnose. -> MLOps.12
+  Problem B
+
+[M][GEN] 21. Explain the difference between an offline and online
+  feature store, and why they use different modeling strategies for the
+  "same" logical feature. -> MLOps.3, DM.13
+
+[M][GEN] 22. What's LLM-as-judge, and what's the concrete risk of
+  trusting it uncalibrated? -> GenAI.9
+
+[H][GEN] 23. Design a customer support agent that can look up orders,
+  issue refunds (with approval), and answer product questions via RAG.
+  -> GenAI.15 Problem B
+
+[M][GEN] 24. What's the difference between shadow deployment and canary
+  deployment for a new model? -> MLOps.5
+
+[H][GEN] 25. Explain why concept drift is harder to detect than data
+  drift, precisely. -> MLOps.7
+
+================================================================================
+9. TRACK G — CODING & DSA DRILLS (15)
+================================================================================
+
+[E][GEN] 1. Deduplicate a list of records, keeping only the latest per
+  business key. State the complexity. -> Coding.4
+
+[E][GEN] 2. Implement a fixed-size sliding window maximum-sum
+  calculation in O(n). -> Coding.5
+
+[M][GEN] 3. Merge a list of overlapping (start, end) intervals.
+  -> Coding.6
+
+[M][GEN] 4. Implement a basic LRU cache with O(1) get/put. -> Coding.13
+  Problem 7
+
+[M][GEN] 5. Given a list of task dependencies, produce a valid execution
+  order (or detect a cycle). -> Coding.8
+
+[H][GEN] 6. Given task dependencies, determine the minimum number of
+  parallel "waves" needed to complete all tasks. -> Coding.13 Problem 11
+
+[M][GEN] 7. Find the top-K most frequent items in a list. State the
+  complexity versus a full sort. -> Coding.9
+
+[H][GEN] 8. Find the top-K most frequent words in a file too large to
+  fit in memory. -> Coding.13 Problem 8
+
+[M][GEN] 9. Implement a rate limiter tracking request count in the last
+  60 seconds. -> Coding.7
+
+[H][GEN] 10. Implement a running-median tracker over a stream using two
+  heaps. -> Coding.9
+
+[M][GEN] 11. Parse a CSV line by hand, correctly handling a delimiter
+  character inside quoted fields. -> Coding.10
+
+[H][GEN] 12. Given a CDC-style before/after snapshot pair, compute
+  inserts/updates/deletes. -> Coding.13 Problem 2
+
+[M][GEN] 13. In PySpark, find the top-3 highest-sales rows per category
+  using a window function. State which ranking function you'd use and
+  why. -> Coding.11
+
+[H][GEN] 14. In PySpark, deduplicate a table keeping the latest row per
+  business key using a Window function — and explain precisely why
+  dropDuplicates() would be the wrong choice here. -> Coding.11
+
+[M][GEN] 15. Given two large sorted files of IDs too big to fit in
+  memory, find IDs present in both. -> Coding.13 Problem 12
+
+================================================================================
+10. TRACK H — ORCHESTRATION QUESTIONS (15)
+================================================================================
+
+[E][GEN] 1. What's a DAG, and why must it be acyclic? -> Orch.2
+
+[M][GEN] 2. Explain Airflow's logical date / execution date semantics
+  precisely — a daily DAG's Jan 2nd run actually executes when?
+  -> Orch.5
+
+[M][GEN] 3. What's catchup=True doing by default, and why is it a
+  common production surprise? -> Orch.5
+
+[H][GEN] 4. Design a safe backfill for 3 weeks of gold tables affected
+  by a silver-layer bug that was just fixed. -> Orch.14 Problem B
+
+[M][GEN] 5. Why is idempotency a prerequisite for safe backfills?
+  -> Orch.6, Orch.15 Q2
+
+[M][GEN] 6. What's the difference between a task failing and an SLA
+  miss? -> Orch.7, Orch.15 Q1
+
+[M][GEN] 7. Explain exponential backoff for retries, and why NOT every
+  failure should retry. -> Orch.7
+
+[M][GEN] 8. What trigger_rule would you use for a "notify on failure"
+  task, and why would the default rule silently never fire it? -> Orch.4
+
+[H][GEN] 9. What's the difference between Lakeflow Declarative Pipelines
+  and Lakeflow Jobs? -> Orch.10, Orch.15 Q4
+
+[M][GEN] 10. When would you choose Airflow over Lakeflow Jobs, or vice
+  versa, for a Databricks-heavy shop? -> Orch.11, Orch.15 Q5
+
+[H][GEN] 11. Design alerting so your team doesn't get paged for every
+  transient retry. -> Orch.13, Orch.15 Q3
+
+[M][GEN] 12. What's XCom for, and what's the common misuse pattern to
+  avoid? -> Orch.9
+
+[H][GEN] 13. Design cross-system orchestration for a pipeline spanning a
+  SaaS API extract, Databricks transformation, and a Snowflake load.
+  What are the dependency-triggering options? -> Orch.12
+
+[M][GEN] 14. What's dynamic task mapping, and how does it differ from
+  hand-writing N nearly-identical tasks? -> Orch.8
+
+[H][GEN] 15. Design the orchestration for a daily medallion pipeline
+  with a hard 6 AM freshness SLA, including retry and alerting design.
+  -> Orch.14 Problem A
+
+================================================================================
+11. COMPANY-FLAVORED TRACKS
+================================================================================
+
+AMAZON — expect Leadership Principles woven into every technical
+answer, heavy cost-consciousness, AWS-native assumed stack.
+  Recommended drill set: Track A #5, #17; Track D #6, #14; Track C #17;
+  Track E #2, #6.
+  For every system design answer, explicitly narrate a cost tradeoff —
+  Amazon interviewers reward this even when not asked directly.
+
+GOOGLE — BigQuery-centric mental model, Dataflow/Beam for streaming,
+strong focus on correctness under distributed failure.
+  Recommended drill set: Track A #8; Track D #10; Track B (all —
+  correctness-under-failure reasoning transfers directly even without
+  BigQuery-specific experience).
+  Explicitly translate: wherever you'd say "Delta Lake," be ready to
+  explain the same concept for "BigQuery" if pushed (see Cloud
+  handbooks' equivalence tables for the general translation habit).
+
+META — massive-scale clickstream, A/B testing infrastructure heavy.
+  Recommended drill set: Track A #13; Track D #5; Track F #20, #24.
+  Expect a genuine, detailed A/B testing / experimentation design
+  question — MLOps.8 is your core prep for this.
+
+NETFLIX — streaming media telemetry, Kafka-heavy, chaos-engineering
+mindset ("what happens when this fails in production" asked explicitly
+and often).
+  Recommended drill set: Track C #7, #11; Track D #4.
+  For every design answer, proactively narrate a failure scenario and
+  recovery plan even if not asked — this is disproportionately valued
+  here specifically.
+
+DATABRICKS (as employer, or assumed stack elsewhere) — lakehouse-first
+vocabulary assumed by default.
+  Recommended drill set: Track B (all); Track H #9, #10; SD.7 Problem 1.
+  Reuse medallion architecture, Unity Catalog, and Lakeflow terminology
+  as your default vocabulary unless a question explicitly asks about a
+  non-Databricks stack.
+
+SNOWFLAKE (as employer, or assumed stack elsewhere) — warehouse-first,
+ELT-with-dbt vocabulary assumed by default.
+  Recommended drill set: Track A #22; Snowflake handbook's own question
+  bank if present; SD.7 Problem 7 reframed for Snowflake instead of a
+  generic warehouse.
+
+================================================================================
+12. FULL MOCK LOOP SIMULATION (A COMPLETE ONSITE DAY)
+================================================================================
+
+Simulate a real onsite by timing yourself through this sequence in one
+sitting (roughly 4-5 hours with breaks, matching a real onsite's pacing).
+Do this cold — no handbook open — then review afterward using the
+pointers.
+
+ROUND 1 — PHONE SCREEN STYLE (30 min)
+  - Track A #1, #6
+  - Track G #1
+
+ROUND 2 — TECHNICAL DEEP DIVE (45 min)
+  "Walk me through a data pipeline you built." Use your GlobalMart/
+  Coca-Cola Delta Live Tables project. Expect follow-ups drawn from:
+  - Track B #6, #12 (join/skew diagnosis on your actual pipeline)
+  - Track A #17 (a "the numbers don't match" style follow-up)
+  - Track H #5 (idempotency of your SCD2 MERGE logic specifically)
+
+ROUND 3 — CODING (45 min)
+  - Track G #5, then #6 as a follow-up extension
+  - Track G #10 as a stretch/bonus if time remains
+
+ROUND 4 — SYSTEM DESIGN (45 min)
+  - Pick ONE cold from Track D you haven't looked at recently. Full
+    RADIO-DE structure, 45-minute clock, no notes.
+
+ROUND 5 — BEHAVIORAL / BAR RAISER (45 min)
+  [Behavioral playbook is a pending gap — for now, prepare 3-4 STAR
+  stories from your actual project history: the GlobalMart pipeline
+  build, the PGT Gold Program PowerPoint/Copilot efficiency project, and
+  one story about a technical disagreement or mistake you owned. Expect
+  this round to ALSO probe technical depth — be ready for a Track B or
+  Track F question mixed in.]
+
+ROUND 6 — AI/GENAI FOCUSED (30-45 min, if applicable to the role)
+  - Track F #4, #9, #15
+
+DEBRIEF (do this immediately after, while it's fresh)
+  For every question: did you state complexity/tradeoffs unprompted?
+  Did you ask clarifying questions before diving into System Design?
+  Did you narrate a failure/cost/security consideration without being
+  asked? Score yourself against Section 13's rubric.
+
+================================================================================
+13. SELF-ASSESSMENT RUBRIC
+================================================================================
+
+Score each mock answer 0-2 on each dimension (0 = didn't do it, 1 =
+partial, 2 = did it well and unprompted):
+
+  [ ] Clarified requirements/assumptions before diving in
+  [ ] Stated complexity (time/space, or cost/latency) unprompted
+  [ ] Named the grain / made an implicit decision explicit (data
+      modeling questions)
+  [ ] Connected the answer to a concrete project/experience when
+      relevant
+  [ ] Proactively mentioned a failure mode, security concern, or cost
+      tradeoff without being asked
+  [ ] Gave a structured answer (framework-first, not stream-of-
+      consciousness)
+  [ ] Correctly used precise terminology (e.g., "exactly-once" framed
+      correctly per SK.6, not hand-waved)
+  [ ] Handled the follow-up question(s) without needing to walk back
+      the original answer
+
+  12-16: Onsite-ready for this topic.
+  8-11: Solid, but drill the specific dimensions you scored low on.
+  Below 8: Re-read the source handbook section before re-attempting.
+
+================================================================================
+14. RAPID-FIRE ROUND (60 ONE-LINERS FOR WARM-UP/COOLDOWN)
+================================================================================
+
+Answer each in one sentence, out loud, in under 10 seconds. Use these to
+warm up before a mock, or cool down after one.
+
+ 1. What does ACID stand for in the context of Delta Lake?
+ 2. Narrow or wide: filter(). Narrow or wide: groupBy().
+ 3. What's the default join Spark picks for two large tables?
+ 4. What's the Kafka guarantee on message ordering?
+ 5. What's the difference between SCD1 and SCD2 in one sentence?
+ 6. What does AQE stand for and what does it do in one sentence?
+ 7. What's a watermark in Structured Streaming, in one sentence?
+ 8. Broadcast join threshold default — roughly what size?
+ 9. What's the grain of a fact table?
+10. Star schema or snowflake — which is the 2026 default?
+11. What's the difference between coalesce and repartition?
+12. What does Z-ORDER do?
+13. Managed identity vs. service principal — which is preferred?
+14. IAM policy conflict resolution rule in one sentence?
+15. S3 durability vs. availability — which is "eleven nines"?
+16. What's the difference between data drift and concept drift?
+17. RAG solves what kind of gap — knowledge or behavior?
+18. Fine-tuning solves what kind of gap — knowledge or behavior?
+19. What are the three properties that make a system "agentic"?
+20. What's MCP, in one sentence?
+21. What's a DAG's defining constraint?
+22. What does catchup=True do by default in Airflow?
+23. What's the difference between a task failure and an SLA miss?
+24. What's the danger of putting a large DataFrame into an XCom?
+25. What's the difference between exactly-once and at-least-once?
+26. What's a conformed dimension?
+27. What's a degenerate dimension?
+28. What's the difference between OLTP normalization and analytics
+    denormalization, in one sentence?
+29. What ranking function do you use when ties should share a rank AND
+    you want no gaps afterward?
+30. What's the point-in-time correctness requirement for ML training
+    data?
+31. What's training/serving skew?
+32. What's the difference between a shadow deployment and a canary
+    deployment?
+33. What's the standard combo of settings for maximum Kafka durability?
+34. What's the difference between Kafka Streams and Spark Structured
+    Streaming, in one sentence?
+35. What's a factless fact table?
+36. What's an accumulating snapshot fact table used for?
+37. What's the difference between LRS, ZRS, and GRS on Azure?
+38. What's the AWS equivalent of an Azure managed identity?
+39. What's the difference between a Gateway and an Interface VPC
+    endpoint?
+40. What's the single biggest Databricks cost lever most teams miss?
+41. What's the difference between data quality checks and drift
+    monitoring?
+42. What's a golden dataset used for?
+43. What's LLM-as-judge, in one sentence?
+44. What's chunking, and why does chunk size matter?
+45. What's hybrid search combining?
+46. What's the difference between HNSW and IVF, in one sentence?
+47. What's a vector database's core operation called?
+48. What's the risk of an agent looping infinitely, and the mitigation?
+49. What's prompt injection via tool outputs?
+50. What's the difference between Lakeflow Jobs and Lakeflow
+    Declarative Pipelines?
+51. What's a Kafka consumer group's core guarantee?
+52. What's consumer lag, and why is it the top health metric?
+53. What's the difference between LRU cache get/put complexity — O(?)?
+54. What's a topological sort used for in orchestration?
+55. What's the difference between a Debezium-style CDC event's before
+    and after image?
+56. What's idempotency, in the context of pipeline retries/backfills?
+57. What's the difference between batch, micro-batch, and streaming,
+    in terms of latency SLA bands?
+58. What's a role-playing dimension?
+59. What's the difference between a hub and a satellite in Data Vault?
+60. What's the "one big table" tradeoff, in one sentence?
+
+(Answers are every one of these concepts, verbatim or near-verbatim,
+somewhere in this library — if you can't answer instantly, that's your
+signal for what to re-read before your next mock.)
+
+================================================================================
+END OF HANDBOOK
+================================================================================
