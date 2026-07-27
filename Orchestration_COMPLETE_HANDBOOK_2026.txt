@@ -1,0 +1,727 @@
+================================================================================
+ORCHESTRATION — COMPLETE HANDBOOK (2026)
+MAANG / Top-Tier Tech Interview Preparation
+================================================================================
+Companion to: Databricks_COMPLETE_HANDBOOK_2026, Spark_Internals_Deep_Dive_COMPLETE_HANDBOOK_2026,
+System_Design_for_Data_Engineers_COMPLETE_HANDBOOK_2026,
+Streaming_and_Kafka_COMPLETE_HANDBOOK_2026, Coding_and_DSA_for_Data_Engineers_COMPLETE_HANDBOOK_2026
+
+This handbook is standalone. No external references required. It covers
+pipeline orchestration — Airflow as the industry-standard vocabulary, Databricks
+Lakeflow Jobs as the 2026 lakehouse-native alternative, and the operational
+patterns (backfills, retries, sensors, SLAs) that separate "I can write a DAG"
+from "I can run a production orchestration platform."
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+ 1. Why Orchestration Is Its Own Discipline
+ 2. DAGs — The Conceptual Foundation (ties to Coding & DSA handbook)
+ 3. Airflow Architecture Deep Dive
+ 4. Writing DAGs: Operators, Sensors, Task Dependencies
+ 5. Scheduling Semantics — The Part Everyone Gets Wrong
+ 6. Backfills and Catchup
+ 7. Retries, SLAs, and Failure Handling
+ 8. Dynamic DAGs and Task Mapping
+ 9. XComs and Cross-Task Communication
+10. Databricks Lakeflow Jobs — The 2026 Lakehouse-Native Alternative
+11. Airflow vs. Lakeflow Jobs vs. Dagster vs. Step Functions — When to Use What
+12. Orchestrating Across Systems (multi-engine pipelines)
+13. Observability, Alerting, and On-Call for Pipelines
+14. Common Design Problems (worked examples)
+15. Interview Question Bank with Model Answers
+16. Quick-Reference Cheat Sheet
+
+================================================================================
+1. WHY ORCHESTRATION IS ITS OWN DISCIPLINE
+================================================================================
+
+Writing a single Spark job or dbt model is a solved, well-understood
+problem. Running HUNDREDS of interdependent jobs, across multiple engines
+and teams, reliably, on a schedule, with correct handling of late data,
+partial failures, and backfills — that's a genuinely different problem,
+and it's the specific problem orchestration tools exist to solve.
+Interviewers probe orchestration to check whether a candidate has actually
+operated a production pipeline estate, not just authored individual jobs
+in isolation — the questions cluster around exactly the failure modes that
+only show up at that estate-wide scale: a DAG that silently stopped
+running, a backfill that re-triggered downstream jobs unexpectedly, an
+SLA breach nobody was alerted to.
+
+================================================================================
+2. DAGs — THE CONCEPTUAL FOUNDATION (TIES TO CODING & DSA HANDBOOK)
+================================================================================
+
+A DAG (Directed Acyclic Graph) represents tasks as nodes and dependencies
+as directed edges, with NO CYCLES — a task can't (directly or
+transitively) depend on itself, since that would make a valid execution
+order impossible to determine. This is the exact same structure and the
+exact same algorithm (topological sort, Coding & DSA handbook Section 8)
+underlying every orchestration tool's scheduling logic: given a DAG,
+determine a valid execution order (or detect a cycle, which every
+orchestrator rejects at DAG-parse time, not at runtime).
+
+WHY "ACYCLIC" IS NON-NEGOTIABLE
+  If task A depended on task B, and task B depended on task A, there is
+  no valid order to run them in — every orchestrator validates this at
+  DAG registration/parse time and refuses to schedule a cyclic graph,
+  precisely because a topological sort is undefined for a graph with a
+  cycle (Coding & DSA handbook's cycle-detection logic is exactly what's
+  running under the hood).
+
+TASK GRANULARITY — A REAL DESIGN DECISION, NOT A DETAIL
+  Too coarse (one giant task doing ingestion + transformation + load):
+  a failure anywhere forces a full re-run of the whole task, losing all
+  partial progress, and makes debugging harder (which part failed?).
+  Too fine (a task per single row-level operation): scheduling overhead
+  dominates, and the DAG becomes unreadable. The right granularity
+  generally aligns with logical, independently-retriable units of work —
+  typically one task per meaningful pipeline stage (extract, load-bronze,
+  transform-silver, aggregate-gold), each independently retriable without
+  redoing the others' work, directly mirroring the medallion architecture
+  layering from your Databricks handbook.
+
+================================================================================
+3. AIRFLOW ARCHITECTURE DEEP DIVE
+================================================================================
+
+SCHEDULER
+  The component that parses DAG files, determines which tasks are ready
+  to run (dependencies met, schedule interval elapsed), and queues them
+  for execution — the scheduler is the heart of Airflow and historically
+  the most common source of Airflow-specific operational problems
+  (scheduler lag under a large number of DAGs, DAG-parsing overhead).
+
+EXECUTOR
+  Determines HOW and WHERE tasks actually run. Key executor types:
+    SequentialExecutor: runs one task at a time, single process — dev/
+      testing only, never production.
+    LocalExecutor: parallel execution on a single machine — small-scale
+      production use.
+    CeleryExecutor: distributes task execution across a pool of worker
+      machines via a message queue (Redis/RabbitMQ) — the traditional
+      horizontally-scaled production pattern.
+    KubernetesExecutor: launches each task as its own Kubernetes pod,
+      scaling to zero when idle — the dominant modern pattern for cloud-
+      native Airflow deployments, since it gives per-task resource
+      isolation and elastic scaling without maintaining a standing worker
+      pool.
+
+METADATA DATABASE
+  Stores DAG run history, task instance states, variables, connections —
+  the source of truth the scheduler and webserver both read from/write
+  to; a genuinely common real-world operational concern is this database
+  becoming a bottleneck at very large DAG/task-instance volume, worth
+  naming if asked about scaling Airflow itself.
+
+WEBSERVER
+  The UI — visualizing DAG runs, task states, logs; operationally
+  important but not part of the actual scheduling/execution critical
+  path.
+
+TRIGGERER (modern Airflow — worth naming as a 2026-current detail)
+  Runs "deferrable" operators/sensors asynchronously in a single process
+  rather than occupying a full worker slot while waiting (e.g., a sensor
+  polling for a file to land) — a meaningful efficiency improvement over
+  older Airflow versions where a long-waiting sensor would tie up an
+  entire worker slot for the whole wait duration, worth mentioning
+  explicitly if asked about efficiently handling many concurrent
+  "wait for X" tasks.
+
+================================================================================
+4. WRITING DAGs: OPERATORS, SENSORS, TASK DEPENDENCIES
+================================================================================
+
+OPERATORS
+  A task is an instantiated operator — a reusable, parameterized unit of
+  work (PythonOperator runs arbitrary Python, BashOperator runs a shell
+  command, and provider-specific operators like DatabricksSubmitRunOperator
+  or SnowflakeOperator wrap common integrations). Preferring a
+  well-maintained provider operator over hand-rolling the equivalent
+  logic in a PythonOperator is generally the right default — it comes
+  with built-in retry/logging/connection-management behavior specific to
+  that system, rather than reinventing it.
+
+SENSORS
+  A specialized operator that WAITS for a condition to become true before
+  succeeding (a file landing in S3/ADLS, a partition appearing in a
+  table, an external DAG completing) — the mechanism connecting
+  orchestration to the real world's asynchronous, unpredictable timing.
+    Poke mode (classic): repeatedly checks the condition on an interval,
+      occupying a worker slot for the entire wait.
+    Reschedule mode: releases the worker slot between checks, more
+      efficient for long waits at the cost of slightly coarser polling
+      granularity.
+    Deferrable/async sensors (modern Airflow, via the Triggerer):
+      genuinely non-blocking, the most efficient option for long or
+      many concurrent waits — the 2026-recommended default over classic
+      poke-mode sensors for anything with meaningful wait time.
+
+TASK DEPENDENCIES
+  Expressed via bitshift operators (task_a >> task_b) or explicit
+  .set_downstream()/.set_upstream() calls — straightforward for simple
+  chains; know the TaskGroup construct for visually/logically grouping
+  related tasks in the UI without changing actual dependency semantics,
+  useful for keeping large DAGs readable.
+
+TRIGGER RULES (a precise, commonly-tested detail)
+  By default, a task only runs once ALL of its upstream dependencies
+  succeed (trigger_rule='all_success'). Other trigger rules change this:
+  all_failed, one_success, none_failed, all_done (runs regardless of
+  upstream success/failure — the standard choice for a CLEANUP task that
+  must run whether or not the pipeline succeeded). Knowing to use
+  all_done or one_failed-style trigger rules for cleanup/notification/
+  alerting tasks specifically is a genuinely good, concrete interview
+  signal ("how do you make sure a Slack alert fires even if the pipeline
+  fails midway" -> a trigger_rule='all_done' or one_failed task at the
+  end of the DAG, not a task with the default all_success rule, which
+  would never run on failure).
+
+================================================================================
+5. SCHEDULING SEMANTICS — THE PART EVERYONE GETS WRONG
+================================================================================
+
+THE LOGICAL DATE / EXECUTION DATE CONFUSION (Airflow's single most
+commonly misunderstood concept — know this precisely)
+  A DAG scheduled to run daily at midnight for "yesterday's data" has its
+  run for, say, January 2nd actually EXECUTE at midnight on January 3rd —
+  the run is named/keyed by the START of the interval it covers (the
+  "logical date" / "data interval start"), not by when it actually runs.
+  This is deliberate: it lets a DAG run represent "process the data for
+  this interval" cleanly, but it trips up nearly everyone the first time
+  they see a DAG run dated January 2nd actually executing on January 3rd.
+  Precise interview framing: "the logical date represents the START of
+  the data interval being processed, not the actual execution timestamp
+  — a daily DAG's January 2nd run covers data from Jan 2 00:00 to Jan 3
+  00:00, and doesn't actually execute until that interval has fully
+  elapsed, i.e., at the start of January 3rd."
+
+SCHEDULE INTERVALS
+  Cron expressions or Airflow's preset shortcuts (@daily, @hourly)
+  define the DAG's cadence — worth knowing that a DAG run only triggers
+  once its full data interval has elapsed (tying directly to the logical
+  date point above), not at the start of the interval.
+
+CATCHUP BEHAVIOR (a real, concrete operational gotcha)
+  If a DAG is deployed/enabled with a start_date in the past, Airflow by
+  default will schedule and run EVERY missed interval between start_date
+  and now (catchup=True by default) — this is a common, genuinely
+  surprising production incident ("I deployed a new daily DAG with a
+  start_date from 3 months ago and it immediately tried to run 90
+  backfill executions simultaneously") — setting catchup=False is the
+  standard practice for any DAG that should only run going forward from
+  deployment, reserving catchup=True specifically for DAGs that
+  genuinely need historical backfilling as part of their normal
+  operation.
+
+================================================================================
+6. BACKFILLS AND CATCHUP
+================================================================================
+
+WHAT A BACKFILL ACTUALLY IS
+  Re-running a DAG for one or more PAST data intervals — needed when
+  historical data needs reprocessing (a bug fix in transformation logic,
+  a late-arriving historical data correction, or standing up a brand-new
+  pipeline that needs to populate months of history). Airflow supports
+  this via the `airflow dags backfill` CLI command or by manually
+  triggering DAG runs for specific past logical dates.
+
+WHY BACKFILLS ARE OPERATIONALLY DANGEROUS WITHOUT CAREFUL DESIGN
+  A backfill can unintentionally overwhelm shared resources (many
+  historical DAG runs executing concurrently, all hitting the same
+  downstream warehouse/API), and — this is the single most important
+  point — a backfill is only SAFE if every task in the DAG is IDEMPOTENT
+  (re-running task for a given logical date produces the same correct
+  result, not duplicated/corrupted data) — directly reusing the
+  idempotency principle from the System Design and Streaming & Kafka
+  handbooks, now applied to orchestrated batch tasks specifically.
+  Non-idempotent tasks (blind INSERT/append instead of MERGE/upsert
+  keyed on the logical date or a business key) turn every backfill into
+  a data-duplication incident.
+
+CONTROLLING BACKFILL CONCURRENCY
+  max_active_runs (DAG-level) and pool-based resource limits (Airflow
+  Pools, capping how many tasks across the whole scheduler can use a
+  named, limited resource concurrently — e.g., a pool capping concurrent
+  connections to a rate-limited external API) prevent a backfill from
+  overwhelming downstream systems — worth naming Pools specifically as
+  the concrete Airflow mechanism for this, since "just run it" is a
+  common, dangerous naive answer to "how do you backfill 6 months of
+  history."
+
+BACKFILL DESIGN CHECKLIST (a strong, structured interview answer)
+  1. Confirm every task in the DAG is idempotent (MERGE/upsert keyed on
+     logical date or business key, not blind append).
+  2. Set max_active_runs and relevant Pools to bound concurrency against
+     shared/rate-limited downstream resources.
+  3. Run during a low-traffic window if the backfill would compete with
+     live production pipeline runs for the same resources.
+  4. Validate a small sample range first before running the full
+     historical backfill.
+  5. Monitor downstream systems (warehouse compute, API rate limits)
+     during the backfill, not just the DAG runs themselves.
+
+================================================================================
+7. RETRIES, SLAs, AND FAILURE HANDLING
+================================================================================
+
+RETRY CONFIGURATION
+  retries (max retry attempts) and retry_delay (wait between attempts),
+  commonly combined with EXPONENTIAL BACKOFF (retry_exponential_backoff=
+  True) so repeated failures wait progressively longer between attempts
+  — critical for transient failures against a struggling downstream
+  system, since immediate, repeated retries can actively worsen an
+  already-degraded downstream system (a self-inflicted retry storm) —
+  worth naming exponential backoff explicitly as the correct default
+  over fixed-interval retries for exactly this reason.
+
+WHICH FAILURES SHOULD RETRY, AND WHICH SHOULDN'T
+  Transient failures (network blip, temporary resource contention,
+  a downstream service briefly unavailable) are good retry candidates.
+  Deterministic failures (a bug in transformation logic, malformed
+  input data that will fail identically every time) should NOT retry
+  blindly — retrying a deterministically-failing task just delays
+  detection and wastes compute; a mature pipeline design distinguishes
+  these explicitly, sometimes via custom exception types the retry
+  logic can inspect, rather than treating every failure identically.
+
+SLAs (Service Level Agreements, in the Airflow-specific sense)
+  A configured maximum expected duration for a task/DAG — if exceeded,
+  Airflow can trigger an SLA-miss callback (alerting) even if the task
+  eventually succeeds — this is a distinct concept from a task simply
+  FAILING: an SLA miss means "this ran successfully but too slowly,"
+  a genuinely important signal for catching gradual performance
+  degradation before it becomes an outright failure or a business-
+  facing freshness problem.
+
+FAILURE NOTIFICATION PATTERNS
+  on_failure_callback (task/DAG-level hooks firing on failure) wired to
+  Slack/PagerDuty/email — combined with the all_done/one_failed trigger
+  rule pattern from Section 4 for a dedicated "always notify" task at
+  the end of a DAG, ensuring failure visibility doesn't depend on a
+  human noticing a red box in the UI.
+
+CIRCUIT BREAKING AT THE PIPELINE LEVEL
+  For a DAG feeding critical downstream consumers, consider an explicit
+  data-quality-gate task (reusing the DLT expectations / Great
+  Expectations patterns from your Databricks/System Design handbooks)
+  that FAILS the DAG deliberately if output data quality checks don't
+  pass — preventing bad data from silently propagating downstream just
+  because the individual tasks technically "succeeded" without checking
+  the actual output's correctness.
+
+================================================================================
+8. DYNAMIC DAGs AND TASK MAPPING
+================================================================================
+
+DYNAMIC DAG GENERATION
+  Programmatically generating DAG structure (not just task parameters)
+  from external configuration (e.g., one similar DAG per source table in
+  a config file/database, rather than hand-writing N nearly-identical
+  DAG files) — powerful for scaling pipeline management across many
+  similar sources, but worth naming the real tradeoff: dynamically
+  generated DAGs can be harder to debug/reason about individually, and
+  poorly-implemented dynamic DAG generation (e.g., querying a database
+  at DAG-parse time, which happens on every scheduler parse cycle, not
+  just once) is a common, concrete cause of scheduler performance
+  problems.
+
+DYNAMIC TASK MAPPING (modern Airflow — "map" over a runtime-determined
+list of inputs)
+  Rather than statically defining N nearly-identical tasks in code,
+  dynamic task mapping generates task instances at RUN TIME based on the
+  actual number of items to process (e.g., one mapped task instance per
+  file that actually landed today, whatever that count turns out to be)
+  — the correct, modern tool for "process a variable number of similar
+  items" instead of either hardcoding a fixed task count or falling back
+  to full dynamic DAG generation, worth naming specifically as the 2026-
+  current Airflow feature for this pattern.
+
+================================================================================
+9. XCOMs AND CROSS-TASK COMMUNICATION
+================================================================================
+
+WHAT XCOMS ARE FOR
+  A mechanism for tasks to exchange small pieces of data (a computed
+  value, a file path, a row count) via the metadata database — explicitly
+  NOT designed for passing large datasets between tasks (that's what the
+  actual data pipeline — Spark, the warehouse, object storage — is for).
+
+WHY THIS DISTINCTION IS A REAL, TESTABLE INTERVIEW POINT
+  A common anti-pattern/interview trap: someone tries to pass an entire
+  DataFrame or large result set through XCom — this is a misuse of the
+  orchestrator's metadata layer, which isn't designed or sized for bulk
+  data transfer, and can degrade the metadata database's performance for
+  the whole Airflow deployment. The correct pattern: tasks write large
+  data to actual storage (a Delta table, an S3/ADLS path) and pass only
+  the REFERENCE (table name, file path) via XCom — the orchestrator
+  coordinates WORK, it doesn't move DATA; that's a precise, valuable
+  distinction to state explicitly if this comes up.
+
+================================================================================
+10. DATABRICKS LAKEFLOW JOBS — THE 2026 LAKEHOUSE-NATIVE ALTERNATIVE
+================================================================================
+
+WHAT LAKEFLOW JOBS IS
+  Databricks's native orchestration product (evolution of the earlier
+  "Databricks Workflows") — orchestrates notebooks, Python/SQL scripts,
+  DLT/Lakeflow Declarative Pipelines, and dbt tasks natively within the
+  Databricks workspace, with dependency management, retries, and
+  scheduling built directly into the platform rather than requiring a
+  separate orchestration system.
+
+WHY THIS IS A GENUINE ARCHITECTURAL ALTERNATIVE, NOT JUST "AIRFLOW BUT
+WORSE"
+  For a workload that's ALREADY entirely within the Databricks lakehouse
+  (ingestion via Lakeflow Connect/Auto Loader, transformation via
+  Lakeflow Declarative Pipelines, serving via Databricks SQL), Lakeflow
+  Jobs eliminates an entire category of cross-system operational
+  overhead: no separate orchestrator to deploy/scale/secure, unified
+  Unity Catalog lineage covering the orchestration layer itself (you can
+  trace a table's lineage all the way back through which Job run
+  produced it), and native, no-extra-integration-code triggering of
+  Databricks-specific task types.
+
+LAKEFLOW DECLARATIVE PIPELINES INTEGRATION
+  Where DLT/Lakeflow Declarative Pipelines already handle intra-pipeline
+  dependency resolution DECLARATIVELY (you declare tables and their
+  upstream dependencies; the pipeline engine figures out execution order
+  and incremental processing automatically — closer to a self-managing
+  DAG than something you hand-orchestrate), Lakeflow Jobs sits ABOVE
+  that layer, orchestrating ACROSS multiple pipelines/notebooks/tasks
+  and other systems entirely — worth stating this layering precisely:
+  "Lakeflow Declarative Pipelines handles the DAG WITHIN one
+  medallion-style pipeline declaratively; Lakeflow Jobs orchestrates
+  BETWEEN multiple pipelines and other task types, and is where you'd
+  add cross-system dependencies Airflow would otherwise be needed for."
+
+WHEN LAKEFLOW JOBS ISN'T ENOUGH, AND YOU STILL NEED AIRFLOW (OR SIMILAR)
+  A genuinely multi-engine pipeline estate — orchestrating tasks across
+  Databricks AND Snowflake AND an external SaaS API AND a non-Databricks
+  Kubernetes job — benefits from a platform-agnostic orchestrator like
+  Airflow specifically because it isn't tied to any one platform's task
+  types; Databricks even provides a native Airflow provider package
+  (apache-airflow-providers-databricks) specifically for the common
+  pattern of "Airflow orchestrates broadly, but delegates the actual
+  Databricks-specific work to a Databricks Job/notebook run," combining
+  both tools rather than treating the choice as strictly either/or.
+
+================================================================================
+11. AIRFLOW vs. LAKEFLOW JOBS vs. DAGSTER vs. STEP FUNCTIONS — WHEN TO USE WHAT
+================================================================================
+
+AIRFLOW
+  The industry-standard, most broadly adopted, most platform-agnostic
+  option — the default answer when a pipeline estate spans multiple
+  systems/clouds/vendors and needs one unifying orchestration layer, or
+  when interviewing at a company not centered specifically on Databricks.
+
+LAKEFLOW JOBS (Databricks-native)
+  The right default for a workload that lives entirely within the
+  Databricks lakehouse — eliminates cross-system operational overhead
+  and gets native Unity Catalog lineage through the orchestration layer
+  itself; the correct answer given your specific Databricks background
+  when a question doesn't explicitly demand a platform-agnostic
+  solution.
+
+DAGSTER
+  A more recent orchestrator built around an "asset-based" philosophy —
+  you declare the DATA ASSETS (tables, files, models) a pipeline
+  produces and their dependencies, and Dagster derives the DAG from
+  asset dependencies, rather than defining tasks and dependencies
+  directly the way Airflow does — worth naming as a genuine alternative
+  philosophy (data-asset-centric rather than task-centric orchestration)
+  if it comes up, without needing deep hands-on Dagster experience to
+  discuss the conceptual distinction intelligently.
+
+CLOUD-NATIVE STEP FUNCTIONS / EQUIVALENT (AWS Step Functions, Azure
+Logic Apps/Data Factory pipelines)
+  Managed, serverless orchestration tightly integrated with a specific
+  cloud's native services (Lambda, Glue, ECS on AWS) — appropriate when
+  a pipeline is composed primarily of that cloud's native serverless
+  services and heavy Airflow/Dagster infrastructure would be
+  disproportionate operational overhead for the actual complexity
+  involved; directly ties to the ADF orchestration mention in the Cloud
+  Fundamentals Azure handbook and the Step Functions mention in the
+  Cloud Fundamentals AWS handbook.
+
+DECISION FRAMEWORK
+  Entirely within Databricks lakehouse -> Lakeflow Jobs (native lineage,
+    zero extra infrastructure)
+  Multi-system / multi-cloud / vendor-agnostic requirement -> Airflow
+    (industry standard, broadest ecosystem of provider integrations)
+  Asset/data-lineage-first philosophy preferred, greenfield choice ->
+    Dagster worth considering
+  Primarily cloud-native serverless services on one specific cloud ->
+    that cloud's native orchestrator (Step Functions / ADF)
+
+================================================================================
+12. ORCHESTRATING ACROSS SYSTEMS (MULTI-ENGINE PIPELINES)
+================================================================================
+
+THE REAL-WORLD PATTERN THIS SECTION ADDRESSES
+  Most non-trivial pipeline estates aren't single-engine — a typical
+  real pipeline might extract from a SaaS API, land in S3/ADLS, transform
+  in Databricks, load curated marts into Snowflake for a specific BI
+  tool's connector requirements, and trigger a reverse-ETL sync back into
+  a CRM — orchestration is precisely the layer that coordinates this
+  cross-system sequence with correct dependency ordering and failure
+  isolation.
+
+CROSS-SYSTEM DEPENDENCY PATTERNS
+  Sensor-based: one system's orchestrator waits (via a sensor) for a
+    signal that another system's job completed (a file landing, a
+    specific status in an external system's API) — loosely coupled,
+    works across any systems with an observable completion signal, but
+    adds polling latency.
+  Event-driven: a completion event (e.g., an S3 event notification, a
+    Kafka message) triggers the next stage directly rather than being
+    polled for — lower latency, tighter coupling, requires the upstream
+    system to actually emit an observable event.
+  API-triggered: one orchestrator directly calls another system's
+    trigger API/webhook on completion (e.g., an Airflow task calling the
+    Databricks Jobs API to trigger a Lakeflow Job, then polling for its
+    completion status) — the most common practical pattern for "Airflow
+    orchestrates broadly, delegates Databricks-specific execution to
+    Lakeflow Jobs" from Section 10.
+
+FAILURE ISOLATION ACROSS SYSTEM BOUNDARIES
+  A failure in one system's stage shouldn't silently corrupt or strand
+  downstream systems in an inconsistent state — the orchestration layer
+  crossing system boundaries needs explicit compensating logic (or at
+  minimum, clear alerting) for partial cross-system failure, since there's
+  no single transactional boundary spanning multiple independent systems
+  the way a single Delta MERGE has ACID guarantees within one system —
+  worth naming this explicitly as a harder problem than single-system
+  orchestration: "there's no cross-system transaction here, so I need to
+  think explicitly about what state each system is left in if the
+  pipeline fails between stage 2 and stage 3, and design either
+  compensating cleanup logic or, at minimum, clear alerting and a
+  documented manual recovery procedure."
+
+================================================================================
+13. OBSERVABILITY, ALERTING, AND ON-CALL FOR PIPELINES
+================================================================================
+
+WHAT TO MONITOR AT THE ORCHESTRATION LAYER (beyond individual task
+success/failure)
+  - DAG run duration trends (a DAG that used to finish in 20 minutes
+    creeping up to 90 minutes over weeks, even if each individual run
+    "succeeds," signals a real problem — SLA-miss tracking from Section
+    7 is the concrete mechanism for catching this).
+  - Task retry rates (a task that succeeds on the 3rd retry every single
+    run isn't healthy just because it eventually succeeds — it's masking
+    a real, worth-investigating flakiness).
+  - Scheduler health itself (scheduling lag — the gap between when a
+    task SHOULD have started per its dependencies/schedule and when it
+    ACTUALLY started — a symptom of scheduler resource contention at
+    high DAG/task volume).
+  - Data freshness at the OUTPUT level, not just orchestration-level
+    task success (a task can succeed while producing stale or wrong
+    data if an upstream data quality issue wasn't actually caught by
+    the pipeline's own checks — this is why the data-quality-gate
+    pattern from Section 7 matters, and why freshness/quality monitoring
+    should be a first-class signal alongside pure task-success
+    monitoring).
+
+ALERTING DESIGN, THE MATURE VERSION
+  Alert fatigue (too many low-signal alerts) causes real alerts to get
+  ignored — a mature on-call setup distinguishes severity explicitly:
+  a single transient retry succeeding on attempt 2 shouldn't page anyone;
+  a DAG that's been failing for 3 consecutive runs, or has missed a
+  business-critical freshness SLA, should. Tiered alerting (Slack
+  notification for low-severity, PagerDuty for high-severity/business-
+  critical) directly mirrors the action-tiering pattern from the Agentic
+  AI handbook's guardrail design — the same "not every failure deserves
+  the same response" principle applied to pipeline operations.
+
+RUNBOOKS
+  For any pipeline with real on-call weight, a documented runbook
+  (common failure modes, how to diagnose them, how to safely re-run/
+  backfill, who to escalate to) turns a 2am page into a 10-minute fix
+  instead of a from-scratch investigation — worth naming as a concrete,
+  expected operational deliverable alongside the pipeline code itself,
+  not an afterthought.
+
+================================================================================
+14. COMMON DESIGN PROBLEMS (WORKED EXAMPLES)
+================================================================================
+
+--------------------------------------------------------------------------------
+PROBLEM A: Design the orchestration for a daily medallion pipeline
+(bronze -> silver -> gold) with a hard 6 AM freshness SLA for BI dashboards
+--------------------------------------------------------------------------------
+  DAG structure: extract/land-bronze task -> (sensor or direct trigger)
+  -> silver transformation task -> data-quality-gate task (fails the DAG
+  explicitly if quality checks don't pass, per Section 7) -> gold
+  aggregation task -> "always notify" task (trigger_rule=all_done)
+  posting success/failure to Slack.
+  Idempotency: every task implemented as MERGE/upsert keyed on the
+  logical date, so any retry or backfill is safe.
+  SLA: an Airflow SLA (or equivalent freshness monitor) set for 5:45 AM
+  on the final gold task, firing an alert BEFORE the hard 6 AM deadline
+  is actually breached, giving time to react — explicitly distinguish
+  this from just alerting on outright task failure, since a
+  slow-but-eventually-successful run would breach the business SLA
+  without ever technically failing.
+  Retry policy: exponential backoff on the extract task (most likely to
+  hit transient upstream API/network issues), no retry on the data-
+  quality-gate task (a quality failure is deterministic given the same
+  bad data — retrying won't fix it, and should surface immediately for
+  investigation rather than delay detection).
+  Choice of tool: if this is entirely within Databricks, Lakeflow Jobs
+  is the natural default (native lineage, no extra infrastructure); if
+  the extract stage pulls from several non-Databricks SaaS sources
+  and/or needs to coordinate with non-Databricks systems downstream,
+  Airflow with a Databricks provider operator for the Databricks-
+  specific stages is the more platform-agnostic choice.
+
+--------------------------------------------------------------------------------
+PROBLEM B: A bug in silver-layer transformation logic shipped 3 weeks
+ago and was just fixed. Design a safe backfill to correct 3 weeks of
+downstream gold tables.
+--------------------------------------------------------------------------------
+  Pre-backfill checklist (Section 6): confirm the silver and gold tasks
+  are genuinely idempotent (MERGE keyed on logical date/business key) —
+  if not, fix that FIRST, since a non-idempotent backfill would
+  duplicate/corrupt data rather than correct it.
+  Scope the backfill precisely to the affected date range (the 3 weeks
+  the bug was live) rather than a wider "just to be safe" range that
+  wastes compute and risks touching correct data unnecessarily.
+  Set max_active_runs low enough that the backfill's concurrent DAG runs
+  don't overwhelm the warehouse/cluster capacity shared with live,
+  ongoing production runs — consider running the backfill in an
+  isolated compute environment (a separate Databricks job cluster,
+  a separate warehouse) entirely, to guarantee zero contention with
+  live pipeline SLAs during the backfill window.
+  Validate on a small sample (a single day) first, confirm output
+  correctness against expected values, THEN run the full 3-week
+  backfill — never run a multi-week backfill unvalidated as the first
+  test of the fix.
+  Downstream awareness: if gold tables feed BI dashboards or ML feature
+  pipelines, communicate the backfill window to those downstream
+  consumers, since historical numbers they've already reported on will
+  change — an organizational/communication step worth naming explicitly,
+  not just a technical one.
+
+================================================================================
+15. INTERVIEW QUESTION BANK WITH MODEL ANSWERS
+================================================================================
+
+Q: "What's the difference between a task failing and an SLA miss in
+   Airflow?"
+A: "A failure means the task actually errored out. An SLA miss means the
+   task took longer than its configured expected duration, even if it
+   eventually succeeded. They're both important but for different
+   reasons — SLA misses catch gradual performance degradation that
+   would otherwise hide behind a green checkmark, which matters a lot
+   for anything with a real business freshness deadline, since a slow-
+   but-technically-successful run can still breach a business SLA
+   without ever showing up as a failure."
+
+Q: "Why is idempotency specifically important for backfills?"
+A: "A backfill re-runs a DAG for past logical dates, sometimes multiple
+   times if something goes wrong mid-backfill. If a task does a blind
+   append/insert instead of a MERGE keyed on the logical date or a
+   business key, re-running it duplicates data rather than correcting
+   it. I treat idempotency as a prerequisite to even attempting a
+   backfill, not something to hope works out — I'd verify the MERGE
+   logic explicitly before running a multi-week backfill against
+   production tables."
+
+Q: "How would you design alerting so your team doesn't get paged for
+   every transient retry?"
+A: "Tier the alerts by actual severity rather than treating every
+   failure identically. A single retry that succeeds on attempt two
+   shouldn't page anyone — that's exactly what retries with backoff are
+   for. I'd reserve high-severity paging for things like a DAG failing
+   across multiple consecutive runs, or a business-critical freshness
+   SLA actually being missed, and route lower-severity signals to a
+   Slack channel instead. Alert fatigue from over-paging is a real
+   operational risk — it trains people to ignore pages, which defeats
+   the purpose of having them at all."
+
+Q: "What's the difference between Lakeflow Declarative Pipelines and
+   Lakeflow Jobs?"
+A: "Declarative Pipelines handles the DAG WITHIN one pipeline
+   declaratively — you declare tables and their dependencies, and it
+   figures out execution order and incremental processing on its own.
+   Lakeflow Jobs sits above that, orchestrating ACROSS multiple
+   pipelines, notebooks, and other task types, including non-Databricks
+   systems if needed. I'd think of Declarative Pipelines as handling the
+   fine-grained DAG inside a medallion pipeline, and Jobs as the
+   coordinator stitching multiple such pipelines — and other systems —
+   together."
+
+Q: "When would you choose Airflow over Lakeflow Jobs, or vice versa, for
+   a Databricks-heavy shop?"
+A: "If the entire workload lives inside the Databricks lakehouse, I'd
+   default to Lakeflow Jobs — it eliminates a whole separate piece of
+   infrastructure to operate, and gets native Unity Catalog lineage
+   through the orchestration layer itself, which Airflow wouldn't give
+   me without extra integration work. I'd reach for Airflow specifically
+   once the pipeline estate genuinely spans multiple systems — a
+   non-Databricks source, a different cloud, a vendor-specific API —
+   where a platform-agnostic orchestrator earns its operational
+   overhead. In practice a lot of real shops use both together — Airflow
+   orchestrating broadly, delegating the Databricks-specific stages to a
+   Lakeflow Job via the Databricks provider operator."
+
+================================================================================
+16. QUICK-REFERENCE CHEAT SHEET
+================================================================================
+
+DAG FUNDAMENTALS
+  DAG = tasks (nodes) + dependencies (edges), no cycles allowed —
+  same topological sort algorithm as the Coding & DSA handbook's
+  DAG-scheduling problems.
+
+AIRFLOW ARCHITECTURE
+  Scheduler (parses DAGs, queues ready tasks) + Executor (runs them —
+  Kubernetes/Celery for production) + Metadata DB + Webserver +
+  Triggerer (async deferrable operators/sensors)
+
+LOGICAL DATE, ONE-LINE RULE
+  A DAG run is named for the START of the data interval it covers, and
+  only executes once that interval has fully elapsed — not named for its
+  actual execution timestamp.
+
+CATCHUP
+  catchup=True (default) backfills every missed interval since
+  start_date automatically on deploy — set catchup=False unless you
+  genuinely want that behavior.
+
+BACKFILL SAFETY CHECKLIST
+  1. Idempotent tasks (MERGE/upsert, not blind append)
+  2. Bound concurrency (max_active_runs, Pools)
+  3. Isolated/low-traffic compute if possible
+  4. Validate a small sample range first
+  5. Communicate to downstream consumers
+
+TRIGGER RULES FOR CLEANUP/ALERTING TASKS
+  Use all_done or one_failed, never the default all_success — or your
+  "always notify on failure" task will never actually run on failure.
+
+RETRY DESIGN
+  Exponential backoff for transient failures. No retry (fail fast) for
+  deterministic failures (bad data, logic bugs) — retrying won't fix
+  those and just delays detection.
+
+XCOM RULE
+  Pass small values/references (table names, paths) via XCom. Never pass
+  large datasets through it — write data to real storage, pass the
+  pointer.
+
+TOOL SELECTION
+  Entirely within Databricks lakehouse -> Lakeflow Jobs
+  Multi-system / multi-cloud / vendor-agnostic -> Airflow
+  Asset-first philosophy, greenfield -> Dagster (worth knowing conceptually)
+  Cloud-native serverless, single cloud -> Step Functions / ADF pipelines
+
+MONITORING BEYOND TASK SUCCESS/FAILURE
+  DAG duration trend | retry rate | scheduler lag | data freshness/
+  quality at the OUTPUT level, not just orchestration-level success
+
+================================================================================
+END OF HANDBOOK
+================================================================================
